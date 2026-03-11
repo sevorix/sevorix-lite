@@ -117,6 +117,15 @@ pub enum HubCommands {
         /// Optional tags (can be specified multiple times)
         #[arg(short = 't', long)]
         tag: Vec<String>,
+        /// Artifact type: "artifact" (default) or "set"
+        #[arg(long, default_value = "artifact")]
+        artifact_type: String,
+        /// Declare a dependency as name@version (can be specified multiple times)
+        #[arg(long = "dep", value_name = "NAME@VERSION")]
+        dep: Vec<String>,
+        /// Visibility: "public" (default), "private", or "draft"
+        #[arg(long, default_value = "public")]
+        visibility: String,
     },
     /// Pull a policy artifact from SevorixHub
     Pull {

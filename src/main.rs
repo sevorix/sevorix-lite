@@ -586,7 +586,7 @@ mod tests {
 }
 
 async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
-    use sevorix_watchtower::hub::{HubClient, PushRequest, check_executable_policy, clear_token, save_token, check_auth_status};
+    use sevorix_watchtower::hub::{HubClient, PushRequest, DependencyRef, check_executable_policy, clear_token, save_token, check_auth_status};
 
     match cmd {
         HubCommands::Register { hub_url, email, password } => {
@@ -685,7 +685,7 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             println!("  Token saved to ~/.sevorix/hub_token");
         }
 
-        HubCommands::Push { hub_url, name, version, file, description, tag } => {
+        HubCommands::Push { hub_url, name, version, file, description, tag, artifact_type, dep, visibility } => {
             // Read the policy file
             let content = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", file, e))?;
@@ -698,20 +698,48 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
 
             let tags = if tag.is_empty() { None } else { Some(tag) };
 
+            // Parse --dep name@version flags
+            let dependencies = if dep.is_empty() {
+                None
+            } else {
+                let mut deps = Vec::new();
+                for d in &dep {
+                    let parts: Vec<&str> = d.splitn(2, '@').collect();
+                    if parts.len() != 2 {
+                        anyhow::bail!("Invalid dependency '{}': must be in name@version format", d);
+                    }
+                    deps.push(DependencyRef {
+                        name: parts[0].to_string(),
+                        version: parts[1].to_string(),
+                        required: true,
+                    });
+                }
+                Some(deps)
+            };
+
             let req = PushRequest {
                 name,
                 version,
                 description,
                 tags,
                 content,
+                visibility: Some(visibility),
+                artifact_type: Some(artifact_type),
+                dependencies,
             };
 
             let response = client.push(req).await?;
 
-            println!("Pushed artifact: {}@{}", response.name, response.version);
+            println!("Pushed artifact: {}@{} [{}]", response.name, response.version, response.artifact_type);
             println!("  ID: {}", response.id);
             println!("  Owner: {}", response.owner);
             println!("  Downloads: {}", response.downloads);
+            if !response.dependencies.is_empty() {
+                println!("  Dependencies:");
+                for d in &response.dependencies {
+                    println!("    - {}@{}{}", d.name, d.version, if d.required { "" } else { " (optional)" });
+                }
+            }
         }
 
         HubCommands::Pull { hub_url, name, version, output } => {
@@ -741,11 +769,17 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
                 }
             }
 
-            println!("\nArtifact: {}@{}", response.name, response.version);
+            println!("\nArtifact: {}@{} [{}]", response.name, response.version, response.artifact_type);
             println!("Owner: {}", response.owner);
             println!("Downloads: {}", response.downloads);
             if let Some(desc) = response.description {
                 println!("Description: {}", desc);
+            }
+            if !response.dependencies.is_empty() {
+                println!("Dependencies:");
+                for d in &response.dependencies {
+                    println!("  - {}@{}{}", d.name, d.version, if d.required { "" } else { " (optional)" });
+                }
             }
         }
 

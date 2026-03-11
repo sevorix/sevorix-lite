@@ -243,6 +243,19 @@ pub struct LoginResponse {
     pub email: String,
 }
 
+/// A declared dependency reference (name + version + required flag).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyRef {
+    pub name: String,
+    pub version: String,
+    #[serde(default = "default_required")]
+    pub required: bool,
+}
+
+fn default_required() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize)]
 pub struct PushRequest {
     pub name: String,
@@ -250,6 +263,15 @@ pub struct PushRequest {
     pub description: Option<String>,
     pub tags: Option<Vec<String>>,
     pub content: String,
+    /// "public", "private", or "draft"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// "artifact" (default) or "set"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    /// Declared dependencies (required for sets, optional for artifacts)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<Vec<DependencyRef>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +284,10 @@ pub struct PushResponse {
     pub tags: Vec<String>,
     pub downloads: i32,
     pub created_at: String,
+    #[serde(default)]
+    pub artifact_type: String,
+    #[serde(default)]
+    pub dependencies: Vec<DependencyRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,6 +301,10 @@ pub struct PullResponse {
     pub downloads: i32,
     pub created_at: String,
     pub content: serde_json::Value,
+    #[serde(default)]
+    pub artifact_type: String,
+    #[serde(default)]
+    pub dependencies: Vec<DependencyRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,6 +664,9 @@ mod tests {
             description: Some("A test policy".to_string()),
             tags: Some(vec!["security".to_string(), "test".to_string()]),
             content: "{}".to_string(),
+            visibility: None,
+            artifact_type: None,
+            dependencies: None,
         };
 
         let json = serde_json::to_string(&req).expect("Failed to serialize");
@@ -739,6 +772,9 @@ mod tests {
             description: None,
             tags: None,
             content: "{}".to_string(),
+            visibility: None,
+            artifact_type: None,
+            dependencies: None,
         };
 
         let json = serde_json::to_string(&req).expect("Failed to serialize");
@@ -1036,6 +1072,9 @@ mod tests {
             description: Some("A comprehensive policy".to_string()),
             tags: Some(vec!["security".to_string(), "network".to_string()]),
             content: r#"{"rules": []}"#.to_string(),
+            visibility: Some("public".to_string()),
+            artifact_type: Some("artifact".to_string()),
+            dependencies: Some(vec![DependencyRef { name: "dep-a".to_string(), version: "1.0.0".to_string(), required: true }]),
         };
 
         let json = serde_json::to_string(&req).unwrap();
