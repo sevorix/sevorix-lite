@@ -1,5 +1,6 @@
 use clap::Parser;
 use sevorix_watchtower::{handle_config, handle_integrations, handle_validate, logging::init_logging, run_server, Cli, Commands, DaemonManager, HubCommands};
+use sevorix_watchtower::prime::print_prime;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -106,6 +107,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Hub { subcmd }) => handle_hub(subcmd),
         Some(Commands::Integrations { subcmd }) => handle_integrations(subcmd),
         Some(Commands::Validate { command, role, context }) => handle_validate(command, role, context),
+        Some(Commands::Prime { agent_type }) => print_prime(&agent_type),
         Some(Commands::Run) | None => {
             // Default foreground run
             let (_guard, session_id) = init_logging();
@@ -680,7 +682,7 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             save_token(&response.token)?;
 
             println!("\n✓ Logged in as '{}'", response.email);
-            println!("  Token saved to ~/.config/sevorix/hub_token");
+            println!("  Token saved to ~/.sevorix/hub_token");
         }
 
         HubCommands::Push { hub_url, name, version, file, description, tag } => {

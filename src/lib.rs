@@ -25,6 +25,7 @@ pub mod hub;
 pub mod integrations;
 pub mod logging;
 pub mod policy;
+pub mod prime;
 pub mod proxy;
 pub mod scanner;
 
@@ -191,56 +192,60 @@ pub fn handle_validate_config() {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
-    // Check configuration directories
-    if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
-        let config_dir = proj_dirs.config_dir();
-        let policy_path = config_dir.join("policies.json");
-
-        // Check policies.json
-        if policy_path.exists() {
-            match std::fs::read_to_string(&policy_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(_) => println!("✓ policies.json: Valid JSON"),
-                        Err(e) => errors.push(format!("policies.json: Invalid JSON - {}", e)),
-                    }
-                }
-                Err(e) => errors.push(format!("policies.json: Cannot read - {}", e)),
-            }
-        } else {
-            warnings.push("policies.json: Not found (optional)".to_string());
-        }
-
-        // Check policies directory
-        let policy_dir = config_dir.join("policies");
-        if policy_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&policy_dir) {
-                let count = entries.count();
-                println!("✓ policies/: {} policy file(s) found", count);
-            }
-        } else {
-            warnings.push("policies/: Not found (optional)".to_string());
-        }
-
-        // Check roles directory
-        let roles_dir = config_dir.join("roles");
-        if roles_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&roles_dir) {
-                let count = entries.count();
-                println!("✓ roles/: {} role file(s) found", count);
-            }
-        } else {
-            warnings.push("roles/: Not found (optional)".to_string());
-        }
-    }
-
-    // Check ~/.sevorix/
+    // Primary store: ~/.sevorix/
     if let Some(user_dirs) = directories::UserDirs::new() {
         let sevorix_dir = user_dirs.home_dir().join(".sevorix");
+
         if sevorix_dir.exists() {
             println!("✓ ~/.sevorix/: Exists");
         } else {
             warnings.push("~/.sevorix/: Not found (will be created on first use)".to_string());
+        }
+
+        // Check primary policies directory
+        let policy_dir = sevorix_dir.join("policies");
+        if policy_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&policy_dir) {
+                let count = entries.count();
+                println!("✓ ~/.sevorix/policies/: {} policy file(s) found", count);
+            }
+        } else {
+            warnings.push("~/.sevorix/policies/: Not found (optional — place .json policy files here)".to_string());
+        }
+
+        // Check primary roles directory
+        let roles_dir = sevorix_dir.join("roles");
+        if roles_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&roles_dir) {
+                let count = entries.count();
+                println!("✓ ~/.sevorix/roles/: {} role file(s) found", count);
+            }
+        } else {
+            warnings.push("~/.sevorix/roles/: Not found (optional — place .json role files here)".to_string());
+        }
+
+        // Check hub token
+        let token_path = sevorix_dir.join("hub_token");
+        if token_path.exists() {
+            println!("✓ ~/.sevorix/hub_token: Present");
+        } else {
+            warnings.push("~/.sevorix/hub_token: Not found (run 'sevorix hub login' to authenticate)".to_string());
+        }
+    }
+
+    // Legacy fallback: ~/.config/sevorix/policies.json
+    if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
+        let legacy_policy = proj_dirs.config_dir().join("policies.json");
+        if legacy_policy.exists() {
+            match std::fs::read_to_string(&legacy_policy) {
+                Ok(content) => {
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(_) => println!("✓ ~/.config/sevorix/policies.json: Valid JSON (legacy fallback)"),
+                        Err(e) => errors.push(format!("~/.config/sevorix/policies.json: Invalid JSON - {}", e)),
+                    }
+                }
+                Err(e) => errors.push(format!("~/.config/sevorix/policies.json: Cannot read - {}", e)),
+            }
         }
     }
 

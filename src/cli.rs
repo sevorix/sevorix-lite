@@ -58,6 +58,11 @@ pub enum Commands {
         #[arg(short = 'C', long, default_value = "Shell")]
         context: String,
     },
+    /// Print a context primer for a specific agent type (pipe into an AI agent's context)
+    Prime {
+        /// Agent type to prime: policy-manager (pm) or guarded-agent (guard)
+        agent_type: String,
+    },
 }
 
 #[derive(Subcommand)]

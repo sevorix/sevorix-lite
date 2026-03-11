@@ -12,11 +12,19 @@ const DEFAULT_HUB_URL: &str = "https://sevorix-hub-668536931811.us-central1.run.
 // ---------------------------------------------------------------------------
 
 fn token_path() -> Result<PathBuf> {
-    let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
-        .context("Could not determine config directory")?;
-    let config_dir = proj_dirs.config_dir();
-    fs::create_dir_all(config_dir).context("Failed to create config directory")?;
-    Ok(config_dir.join("hub_token"))
+    let home = directories::UserDirs::new()
+        .context("Could not determine home directory")?;
+    let sevorix_dir = home.home_dir().join(".sevorix");
+    fs::create_dir_all(&sevorix_dir).context("Failed to create ~/.sevorix directory")?;
+    Ok(sevorix_dir.join("hub_token"))
+}
+
+/// Returns the legacy token path (~/.config/sevorix/hub_token) if it exists,
+/// so we can migrate it on first access.
+fn legacy_token_path() -> Option<PathBuf> {
+    let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")?;
+    let path = proj_dirs.config_dir().join("hub_token");
+    if path.exists() { Some(path) } else { None }
 }
 
 pub fn save_token(token: &str) -> Result<()> {
@@ -34,8 +42,20 @@ pub fn save_token(token: &str) -> Result<()> {
 
 pub fn load_token() -> Result<String> {
     let path = token_path()?;
-    fs::read_to_string(&path)
-        .context("No hub token found. Run 'sevorix hub login' first.")
+    if path.exists() {
+        return fs::read_to_string(&path)
+            .context("No hub token found. Run 'sevorix hub login' first.");
+    }
+    // One-time migration: copy from legacy location if present
+    if let Some(legacy) = legacy_token_path() {
+        let token = fs::read_to_string(&legacy)
+            .context("No hub token found. Run 'sevorix hub login' first.")?;
+        // Write to new location and remove old one
+        save_token(&token)?;
+        let _ = fs::remove_file(&legacy);
+        return Ok(token);
+    }
+    Err(anyhow::anyhow!("No hub token found. Run 'sevorix hub login' first."))
 }
 
 pub fn clear_token() -> Result<()> {
