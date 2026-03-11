@@ -1,0 +1,201 @@
+{
+  "policies": [
+    {
+      "id": "block_drop",
+      "type": "Simple",
+      "pattern": "DROP",
+      "action": "Block"
+    },
+    {
+      "id": "block_delete",
+      "type": "Simple",
+      "pattern": "DELETE",
+      "action": "Block"
+    },
+    {
+      "id": "block_wire",
+      "type": "Simple",
+      "pattern": "WIRE",
+      "action": "Block"
+    },
+    {
+      "id": "block_funds",
+      "type": "Simple",
+      "pattern": "FUNDS",
+      "action": "Block"
+    },
+    {
+      "id": "block_truncate",
+      "type": "Simple",
+      "pattern": "TRUNCATE",
+      "action": "Block"
+    },
+    {
+      "id": "block_exec",
+      "type": "Simple",
+      "pattern": "EXEC",
+      "action": "Block"
+    },
+    {
+      "id": "block_shutdown",
+      "type": "Simple",
+      "pattern": "SHUTDOWN",
+      "action": "Block"
+    },
+    {
+      "id": "block_restart",
+      "type": "Simple",
+      "pattern": "RESTART",
+      "action": "Block"
+    },
+    {
+      "id": "flag_select",
+      "type": "Simple",
+      "pattern": "SELECT",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_admin",
+      "type": "Simple",
+      "pattern": "ADMIN",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_insert",
+      "type": "Simple",
+      "pattern": "INSERT",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_update",
+      "type": "Simple",
+      "pattern": "UPDATE",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_alter",
+      "type": "Simple",
+      "pattern": "ALTER",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_create",
+      "type": "Simple",
+      "pattern": "CREATE",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_union",
+      "type": "Simple",
+      "pattern": "UNION",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_password",
+      "type": "Simple",
+      "pattern": "PASSWORD",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_secret",
+      "type": "Simple",
+      "pattern": "SECRET",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_key",
+      "type": "Simple",
+      "pattern": "KEY",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_token",
+      "type": "Simple",
+      "pattern": "TOKEN",
+      "action": "Flag"
+    },
+    {
+      "id": "flag_auth",
+      "type": "Simple",
+      "pattern": "AUTH",
+      "action": "Flag"
+    },
+    {
+      "id": "re_ssn",
+      "type": "Regex",
+      "pattern": "\\d{3}-\\d{2}-\\d{4}",
+      "action": "Block"
+    },
+    {
+      "id": "re_credit_card",
+      "type": "Regex",
+      "pattern": "\\d{4}-\\d{4}-\\d{4}-\\d{4}",
+      "action": "Block"
+    },
+    {
+      "id": "block_sevorix_config",
+      "type": "Simple",
+      "pattern": ".sevorix",
+      "action": "Block"
+    },
+    {
+      "id": "block_config_sevorix",
+      "type": "Simple",
+      "pattern": ".config/sevorix",
+      "action": "Block"
+    },
+    {
+      "id": "block_policy_modification",
+      "type": "Simple",
+      "pattern": "policies.json",
+      "action": "Block"
+    },
+    {
+      "id": "block_roles_modification",
+      "type": "Simple",
+      "pattern": "roles.json",
+      "action": "Block"
+    },
+    {
+      "id": "block_sevorix_commands",
+      "type": "Simple",
+      "pattern": "sevorix",
+      "action": "Block"
+    }
+  ],
+  "roles": [
+    {
+      "name": "default",
+      "policies": [
+        "block_drop",
+        "block_delete",
+        "block_wire",
+        "block_funds",
+        "block_truncate",
+        "block_exec",
+        "block_shutdown",
+        "block_restart",
+        "re_ssn",
+        "re_credit_card",
+        "flag_select",
+        "flag_admin",
+        "flag_insert",
+        "flag_update",
+        "flag_alter",
+        "flag_create",
+        "flag_union",
+        "flag_password",
+        "flag_secret",
+        "flag_key",
+        "flag_token",
+        "flag_auth",
+        "block_sevorix_config",
+        "block_config_sevorix",
+        "block_policy_modification",
+        "block_roles_modification",
+        "block_sevorix_commands"
+      ],
+      "is_dynamic": true
+    }
+  ]
+}

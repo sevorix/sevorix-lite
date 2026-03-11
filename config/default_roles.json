@@ -1,0 +1,30 @@
+[
+  {
+    "name": "default",
+    "policies": [
+      "block_drop",
+      "block_delete",
+      "block_wire",
+      "block_funds",
+      "block_truncate",
+      "block_exec",
+      "block_shutdown",
+      "block_restart",
+      "re_ssn",
+      "re_credit_card",
+      "flag_select",
+      "flag_admin",
+      "flag_insert",
+      "flag_update",
+      "flag_alter",
+      "flag_create",
+      "flag_union",
+      "flag_password",
+      "flag_secret",
+      "flag_key",
+      "flag_token",
+      "flag_auth"
+    ],
+    "is_dynamic": true
+  }
+]

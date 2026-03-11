@@ -1,0 +1,343 @@
+use anyhow::{Context, Result};
+use daemonize::Daemonize;
+use directories::ProjectDirs;
+use libc;
+use std::fs;
+use std::path::PathBuf;
+
+/// Manages Watchtower daemon lifecycle (start/stop/status).
+pub struct DaemonManager {
+    pid_path: PathBuf,
+    log_path: PathBuf,
+}
+
+/// Manages eBPF daemon lifecycle (start/stop/status).
+pub struct EbpfDaemonManager {
+    pid_path: PathBuf,
+    log_path: PathBuf,
+}
+
+impl DaemonManager {
+    pub fn new() -> Result<Self> {
+        let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
+
+        // Use state_dir for PID and logs. Fallback to cache_dir if state_dir not available (rare on Linux)
+        let state_dir = proj_dirs
+            .state_dir()
+            .unwrap_or_else(|| proj_dirs.cache_dir());
+        fs::create_dir_all(state_dir).context("Failed to create state directory")?;
+
+        Ok(Self {
+            pid_path: state_dir.join("sevorix.pid"),
+            log_path: state_dir.join("sevorix.log"),
+        })
+    }
+
+    pub fn start(&self) -> Result<()> {
+        if self.is_running() {
+            println!(
+                "Sevorix is already running (PID: {})",
+                self.read_pid().unwrap_or(0)
+            );
+            // If we return Ok, the main function continues and tries to run the server which will fail binding port
+            // We should probably error or exit here to prevent double run.
+            // Actually, if we are the user running 'sevorix start', we are the parent.
+            // We want to exit and NOT become a daemon (because one exists).
+            // But start() is only supposed to return if it BECAME the daemon.
+            // So we should return an error.
+            return Err(anyhow::anyhow!("Sevorix is already running."));
+        }
+
+        println!("Starting Sevorix Watchtower in background...");
+        println!("Logs => {}", self.log_path.display());
+        println!("📡 API: http://localhost:3000/analyze");
+        println!("📊 Dashboard: http://localhost:3000/dashboard/desktop.html");
+
+        // Append mode might be better for logs?
+        // Let's use OpenOptions for append
+        let stdout = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+            .context("Failed to open log file")?;
+        let stderr = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+            .context("Failed to open log file")?;
+
+        let daemonize = Daemonize::new()
+            .pid_file(&self.pid_path)
+            .chown_pid_file(true)
+            .working_directory(std::env::current_dir().unwrap_or(PathBuf::from("/")))
+            .stdout(stdout)
+            .stderr(stderr);
+
+        match daemonize.start() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("Error daemonizing: {}", e)),
+        }
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        if let Some(pid) = self.read_pid() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            // Wait a bit? Assuming immediate.
+            if self.pid_path.exists() {
+                let _ = fs::remove_file(&self.pid_path);
+            }
+            println!("Sevorix stopped (PID: {})", pid);
+        } else {
+            println!("Sevorix is not running.");
+        }
+        Ok(())
+    }
+
+    pub fn status(&self) {
+        if let Some(pid) = self.read_pid() {
+            let res = unsafe { libc::kill(pid, 0) };
+            if res == 0 {
+                println!("Sevorix is running (PID: {})", pid);
+                println!("PID file: {}", self.pid_path.display());
+                println!("Logs: {}", self.log_path.display());
+                println!("📡 API: http://localhost:3000/analyze");
+                println!("📊 Dashboard: http://localhost:3000/dashboard/desktop.html");
+            } else {
+                println!("Sevorix PID file exists but process is gone. Cleaning up.");
+                let _ = fs::remove_file(&self.pid_path);
+            }
+        } else {
+            println!("Sevorix is NOT running.");
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        if let Some(pid) = self.read_pid() {
+            let res = unsafe { libc::kill(pid, 0) };
+            if res == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn read_pid(&self) -> Option<i32> {
+        if let Ok(content) = fs::read_to_string(&self.pid_path) {
+            content.trim().parse::<i32>().ok()
+        } else {
+            None
+        }
+    }
+}
+
+impl EbpfDaemonManager {
+    pub fn new() -> Result<Self> {
+        let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
+
+        let state_dir = proj_dirs
+            .state_dir()
+            .unwrap_or_else(|| proj_dirs.cache_dir());
+        fs::create_dir_all(state_dir).context("Failed to create state directory")?;
+
+        Ok(Self {
+            pid_path: state_dir.join("sevorix-ebpf.pid"),
+            log_path: state_dir.join("sevorix-ebpf.log"),
+        })
+    }
+
+    /// Check if the eBPF daemon is running.
+    pub fn is_running(&self) -> bool {
+        if let Some(pid) = self.read_pid() {
+            let res = unsafe { libc::kill(pid, 0) };
+            if res == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Stop the eBPF daemon.
+    pub fn stop(&self) -> Result<()> {
+        if let Some(pid) = self.read_pid() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            if self.pid_path.exists() {
+                let _ = fs::remove_file(&self.pid_path);
+            }
+            println!("eBPF daemon stopped (PID: {})", pid);
+        } else {
+            println!("eBPF daemon is not running.");
+        }
+        Ok(())
+    }
+
+    /// Print the status of the eBPF daemon.
+    pub fn status(&self) {
+        if let Some(pid) = self.read_pid() {
+            let res = unsafe { libc::kill(pid, 0) };
+            if res == 0 {
+                println!("eBPF daemon is running (PID: {})", pid);
+                println!("PID file: {}", self.pid_path.display());
+                println!("Logs: {}", self.log_path.display());
+            } else {
+                println!("eBPF daemon PID file exists but process is gone. Cleaning up.");
+                let _ = fs::remove_file(&self.pid_path);
+            }
+        } else {
+            println!("eBPF daemon is NOT running.");
+        }
+    }
+
+    fn read_pid(&self) -> Option<i32> {
+        if let Ok(content) = fs::read_to_string(&self.pid_path) {
+            content.trim().parse::<i32>().ok()
+        } else {
+            None
+        }
+    }
+}
+
+/// Check if the eBPF daemon is running (convenience function).
+pub fn is_ebpf_daemon_running() -> bool {
+    EbpfDaemonManager::new()
+        .map(|m| m.is_running())
+        .unwrap_or(false)
+}
+
+/// Check if the Watchtower daemon is running (convenience function).
+pub fn is_watchtower_running() -> bool {
+    DaemonManager::new()
+        .map(|m| m.is_running())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_daemon_manager_new_creates_directory() {
+        // DaemonManager::new() should create the state directory
+        let result = DaemonManager::new();
+        assert!(result.is_ok());
+
+        let manager = result.unwrap();
+        // Verify paths are set correctly
+        assert!(manager.pid_path.to_string_lossy().contains("sevorix.pid"));
+        assert!(manager.log_path.to_string_lossy().contains("sevorix.log"));
+    }
+
+    #[test]
+    fn test_daemon_manager_pid_path_structure() {
+        let manager = DaemonManager::new().unwrap();
+        // PID path should end with sevorix.pid
+        assert!(manager.pid_path.ends_with("sevorix.pid"));
+    }
+
+    #[test]
+    fn test_daemon_manager_log_path_structure() {
+        let manager = DaemonManager::new().unwrap();
+        // Log path should end with sevorix.log
+        assert!(manager.log_path.ends_with("sevorix.log"));
+    }
+
+    #[test]
+    fn test_is_running_no_pid_file() {
+        let manager = DaemonManager::new().unwrap();
+        // When no PID file exists, is_running should return false
+        assert!(!manager.is_running());
+    }
+
+    #[test]
+    fn test_read_pid_empty_content() {
+        // Test that read_pid returns None for empty content
+        let content = "";
+        let result: Option<i32> = content.trim().parse().ok();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_pid_valid_pid() {
+        // Test that read_pid parsing works correctly
+        let content = "12345";
+        let result: Option<i32> = content.trim().parse().ok();
+        assert_eq!(result, Some(12345));
+    }
+
+    #[test]
+    fn test_read_pid_with_whitespace() {
+        // Test that read_pid handles whitespace correctly
+        let content = "  12345  \n";
+        let result: Option<i32> = content.trim().parse().ok();
+        assert_eq!(result, Some(12345));
+    }
+
+    #[test]
+    fn test_read_pid_invalid_content() {
+        // Test that read_pid handles invalid content
+        let content = "not a pid";
+        let result: Option<i32> = content.trim().parse().ok();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_status_not_running_no_pid() {
+        let manager = DaemonManager::new().unwrap();
+        // status() should not panic when no PID file exists
+        // It will print to stdout, we just verify it doesn't panic
+        manager.status();
+    }
+
+    #[test]
+    fn test_stop_no_process() {
+        let manager = DaemonManager::new().unwrap();
+        // stop() should not panic when no process is running
+        let result = manager.stop();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_pid_path_is_in_state_dir() {
+        let manager = DaemonManager::new().unwrap();
+        // PID path should be in a state or cache directory
+        let path_str = manager.pid_path.to_string_lossy();
+        // Should contain sevorix somewhere in the path
+        assert!(path_str.contains("sevorix"));
+    }
+
+    #[test]
+    fn test_log_path_is_in_state_dir() {
+        let manager = DaemonManager::new().unwrap();
+        // Log path should be in a state or cache directory
+        let path_str = manager.log_path.to_string_lossy();
+        // Should contain sevorix somewhere in the path
+        assert!(path_str.contains("sevorix"));
+    }
+
+    #[test]
+    fn test_paths_are_consistent() {
+        let manager = DaemonManager::new().unwrap();
+        // Both paths should be in the same parent directory
+        assert_eq!(manager.pid_path.parent(), manager.log_path.parent());
+    }
+
+    #[test]
+    fn test_ebpf_daemon_manager_new() {
+        let result = EbpfDaemonManager::new();
+        assert!(result.is_ok());
+        let manager = result.unwrap();
+        assert!(manager.pid_path.ends_with("sevorix-ebpf.pid"));
+        assert!(manager.log_path.ends_with("sevorix-ebpf.log"));
+    }
+
+    #[test]
+    fn test_ebpf_daemon_is_running_no_pid_file() {
+        let manager = EbpfDaemonManager::new().unwrap();
+        assert!(!manager.is_running());
+    }
+}

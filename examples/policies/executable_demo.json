@@ -1,0 +1,6 @@
+{
+    "id": "exec_check_forbidden",
+    "type": "Executable",
+    "pattern": "grep -q forbidden",
+    "action": "Block"
+}

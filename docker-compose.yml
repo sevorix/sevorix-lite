@@ -1,0 +1,19 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sevorix
+      POSTGRES_PASSWORD: sevorix
+      POSTGRES_DB: sevorix_hub
+    ports:
+      - "5432:5432"
+    volumes:
+      - sevorix_hub_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sevorix -d sevorix_hub"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  sevorix_hub_data:

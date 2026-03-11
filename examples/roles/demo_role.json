@@ -1,0 +1,5 @@
+{
+    "name": "checker_role",
+    "policies": ["exec_check_forbidden"],
+    "is_dynamic": false
+}

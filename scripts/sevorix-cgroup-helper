@@ -1,0 +1,70 @@
+#!/bin/bash
+# Sevorix cgroup helper — runs as root to manage per-session cgroup isolation.
+# Called by sevsh via 'sudo -n sevorix-cgroup-helper <action> <session_id> [pid]'
+#
+# Actions:
+#   create   <session_id>       — creates /sys/fs/cgroup/sevorix/<session_id>/
+#   add-pid  <session_id> <pid> — writes <pid> to the session cgroup.procs
+#   cleanup  <session_id>       — removes the session cgroup directory
+
+set -e
+
+ACTION="$1"
+SESSION_ID="$2"
+PID="${3:-}"
+
+CGROUP_BASE="/sys/fs/cgroup/sevorix"
+
+# Validate session ID: must be sevsh-<uuid> to prevent path traversal
+if ! echo "$SESSION_ID" | grep -qE '^sevsh-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'; then
+    echo "sevorix-cgroup-helper: invalid session ID '$SESSION_ID'" >&2
+    exit 1
+fi
+
+CGROUP_PATH="$CGROUP_BASE/$SESSION_ID"
+# Derive the calling user from SUDO_USER (set by sudo)
+OWNER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+
+case "$ACTION" in
+    create)
+        # Ensure base dir exists and is delegated to the calling user
+        if [ ! -d "$CGROUP_BASE" ]; then
+            mkdir -p "$CGROUP_BASE"
+            chown "$OWNER:$OWNER" "$CGROUP_BASE"
+        fi
+        # Create the per-session sub-cgroup
+        mkdir -p "$CGROUP_PATH"
+        ;;
+
+    add-pid)
+        # Validate PID is numeric
+        if ! echo "$PID" | grep -qE '^[0-9]+$'; then
+            echo "sevorix-cgroup-helper: invalid PID '$PID'" >&2
+            exit 1
+        fi
+        if [ ! -d "$CGROUP_PATH" ]; then
+            echo "sevorix-cgroup-helper: cgroup $CGROUP_PATH not found" >&2
+            exit 1
+        fi
+        echo "$PID" > "$CGROUP_PATH/cgroup.procs"
+        ;;
+
+    cleanup)
+        # Move all remaining processes to the parent cgroup before removing.
+        # This is necessary because the calling process (sevsh) may still be
+        # inside the session cgroup when cleanup runs.
+        if [ -f "$CGROUP_PATH/cgroup.procs" ]; then
+            while IFS= read -r pid; do
+                [ -n "$pid" ] && echo "$pid" > "$CGROUP_BASE/cgroup.procs" 2>/dev/null || true
+            done < "$CGROUP_PATH/cgroup.procs"
+        fi
+        # Now rmdir should succeed since all processes have left.
+        rmdir "$CGROUP_PATH" 2>/dev/null || true
+        ;;
+
+    *)
+        echo "sevorix-cgroup-helper: unknown action '$ACTION'" >&2
+        echo "Usage: sevorix-cgroup-helper create|add-pid|cleanup <session_id> [pid]" >&2
+        exit 1
+        ;;
+esac

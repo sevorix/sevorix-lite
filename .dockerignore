@@ -1,0 +1,8 @@
+target
+.git
+.gitignore
+.dockerignore
+Dockerfile
+*.md
+sevorix.py
+simulate.ps1

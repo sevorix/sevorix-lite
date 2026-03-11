@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sevorix Command Center</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    
+    <script>
+        function watchtower() {
+            return {
+                // ── Live strip (WebSocket) ──────────────────────────────────
+                // Small per-layer rolling buffers; never mixes with history.
+                _live: { shell: [], syscall: [], network: [] },
+                LIVE_PER_LAYER: 20,
+
+                get liveEvents() {
+                    return [...this._live.shell, ...this._live.syscall, ...this._live.network]
+                        .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+                },
+
+                // ── History panel (query engine) ────────────────────────────
+                historyEvents: [],
+                historyTotal: 0,
+                historyPage: 1,
+                historyTotalPages: 1,
+                historyLimit: 50,
+                historyLoading: false,
+
+                // ── Shared UI state ─────────────────────────────────────────
+                activeTab: 'history',   // 'live' | 'history'
+                selected: null,
+                stats: { total: 0, blocked: 0, latency: 0 },
+                edition: 'pro',
+                search: '',
+                filters: { shell: true, syscall: true, network: true },
+                _searchDebounce: null,
+
+                get displayEvents() {
+                    return this.activeTab === 'live' ? this.liveEvents : this.historyEvents;
+                },
+
+                // ── Live helpers ────────────────────────────────────────────
+                _addLive(data) {
+                    const layer = (data.layer || 'shell').toLowerCase();
+                    const bucket = layer === 'syscall' ? 'syscall'
+                                 : (layer === 'network' || layer === 'http') ? 'network' : 'shell';
+                    this._live[bucket].unshift(data);
+                    if (this._live[bucket].length > this.LIVE_PER_LAYER)
+                        this._live[bucket].pop();
+                },
+
+                // ── History query ───────────────────────────────────────────
+                queryHistory(page) {
+                    this.historyPage = page || this.historyPage;
+                    this.historyLoading = true;
+
+                    const params = new URLSearchParams({ page: this.historyPage, limit: this.historyLimit });
+                    // "network" checkbox covers both "network" (eBPF) and "http" (proxy).
+                    const activeKeys = Object.entries(this.filters).filter(([, v]) => v).map(([k]) => k);
+                    const activeLayers = activeKeys.flatMap(k => k === 'network' ? ['network', 'http'] : [k]).join(',');
+                    const allLayers = 'shell,syscall,network,http';
+                    if (activeLayers && activeLayers !== allLayers) {
+                        params.set('layer', activeLayers);
+                    }
+                    if (this.search.trim()) params.set('search', this.search.trim());
+
+                    fetch('/api/events?' + params)
+                        .then(r => r.json())
+                        .then(data => {
+                            this.historyEvents   = data.events      || [];
+                            this.historyTotal    = data.total       || 0;
+                            this.historyTotalPages = data.total_pages || 1;
+                            this.historyLoading  = false;
+                        })
+                        .catch(() => { this.historyLoading = false; });
+                },
+
+                onFilterChange() {
+                    this.historyPage = 1;
+                    clearTimeout(this._searchDebounce);
+                    this._searchDebounce = setTimeout(() => this.queryHistory(1), 300);
+                },
+
+                // ── Lifecycle ───────────────────────────────────────────────
+                connect() {
+                    fetch('/api/version')
+                        .then(res => res.json())
+                        .then(data => {
+                            this.edition = data.edition || 'pro';
+                            const headerSpan = document.querySelector('header h1 span');
+                            if (headerSpan && this.edition === 'lite') {
+                                headerSpan.textContent = 'LITE';
+                                headerSpan.className = 'text-slate-400';
+                            }
+                            if (this.edition === 'lite') {
+                            }
+                        })
+                        .catch(err => console.warn("Could not load version info:", err));
+
+                    // Initial history load
+                    this.queryHistory(1);
+
+                    // Stats from full log (no filters)
+                    fetch('/api/events?limit=1')
+                        .then(r => r.json())
+                        .then(data => {
+                            this.stats.total   = data.total || 0;
+                        })
+                        .catch(() => {});
+
+                    const ws = new WebSocket("ws://localhost:3000/ws");
+                    ws.onopen = () => console.log("CONNECTED TO SERVER!");
+                    ws.onmessage = (msg) => {
+                        const data = JSON.parse(msg.data);
+                        this._addLive(data);
+                        this.stats.total++;
+                        if (data.lane === 'RED') this.stats.blocked++;
+                        if (data.latency !== undefined) this.stats.latency = data.latency;
+                        if (data.lane === 'RED') this.selected = data;
+                    };
+                    ws.onclose = () => {
+                        console.log("Disconnected. Retrying...");
+                        setTimeout(() => this.connect(), 1000);
+                    };
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body { background-color: #050a14; color: #cbd5e1; font-family: 'Courier New', monospace; }
+        .cyber-border { border: 1px solid #1e293b; box-shadow: 0 0 10px rgba(0,0,0,0.5); }
+        .scan-line {
+            width: 100%; height: 2px; background: rgba(34, 211, 238, 0.3);
+            position: absolute; top: 0; left: 0;
+            animation: scan 3s linear infinite;
+        }
+        @keyframes scan { 0% {top: 0%;} 100% {top: 100%;} }
+        ::-webkit-scrollbar { width: 12px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 6px; border: 2px solid #0f172a; }
+    </style>
+</head>
+
+<body class="h-screen flex flex-col overflow-hidden" x-data="watchtower()" x-init="connect()">
+
+    <header class="h-16 border-b border-slate-800 bg-slate-950 flex items-center justify-between px-6 z-10 relative">
+        <div class="flex items-center gap-4">
+            <div class="h-8 w-8 bg-cyan-900 rounded flex items-center justify-center text-cyan-400 font-bold border border-cyan-700">S</div>
+            <div>
+                <h1 class="text-xl font-bold text-white tracking-widest">SEVORIX <span class="text-cyan-500">PRIME</span></h1>
+                <p class="text-[10px] text-slate-500 uppercase tracking-[0.2em]">Runtime Containment Engine</p>
+            </div>
+        </div>
+        <div class="flex items-center gap-6">
+            <div class="flex flex-col items-end">
+                <span class="text-[10px] text-slate-500 uppercase">System Status</span>
+                <div class="flex items-center gap-2">
+                    <span class="h-2 w-2 rounded-full bg-green-500 animate-pulse"></span>
+                    <span class="text-xs text-green-400 font-bold">ONLINE / PROTECTED</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <div class="flex-1 flex overflow-hidden relative">
+        <div class="absolute inset-0 opacity-5" 
+             style="background-image: radial-gradient(#334155 1px, transparent 1px); background-size: 30px 30px;"></div>
+
+        <aside class="w-64 bg-slate-950 border-r border-slate-800 p-4 flex flex-col gap-6 z-10">
+            <div class="cyber-border bg-slate-900/50 p-4 rounded relative overflow-hidden">
+                <p class="text-xs text-slate-500 uppercase mb-1">Total Traffic</p>
+                <h2 class="text-4xl font-bold text-white" x-text="stats.total">0</h2>
+                <div class="absolute bottom-0 left-0 h-1 bg-blue-500 transition-all duration-300" style="width: 100%"></div>
+            </div>
+            <div class="cyber-border bg-slate-900/50 p-4 rounded relative overflow-hidden">
+                <p class="text-xs text-slate-500 uppercase mb-1">Threats Blocked</p>
+                <h2 class="text-4xl font-bold text-red-500" x-text="stats.blocked">0</h2>
+                <div class="absolute bottom-0 left-0 h-1 bg-red-600 transition-all duration-300" style="width: 100%"></div>
+            </div>
+            <div class="cyber-border bg-slate-900/50 p-4 rounded relative overflow-hidden">
+                <p class="text-xs text-slate-500 uppercase mb-1">Avg Latency</p>
+                <h2 class="text-4xl font-bold text-yellow-400"><span x-text="stats.latency">0</span><span class="text-lg text-slate-500 ml-1">ms</span></h2>
+            </div>
+
+            
+
+            
+        </aside>
+
+        <main class="flex-1 flex flex-col border-r border-slate-800 bg-slate-900/20 backdrop-blur-sm z-10 relative">
+            <div class="scan-line pointer-events-none"></div>
+
+            <!-- Tab bar + status -->
+            <div class="p-3 bg-slate-900/80 border-b border-slate-800 flex items-center justify-between gap-4">
+                <div class="flex gap-1">
+                    <button @click="activeTab = 'history'"
+                            :class="activeTab === 'history' ? 'bg-cyan-900 text-cyan-300 border-cyan-600' : 'text-slate-500 border-slate-700 hover:text-slate-300'"
+                            class="px-3 py-1 text-xs font-bold uppercase tracking-wider border rounded transition-all">History</button>
+                    <button @click="activeTab = 'live'"
+                            :class="activeTab === 'live' ? 'bg-cyan-900 text-cyan-300 border-cyan-600' : 'text-slate-500 border-slate-700 hover:text-slate-300'"
+                            class="px-3 py-1 text-xs font-bold uppercase tracking-wider border rounded transition-all">
+                        Live
+                        <span class="ml-1 h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse inline-block"></span>
+                    </button>
+                </div>
+                <span class="text-xs text-slate-500" x-show="activeTab === 'history'"
+                      x-text="historyTotal + ' events · page ' + historyPage + ' of ' + historyTotalPages"></span>
+                <span class="text-xs text-slate-500" x-show="activeTab === 'live'"
+                      x-text="liveEvents.length + ' live events (last ' + LIVE_PER_LAYER + ' per layer)'"></span>
+            </div>
+
+            <!-- Filter bar (history only) -->
+            <div x-show="activeTab === 'history'"
+                 class="px-4 py-2 bg-slate-950/60 border-b border-slate-800 flex flex-wrap items-center gap-4">
+                <input type="text" x-model="search"
+                       @input="onFilterChange()"
+                       placeholder="Search payload, verdict, syscall…"
+                       class="flex-1 min-w-[160px] px-3 py-1.5 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-cyan-600" />
+                <div class="flex items-center gap-4 text-xs">
+                    <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                        <input type="checkbox" x-model="filters.shell"   @change="onFilterChange()" class="accent-cyan-500" />
+                        <span class="text-cyan-400 font-semibold uppercase tracking-wide">Shell</span>
+                    </label>
+                    <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                        <input type="checkbox" x-model="filters.syscall" @change="onFilterChange()" class="accent-purple-500" />
+                        <span class="text-purple-400 font-semibold uppercase tracking-wide">Syscall</span>
+                    </label>
+                    <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                        <input type="checkbox" x-model="filters.network" @change="onFilterChange()" class="accent-yellow-500" />
+                        <span class="text-yellow-400 font-semibold uppercase tracking-wide">Network</span>
+                    </label>
+                </div>
+                <span x-show="historyLoading" class="text-xs text-slate-500 animate-pulse">Loading…</span>
+            </div>
+
+            <!-- Event list -->
+            <div class="flex-1 overflow-y-auto p-4 space-y-3" id="feed-container">
+                <template x-for="event in displayEvents" :key="event.timestamp + (event.pid || '')">
+                    <div class="p-4 rounded border-l-4 bg-slate-900/90 hover:bg-slate-800 transition-all cursor-pointer group shadow-lg relative overflow-hidden"
+                         :class="{
+                            'border-red-500 shadow-red-900/20': event.lane === 'RED',
+                            'border-yellow-400 shadow-yellow-900/20': event.lane === 'YELLOW',
+                            'border-green-500 shadow-green-900/20': event.lane === 'GREEN'
+                         }"
+                         @click="selected = event">
+                        <div class="flex justify-between items-start mb-2">
+                            <div class="flex items-center gap-2">
+                                <span class="font-bold text-xl tracking-wider"
+                                      :class="{
+                                        'text-red-500': event.lane === 'RED',
+                                        'text-yellow-400': event.lane === 'YELLOW',
+                                        'text-green-500': event.lane === 'GREEN'
+                                      }" x-text="event.verdict"></span>
+                                <span class="text-[10px] px-1.5 py-0.5 rounded uppercase font-bold tracking-widest"
+                                      :class="{
+                                        'bg-cyan-900/60 text-cyan-400':     (event.layer || 'shell') === 'shell',
+                                        'bg-purple-900/60 text-purple-400': event.layer === 'syscall',
+                                        'bg-yellow-900/60 text-yellow-400': event.layer === 'network' || event.layer === 'http'
+                                      }"
+                                      x-text="event.layer || 'shell'"></span>
+                            </div>
+                            <div class="flex items-baseline gap-1 font-mono"
+                                 :class="{
+                                    'text-red-500': event.lane === 'RED',
+                                    'text-yellow-400': event.lane === 'YELLOW',
+                                    'text-green-500 opacity-60': event.lane === 'GREEN'
+                                  }">
+                                <span class="text-sm">⚡</span>
+                                <span class="text-2xl font-bold" x-text="event.latency"></span>
+                                <span class="text-sm">ms</span>
+                            </div>
+                        </div>
+                        <div class="flex justify-between items-end relative z-10">
+                            <span class="text-base text-slate-300 truncate w-full pr-4 font-medium" x-text="event.payload"></span>
+                            <span class="text-sm text-slate-500 font-mono whitespace-nowrap"
+                                  x-text="(event.timestamp || '').split('T')[1]?.split('.')[0] || ''"></span>
+                        </div>
+                    </div>
+                </template>
+                <div x-show="displayEvents.length === 0 && !historyLoading"
+                     class="text-center text-slate-600 text-sm py-12">No events match your filters.</div>
+            </div>
+
+            <!-- Pagination (history only) -->
+            <div x-show="activeTab === 'history' && historyTotalPages > 1"
+                 class="flex items-center justify-center gap-2 py-3 border-t border-slate-800 bg-slate-950/60">
+                <button @click="queryHistory(historyPage - 1)" :disabled="historyPage <= 1"
+                        class="px-3 py-1 text-xs border border-slate-700 rounded text-slate-400 hover:text-white hover:border-slate-500 disabled:opacity-30 disabled:cursor-not-allowed">← Prev</button>
+                <span class="text-xs text-slate-500 font-mono"
+                      x-text="historyPage + ' / ' + historyTotalPages"></span>
+                <button @click="queryHistory(historyPage + 1)" :disabled="historyPage >= historyTotalPages"
+                        class="px-3 py-1 text-xs border border-slate-700 rounded text-slate-400 hover:text-white hover:border-slate-500 disabled:opacity-30 disabled:cursor-not-allowed">Next →</button>
+            </div>
+        </main>
+
+        <aside class="w-[400px] bg-slate-950 p-6 flex flex-col gap-4 z-10">
+            <h3 class="text-sm font-bold text-slate-400 uppercase tracking-wider">Payload Inspector</h3>
+            <div class="flex-1 cyber-border bg-black p-5 rounded font-mono text-sm overflow-auto relative">
+                <template x-if="selected">
+                    <div>
+                        <div class="flex justify-between mb-6 border-b border-slate-800 pb-3">
+                            <span class="text-slate-500">VERDICT</span>
+                            <span class="font-bold text-lg"
+                                  :class="{
+                                    'text-red-500': selected.verdict === 'BLOCK',
+                                    'text-yellow-400': selected.verdict === 'FLAG',
+                                    'text-green-500': selected.verdict === 'ALLOW'
+                                  }" x-text="selected.verdict"></span>
+                        </div>
+                        <div class="flex justify-between mb-6 border-b border-slate-800 pb-3">
+                            <span class="text-slate-500">LANE</span>
+                            <span class="font-bold text-lg"
+                                  :class="{
+                                    'text-red-500': selected.lane === 'RED',
+                                    'text-yellow-400': selected.lane === 'YELLOW',
+                                    'text-green-500': selected.lane === 'GREEN'
+                                  }" x-text="selected.lane"></span>
+                        </div>
+                        <div class="flex justify-between mb-6 border-b border-slate-800 pb-3">
+                            <span class="text-slate-500">CONTEXT</span>
+                            <span class="text-slate-300 text-lg font-mono" x-text="selected.context || 'N/A'"></span>
+                        </div>
+                        <div class="mb-6">
+                            <span class="text-slate-500 block mb-2">TIMESTAMP</span>
+                            <span class="text-white text-lg" x-text="selected.timestamp"></span>
+                        </div>
+                        <div class="mb-6">
+                            <span class="text-slate-500 block mb-2">LATENCY</span>
+                            <span class="text-cyan-400 font-bold text-2xl">⚡ <span x-text="selected.latency"></span>ms</span>
+                        </div>
+                        <template x-if="selected.reason">
+                            <div class="mb-6">
+                                <span class="text-slate-500 block mb-2">THREAT REASON</span>
+                                <span class="text-red-400 text-lg italic" x-text="selected.reason"></span>
+                            </div>
+                        </template>
+                        <template x-if="selected.confidence">
+                             <div class="mb-6">
+                                <span class="text-slate-500 block mb-2">AI CONFIDENCE</span>
+                                <span class="text-slate-300 text-lg font-mono" x-text="selected.confidence"></span>
+                            </div>
+                        </template>
+                        <div>
+                            <span class="text-slate-500 block mb-2">PAYLOAD CONTENT</span>
+                            <div class="p-4 bg-slate-900 rounded text-green-400 break-words border border-slate-800 text-base leading-relaxed shadow-inner font-medium">
+                                <span x-text="selected.payload"></span>
+                            </div>
+                        </div>
+                        
+                        <div class="mt-8 pt-8 border-t border-slate-800 space-y-4">
+                             <template x-if="selected.lane === 'YELLOW' || selected.lane === 'RED'">
+                                <button @click="alert('⛔ KILL SIGNAL SENT\n\nAgent connection severed.')" 
+                                        class="w-full py-3 bg-red-900/20 border-2 border-red-500 text-red-500 hover:bg-red-500 hover:text-white transition-all uppercase text-sm font-bold tracking-[0.2em] active:scale-95 shadow-[0_0_15px_rgba(239,68,68,0.3)]">
+                                    Force Terminate Agent
+                                </button>
+                             </template>
+
+                             <button @click="fetch('/open-log', {method: 'POST'})" 
+                                     class="w-full py-3 bg-slate-800 border-2 border-slate-600 text-slate-400 hover:bg-cyan-900 hover:text-cyan-400 hover:border-cyan-500 transition-all uppercase text-sm font-bold tracking-[0.2em] active:scale-95 flex items-center justify-center gap-3 shadow-[0_0_15px_rgba(6,182,212,0.1)]">
+                                 <span class="text-lg">📄</span> Open Forensic Report
+                             </button>
+                        </div>
+                    </div>
+                </template>
+                <template x-if="!selected">
+                    <div class="h-full flex items-center justify-center text-slate-600 text-center opacity-50">
+                        <p class="text-lg">Select an event<br>to inspect payload</p>
+                    </div>
+                </template>
+            </div>
+        </aside>
+    </div>
+</body>
+</html>

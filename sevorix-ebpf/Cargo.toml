@@ -1,0 +1,17 @@
+[package]
+name = "sevorix-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-ebpf-bindings = "0.1"
+sevorix-ebpf-common = { path = "../sevorix-ebpf-common", features = ["kernel"] }
+
+[build-dependencies]
+aya-build = "0.1"
+
+[[bin]]
+name = "sevorix-ebpf"
+path = "src/main.rs"
+test = false

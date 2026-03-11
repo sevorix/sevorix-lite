@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.edition }} edition)
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        include:
+          - edition: lite
+            features: ''
+          - edition: pro
+            features: '--features pro'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace ${{ matrix.features }}
+
+  fmt:
+    name: Rustfmt
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (${{ matrix.edition }} edition)
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        include:
+          - edition: lite
+            features: ''
+          - edition: pro
+            features: '--features pro'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Lint with Clippy
+        run: cargo clippy --workspace ${{ matrix.features }} -- -D warnings
+
+  coverage:
+    name: Coverage (${{ matrix.edition }} edition)
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        include:
+          - edition: lite
+            features: ''
+          - edition: pro
+            features: '--features pro'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+      - name: Generate code coverage
+        run: cargo tarpaulin --verbose ${{ matrix.features }} --workspace --timeout 120 --out Xml --fail-under 90 --exclude-files "sevorix-core/src/tracer.rs"
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          flags: ${{ matrix.edition }}
+      - name: Archive code coverage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-report-${{ matrix.edition }}
+          path: cobertura.xml

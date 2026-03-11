@@ -1,0 +1,9 @@
+# Example terraform.tfvars file
+# Copy to terraform.tfvars and fill in your values
+
+project_id        = "sevorix"
+region            = "us-central1"
+db_tier           = "db-f1-micro"
+db_availability_type = "ZONAL"
+github_owner      = "your-github-username"
+github_repo       = "sevorix"

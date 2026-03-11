@@ -1,0 +1,61 @@
+# Cloud Build configuration for sevorix-hub
+# Builds and deploys to Cloud Run
+
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/sevorix-hub/sevorix-hub:${SHORT_SHA}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/sevorix-hub/sevorix-hub:latest'
+      - '-f'
+      - 'sevorix-hub/Dockerfile'
+      - '.'
+    id: 'build-image'
+
+  # Push to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/sevorix-hub/sevorix-hub'
+    id: 'push-image'
+    waitFor: ['build-image']
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'sevorix-hub'
+      - '--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/sevorix-hub/sevorix-hub:${SHORT_SHA}'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--service-account=sevorix-hub@${PROJECT_ID}.iam.gserviceaccount.com'
+      - '--set-env-vars=STORAGE_BACKEND=gcs,GCS_BUCKET=${PROJECT_ID}-artifacts'
+      - '--set-secrets=DATABASE_URL=sevorix-hub-database-url:latest,JWT_SECRET=sevorix-hub-jwt-secret:latest'
+      - '--add-cloudsql-instances=${PROJECT_ID}:${_REGION}:sevorix-hub-db'
+      - '--vpc-connector=sevorix-hub-connector'
+      - '--allow-unauthenticated'
+    id: 'deploy-service'
+    waitFor: ['push-image']
+
+# Default substitutions
+substitutions:
+  _REGION: us-central1
+
+# Store images in Artifact Registry
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/sevorix-hub/sevorix-hub:${SHORT_SHA}'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/sevorix-hub/sevorix-hub:latest'
+
+# Build options
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+# Timeout
+timeout: '1200s'
