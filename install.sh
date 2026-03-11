@@ -8,11 +8,60 @@ INSTALL_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.sevorix"
 STATE_DIR="$HOME/.local/state/sevorix"
 
+# ---------------------------------------------------------------
+# Parse flags
+# ---------------------------------------------------------------
+FORCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --force|-f) FORCE=1 ;;
+        --help|-h)
+            echo "Usage: ./install.sh [--force]"
+            echo ""
+            echo "  --force  Skip all confirmation prompts (non-interactive install)"
+            exit 0
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+
+# prompt_confirm <title> <detail>
+# Returns 0 to proceed, 1 to skip. With --force, always returns 0.
+prompt_confirm() {
+    local title="$1"
+    local detail="$2"
+
+    if [ "$FORCE" -eq 1 ]; then
+        return 0
+    fi
+
+    echo ""
+    echo "┌─ $title"
+    echo "│  $detail"
+    printf "└─ Proceed? [Y/n] "
+    read -r answer
+    case "$answer" in
+        [nN][oO]|[nN])
+            echo "   ↩ Skipped."
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 echo "--------------------------------------------------"
 echo "🛡️  Sevorix Watchtower Installer"
+if [ "$FORCE" -eq 1 ]; then
+    echo "   Running in --force mode (no prompts)"
+fi
 echo "--------------------------------------------------"
 
-# Create user directories
+# Create user directories (non-invasive, no prompt needed)
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$STATE_DIR"
@@ -35,16 +84,28 @@ if [ -f "Cargo.toml" ]; then
     # Prerequisite: nightly toolchain (required for eBPF bytecode)
     # ---------------------------------------------------------------
     if ! cargo +nightly --version &> /dev/null; then
-        echo "   Installing nightly Rust toolchain (required for eBPF kernel bytecode)..."
-        rustup toolchain install nightly
+        if prompt_confirm \
+            "Install nightly Rust toolchain" \
+            "Required for eBPF kernel bytecode compilation. Runs: rustup toolchain install nightly"; then
+            rustup toolchain install nightly
+        else
+            echo "   ⚠️  Nightly toolchain skipped — eBPF support will be unavailable."
+        fi
     fi
 
     # ---------------------------------------------------------------
     # Prerequisite: rust-src component on nightly (needed for -Zbuild-std)
     # ---------------------------------------------------------------
-    if ! rustup component list --toolchain nightly --installed 2>/dev/null | grep -q "rust-src"; then
-        echo "   Adding rust-src to nightly toolchain..."
-        rustup component add rust-src --toolchain nightly
+    if cargo +nightly --version &> /dev/null; then
+        if ! rustup component list --toolchain nightly --installed 2>/dev/null | grep -q "rust-src"; then
+            if prompt_confirm \
+                "Add rust-src to nightly toolchain" \
+                "Needed for -Zbuild-std when compiling eBPF programs. Runs: rustup component add rust-src --toolchain nightly"; then
+                rustup component add rust-src --toolchain nightly
+            else
+                echo "   ⚠️  rust-src skipped — eBPF bytecode compilation will be unavailable."
+            fi
+        fi
     fi
 
     # ---------------------------------------------------------------
@@ -56,42 +117,54 @@ if [ -f "Cargo.toml" ]; then
     # Prerequisite: bpf-linker (eBPF LLVM backend)
     # ---------------------------------------------------------------
     if ! command -v bpf-linker &> /dev/null; then
-        echo "   Installing bpf-linker (required for eBPF bytecode compilation)..."
-        cargo install bpf-linker
+        if prompt_confirm \
+            "Install bpf-linker" \
+            "LLVM-based linker required for eBPF bytecode. Runs: cargo install bpf-linker (may take several minutes)"; then
+            cargo install bpf-linker
+        else
+            echo "   ⚠️  bpf-linker skipped — eBPF support will be unavailable."
+        fi
     fi
 
     # ---------------------------------------------------------------
     # Build userspace binaries (watchtower, sevsh, eBPF daemon)
     # A single invocation builds all three.
     # ---------------------------------------------------------------
-    echo "   Compiling release build (this may take a minute)..."
-    cargo build --release --features ebpf
+    if prompt_confirm \
+        "Build Sevorix from source" \
+        "Compiles release binaries (sevorix, sevsh, sevorix-ebpf-daemon). Runs: cargo build --release --features ebpf"; then
+        echo "   Compiling release build (this may take a minute)..."
+        cargo build --release --features ebpf
 
-    SOURCE_BIN="target/release/sevorix_watchtower"
-    SHELL_BIN="target/release/sevsh"
-    EBPF_BIN="target/release/sevorix-ebpf-daemon"
+        SOURCE_BIN="target/release/sevorix_watchtower"
+        SHELL_BIN="target/release/sevsh"
+        EBPF_BIN="target/release/sevorix-ebpf-daemon"
 
-    if [ ! -f "$SOURCE_BIN" ]; then
-        echo "❌ Build failed. Binary not found at $SOURCE_BIN"
-        exit 1
-    fi
-    echo "   ✅ Userspace binaries built"
+        if [ ! -f "$SOURCE_BIN" ]; then
+            echo "❌ Build failed. Binary not found at $SOURCE_BIN"
+            exit 1
+        fi
+        echo "   ✅ Userspace binaries built"
 
-    # ---------------------------------------------------------------
-    # Build eBPF kernel bytecode (loaded by daemon at runtime)
-    # ---------------------------------------------------------------
-    EBPF_BYTECODE="target/bpfel-unknown-none/release/sevorix-ebpf"
-    echo "   Compiling eBPF kernel bytecode..."
-    if cargo +nightly build --target bpfel-unknown-none -Zbuild-std=core -p sevorix-ebpf --release; then
-        if [ -f "$EBPF_BYTECODE" ]; then
-            echo "   ✅ eBPF kernel bytecode compiled"
+        # ---------------------------------------------------------------
+        # Build eBPF kernel bytecode (loaded by daemon at runtime)
+        # ---------------------------------------------------------------
+        EBPF_BYTECODE="target/bpfel-unknown-none/release/sevorix-ebpf"
+        echo "   Compiling eBPF kernel bytecode..."
+        if cargo +nightly build --target bpfel-unknown-none -Zbuild-std=core -p sevorix-ebpf --release 2>/dev/null; then
+            if [ -f "$EBPF_BYTECODE" ]; then
+                echo "   ✅ eBPF kernel bytecode compiled"
+            else
+                echo "   ⚠️  eBPF bytecode not found after build — eBPF monitoring will be unavailable."
+                EBPF_BYTECODE=""
+            fi
         else
-            echo "   ⚠️  eBPF bytecode not found after build — eBPF monitoring will be unavailable."
+            echo "   ⚠️  eBPF bytecode build failed — eBPF monitoring will be unavailable."
             EBPF_BYTECODE=""
         fi
     else
-        echo "   ⚠️  eBPF bytecode build failed — eBPF monitoring will be unavailable."
-        EBPF_BYTECODE=""
+        echo "❌ Build skipped. Cannot continue without binaries."
+        exit 1
     fi
 
 elif [ -f "sevorix" ]; then
@@ -137,21 +210,34 @@ if [ -n "$EBPF_BIN" ] && [ -f "$EBPF_BIN" ]; then
     cp "$EBPF_BIN" "$INSTALL_DIR/sevorix-ebpf-daemon"
     chmod +x "$INSTALL_DIR/sevorix-ebpf-daemon"
 
-    echo "🔐 Granting eBPF capabilities to sevorix-ebpf-daemon (requires sudo)..."
-    if sudo setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep "$INSTALL_DIR/sevorix-ebpf-daemon"; then
-        echo "   ✅ Capabilities granted"
+    if prompt_confirm \
+        "Grant eBPF Linux capabilities to sevorix-ebpf-daemon" \
+        "Allows the daemon to load eBPF programs without running as root. Runs: sudo setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep $INSTALL_DIR/sevorix-ebpf-daemon"; then
+        if sudo setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep "$INSTALL_DIR/sevorix-ebpf-daemon"; then
+            echo "   ✅ Capabilities granted"
+        else
+            echo "   ⚠️  setcap failed — eBPF daemon may require sudo to run."
+        fi
     else
-        echo "   ⚠️  setcap failed — eBPF daemon may require sudo to run."
+        echo "   ⚠️  Capabilities not granted — eBPF daemon will require sudo to run."
     fi
 
     SUDOERS_FILE="/etc/sudoers.d/sevorix-ebpf"
     SUDOERS_RULE="$USER ALL=(root) NOPASSWD: $INSTALL_DIR/sevorix-ebpf-daemon"
-    echo "🔐 Installing sudoers rule for passwordless eBPF daemon launch (requires sudo)..."
-    if echo "$SUDOERS_RULE" | sudo tee "$SUDOERS_FILE" > /dev/null && sudo chmod 440 "$SUDOERS_FILE"; then
-        echo "   ✅ Sudoers rule installed at $SUDOERS_FILE"
+    if prompt_confirm \
+        "Install passwordless sudoers rule for eBPF daemon" \
+        "Allows Sevorix to launch the eBPF daemon without a sudo password prompt.
+│  Writes to: $SUDOERS_FILE
+│  Rule: $SUDOERS_RULE"; then
+        if echo "$SUDOERS_RULE" | sudo tee "$SUDOERS_FILE" > /dev/null && sudo chmod 440 "$SUDOERS_FILE"; then
+            echo "   ✅ Sudoers rule installed at $SUDOERS_FILE"
+        else
+            echo "   ⚠️  Failed to install sudoers rule."
+            echo "   Add manually via visudo: $SUDOERS_RULE"
+        fi
     else
-        echo "   ⚠️  Failed to install sudoers rule."
-        echo "   Add manually via visudo: $SUDOERS_RULE"
+        echo "   ⚠️  Sudoers rule skipped. Add manually via visudo if needed:"
+        echo "      $SUDOERS_RULE"
     fi
 else
     echo "ℹ️  eBPF daemon binary not found — skipping."
@@ -171,19 +257,33 @@ fi
 # ---------------------------------------------------------------
 CGROUP_HELPER="/usr/local/bin/sevorix-cgroup-helper"
 if [ -f "scripts/sevorix-cgroup-helper" ]; then
-    echo "🔐 Installing cgroup helper to $CGROUP_HELPER (requires sudo)..."
-    if sudo cp "scripts/sevorix-cgroup-helper" "$CGROUP_HELPER" && sudo chmod 755 "$CGROUP_HELPER"; then
-        echo "   ✅ Cgroup helper installed"
-        CGROUP_SUDOERS_FILE="/etc/sudoers.d/sevorix-cgroup"
-        CGROUP_SUDOERS_RULE="$USER ALL=(root) NOPASSWD: $CGROUP_HELPER"
-        if echo "$CGROUP_SUDOERS_RULE" | sudo tee "$CGROUP_SUDOERS_FILE" > /dev/null && sudo chmod 440 "$CGROUP_SUDOERS_FILE"; then
-            echo "   ✅ Cgroup sudoers rule installed at $CGROUP_SUDOERS_FILE"
+    if prompt_confirm \
+        "Install cgroup helper to /usr/local/bin" \
+        "System-wide helper for per-session process isolation. Requires sudo write to /usr/local/bin."; then
+        if sudo cp "scripts/sevorix-cgroup-helper" "$CGROUP_HELPER" && sudo chmod 755 "$CGROUP_HELPER"; then
+            echo "   ✅ Cgroup helper installed"
+            CGROUP_SUDOERS_FILE="/etc/sudoers.d/sevorix-cgroup"
+            CGROUP_SUDOERS_RULE="$USER ALL=(root) NOPASSWD: $CGROUP_HELPER"
+            if prompt_confirm \
+                "Install passwordless sudoers rule for cgroup helper" \
+                "Allows Sevorix to manage process isolation without a sudo password prompt.
+│  Writes to: $CGROUP_SUDOERS_FILE
+│  Rule: $CGROUP_SUDOERS_RULE"; then
+                if echo "$CGROUP_SUDOERS_RULE" | sudo tee "$CGROUP_SUDOERS_FILE" > /dev/null && sudo chmod 440 "$CGROUP_SUDOERS_FILE"; then
+                    echo "   ✅ Cgroup sudoers rule installed at $CGROUP_SUDOERS_FILE"
+                else
+                    echo "   ⚠️  Failed to install cgroup sudoers rule."
+                    echo "   Add manually via visudo: $CGROUP_SUDOERS_RULE"
+                fi
+            else
+                echo "   ⚠️  Cgroup sudoers rule skipped. Add manually via visudo if needed:"
+                echo "      $CGROUP_SUDOERS_RULE"
+            fi
         else
-            echo "   ⚠️  Failed to install cgroup sudoers rule."
-            echo "   Add manually via visudo: $CGROUP_SUDOERS_RULE"
+            echo "   ⚠️  Failed to install cgroup helper — session isolation will be limited."
         fi
     else
-        echo "   ⚠️  Failed to install cgroup helper — session isolation will be limited."
+        echo "⚠️  Cgroup helper skipped — session isolation will be limited."
     fi
 else
     echo "⚠️  scripts/sevorix-cgroup-helper not found — session isolation will be limited."
