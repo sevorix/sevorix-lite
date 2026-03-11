@@ -290,27 +290,40 @@ else
 fi
 
 # ---------------------------------------------------------------
-# Install default config (policies + roles) — skip if already present
+# Install default config (policies + roles) via Sevorix Hub
 # ---------------------------------------------------------------
 mkdir -p "$CONFIG_DIR/policies"
 mkdir -p "$CONFIG_DIR/roles"
 
-if [ -z "$(ls -A "$CONFIG_DIR/policies" 2>/dev/null)" ]; then
-    if [ -f "config/default_policies.json" ]; then
-        echo "📝 Installing default policies..."
-        cp "config/default_policies.json" "$CONFIG_DIR/policies/default_policies.json"
+if [ -n "$(ls -A "$CONFIG_DIR/policies" 2>/dev/null)" ] || [ -n "$(ls -A "$CONFIG_DIR/roles" 2>/dev/null)" ]; then
+    echo "ℹ️  Existing config found in $CONFIG_DIR — keeping it."
+elif prompt_confirm \
+    "Pull default policies and roles from Sevorix Hub" \
+    "Downloads the canonical default policy set from the public Hub registry (requires internet access).
+│  Artifacts: default-policies@1.0.0, default-roles@1.0.0
+│
+│  ⚠️  DISCLAIMER: Default policies and roles provide minimal safeguards only.
+│  To properly secure your system, critically review your use case and security
+│  vulnerabilities, and curate your own policies and roles for your environment."; then
+    echo "📝 Pulling default-policies from Hub..."
+    if "$INSTALL_DIR/$BINARY_NAME" hub pull default-policies 1.0.0 \
+            -o "$CONFIG_DIR/policies/default_policies.json" 2>&1; then
+        echo "   ✅ Default policies installed"
+    else
+        echo "   ⚠️  Failed to pull default policies — no policies installed."
+        rm -f "$CONFIG_DIR/policies/default_policies.json"
     fi
-else
-    echo "ℹ️  Existing policies found in $CONFIG_DIR/policies — keeping them."
-fi
 
-if [ -z "$(ls -A "$CONFIG_DIR/roles" 2>/dev/null)" ]; then
-    if [ -f "config/default_roles.json" ]; then
-        echo "📝 Installing default roles..."
-        cp "config/default_roles.json" "$CONFIG_DIR/roles/default_roles.json"
+    echo "📝 Pulling default-roles from Hub..."
+    if "$INSTALL_DIR/$BINARY_NAME" hub pull default-roles 1.0.0 \
+            -o "$CONFIG_DIR/roles/default_roles.json" 2>&1; then
+        echo "   ✅ Default roles installed"
+    else
+        echo "   ⚠️  Failed to pull default roles — no roles installed."
+        rm -f "$CONFIG_DIR/roles/default_roles.json"
     fi
 else
-    echo "ℹ️  Existing roles found in $CONFIG_DIR/roles — keeping them."
+    echo "ℹ️  Skipping default config — no policies or roles installed."
 fi
 
 # ---------------------------------------------------------------
