@@ -91,10 +91,21 @@ async fn main() -> Result<()> {
         }
     };
 
+    let max_artifact_bytes: usize = std::env::var("MAX_ARTIFACT_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(262144); // 256 KB
+
+    let require_signed_artifacts = std::env::var("REQUIRE_SIGNED_ARTIFACTS")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
     let state = Arc::new(AppState {
         db,
         store,
         jwt_secret: cli.jwt_secret,
+        max_artifact_bytes,
+        require_signed_artifacts,
     });
 
     // Rate limiting configuration
@@ -147,6 +158,9 @@ async fn main() -> Result<()> {
     let general_router = Router::new()
         .route("/api/v1/me", get(routes::get_current_user))
         .route("/api/v1/me/email", patch(routes::update_email))
+        .route("/api/v1/me/signing-keys", post(routes::register_signing_key))
+        .route("/api/v1/me/signing-keys", get(routes::list_signing_keys))
+        .route("/api/v1/me/signing-keys/:fingerprint", delete(routes::revoke_signing_key))
         .route("/api/v1/users/:user_id", get(routes::get_user_profile))
         .route(
             "/api/v1/admin/users/:user_id/approve",
@@ -159,6 +173,10 @@ async fn main() -> Result<()> {
             get(routes::pull_artifact),
         )
         .route(
+            "/api/v1/artifacts/:name/:version/members",
+            get(routes::get_set_members),
+        )
+        .route(
             "/api/v1/artifacts/:artifact_id/endorsements",
             post(routes::create_endorsement),
         )
@@ -169,6 +187,18 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/artifacts/:artifact_id/endorsements/:endorsement_id",
             delete(routes::delete_endorsement),
+        )
+        .route(
+            "/api/v1/artifacts/:id/yank",
+            post(routes::yank_artifact),
+        )
+        .route(
+            "/api/v1/artifacts/:id/yank",
+            delete(routes::unyank_artifact),
+        )
+        .route(
+            "/api/v1/artifacts/:name/:version/resolve",
+            get(routes::resolve_dependencies),
         )
         .layer(GovernorLayer {
             config: Arc::clone(&global_rate_limit),

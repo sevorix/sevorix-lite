@@ -13,3 +13,15 @@ threat_log.txt
 __pycache__/
 .sevorix.pid
 server.log
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
+
+# Terraform
+infra/.terraform/
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+
+# Playwright CLI cache
+.playwright-cli/

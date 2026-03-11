@@ -22,4 +22,7 @@ pub struct AppState {
     pub db: DbPool,
     pub store: Store,
     pub jwt_secret: String,
+    /// Maximum artifact content size in bytes (default: 262144 = 256 KB).
+    pub max_artifact_bytes: usize,
+    pub require_signed_artifacts: bool,
 }

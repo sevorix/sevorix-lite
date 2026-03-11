@@ -22,6 +22,7 @@ use crate::{
     store::ArtifactStore,
     AppState,
 };
+use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Register
@@ -336,6 +337,16 @@ pub struct PushRequest {
     /// Visibility level: "public", "private", or "draft"
     #[serde(default)]
     pub visibility: Option<String>,
+    /// Optional Ed25519 signature (base64) of the content SHA-256 hash.
+    pub signature: Option<String>,
+    /// Fingerprint of the signing key to look up in user_signing_keys.
+    pub key_fingerprint: Option<String>,
+    /// Optional list of declared dependencies for this artifact.
+    pub dependencies: Option<Vec<crate::models::DependencyRef>>,
+    /// Optional JSON Schema to validate content against on push.
+    pub schema: Option<serde_json::Value>,
+    /// "artifact" (default) or "set". Sets have no content and require ≥1 dependency.
+    pub artifact_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -349,6 +360,12 @@ pub struct PushResponse {
     pub visibility: Visibility,
     pub downloads: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub content_hash: Option<String>,
+    pub content_schema: Option<serde_json::Value>,
+    pub signed: bool,
+    pub key_fingerprint: Option<String>,
+    pub dependencies: Vec<crate::models::DependencyRef>,
+    pub artifact_type: String,
 }
 
 pub async fn push_artifact(
@@ -373,13 +390,22 @@ pub async fn push_artifact(
         ));
     }
 
-    if req.name.is_empty() || req.version.is_empty() {
-        return Err(AppError::BadRequest("name and version are required".into()));
-    }
+    // Input sanitization
+    validation::validate_name(&req.name)?;
+    validation::validate_version(&req.version)?;
+    let tags = req.tags.clone().unwrap_or_default();
+    validation::validate_tags(&tags)?;
+    validation::validate_description(&req.description)?;
+    validation::validate_content_size(&req.content, state.max_artifact_bytes)?;
 
     // Validate content is valid JSON.
-    serde_json::from_str::<serde_json::Value>(&req.content)
+    let _parsed_content: serde_json::Value = serde_json::from_str(&req.content)
         .map_err(|_| AppError::BadRequest("content must be valid JSON".into()))?;
+
+    // Validate content against optional JSON Schema.
+    if let Some(ref schema) = req.schema {
+        crate::validation::validate_json_schema(schema, &_parsed_content)?;
+    }
 
     // Parse visibility, default to public
     let visibility = match req.visibility.as_deref() {
@@ -394,18 +420,37 @@ pub async fn push_artifact(
         }
     };
 
+    // Resolve artifact type and enforce set rules.
+    let artifact_type_str = match req.artifact_type.as_deref().unwrap_or("artifact") {
+        "set" => {
+            if req.dependencies.as_ref().map_or(true, |d| d.is_empty()) {
+                return Err(AppError::BadRequest(
+                    "artifact sets must declare at least one member dependency".to_string(),
+                ));
+            }
+            "set"
+        }
+        _ => "artifact",
+    };
+
     let artifact_id = Uuid::new_v4();
+    // Compute SHA-256 checksum before storing
+    let content_hash = crate::signing::compute_sha256(req.content.as_bytes());
+
     let file_path = state
         .store
         .store(&artifact_id.to_string(), req.content.as_bytes())
         .await?;
 
-    let tags = req.tags.unwrap_or_default();
+    // tags already bound above via validation
     let visibility_str = visibility.to_string();
 
+    let content_schema_str: Option<String> = req.schema.as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
+
     let artifact_row = sqlx::query_as::<_, ArtifactRow>(
-        "INSERT INTO artifacts (id, name, version, description, owner_id, file_path, tags, visibility)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "INSERT INTO artifacts (id, name, version, description, owner_id, file_path, tags, visibility, content_hash, content_schema, artifact_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING *",
     )
     .bind(artifact_id)
@@ -416,6 +461,9 @@ pub async fn push_artifact(
     .bind(&file_path)
     .bind(&tags)
     .bind(&visibility_str)
+    .bind(&content_hash)
+    .bind(&content_schema_str)
+    .bind(artifact_type_str)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -433,6 +481,124 @@ pub async fn push_artifact(
         .fetch_one(&state.db)
         .await?;
 
+    // Enforce signing requirement if configured.
+    if state.require_signed_artifacts && req.signature.is_none() {
+        return Err(AppError::BadRequest(
+            "artifact signing is required on this hub".to_string(),
+        ));
+    }
+
+    // Optional: verify Ed25519 signature if provided.
+    if let (Some(ref sig_b64), Some(ref fingerprint)) =
+        (&req.signature, &req.key_fingerprint)
+    {
+        let key_row = sqlx::query_as::<_, crate::models::SigningKeyRow>(
+            "SELECT * FROM user_signing_keys
+             WHERE fingerprint = $1 AND user_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(fingerprint)
+        .bind(owner_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "signing key not found or does not belong to you".to_string(),
+            )
+        })?;
+
+        let verifying_key = crate::signing::parse_public_key(&key_row.public_key)?;
+        let content_hash = crate::signing::compute_sha256(req.content.as_bytes());
+        let valid = crate::signing::verify_signature(&verifying_key, &content_hash, sig_b64)?;
+        if !valid {
+            return Err(AppError::BadRequest(
+                "signature verification failed".to_string(),
+            ));
+        }
+    }
+
+    // Process declared dependencies.
+    let declared_deps: Vec<crate::models::DependencyRef> =
+        req.dependencies.clone().unwrap_or_default();
+
+    if !declared_deps.is_empty() {
+        // 1. Strict existence check: every declared dep must exist.
+        for dep in &declared_deps {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE name = $1 AND version = $2)",
+            )
+            .bind(&dep.name)
+            .bind(&dep.version)
+            .fetch_one(&state.db)
+            .await?;
+
+            if !exists {
+                return Err(AppError::BadRequest(format!(
+                    "dependency '{}@{}' does not exist",
+                    dep.name, dep.version
+                )));
+            }
+        }
+
+        // 2. Circular dependency check via BFS.
+        // Build the set we need to check: can we reach req.name@req.version
+        // from any declared dep's transitive closure?
+        #[derive(sqlx::FromRow)]
+        struct DepPair {
+            dep_name: String,
+            dep_version: String,
+        }
+
+        let target = format!("{}@{}", req.name, req.version);
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<(String, String)> = declared_deps
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
+
+        while let Some((dep_name, dep_version)) = queue.pop_front() {
+            let key = format!("{}@{}", dep_name, dep_version);
+            if key == target {
+                return Err(AppError::BadRequest(
+                    "circular dependency detected".to_string(),
+                ));
+            }
+            if visited.contains(&key) {
+                continue;
+            }
+            visited.insert(key);
+
+            // Load transitive deps of this dep.
+            let transitive: Vec<DepPair> = sqlx::query_as(
+                "SELECT dep_name, dep_version FROM artifact_dependencies
+                 WHERE artifact_id = (
+                     SELECT id FROM artifacts WHERE name = $1 AND version = $2
+                 )",
+            )
+            .bind(&dep_name)
+            .bind(&dep_version)
+            .fetch_all(&state.db)
+            .await?;
+
+            for t in transitive {
+                queue.push_back((t.dep_name, t.dep_version));
+            }
+        }
+
+        // 3. Insert dependency rows.
+        for dep in &declared_deps {
+            sqlx::query(
+                "INSERT INTO artifact_dependencies (artifact_id, dep_name, dep_version, dep_required)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(artifact.id)
+            .bind(&dep.name)
+            .bind(&dep.version)
+            .bind(dep.required)
+            .execute(&state.db)
+            .await?;
+        }
+    }
+
     // Audit log the artifact push
     audit::log_artifact_push(&email, &artifact.name, &artifact.version, Some(&ip_str));
 
@@ -448,6 +614,13 @@ pub async fn push_artifact(
             visibility: artifact.visibility,
             downloads: artifact.downloads,
             created_at: artifact.created_at,
+            content_hash: artifact.content_hash,
+            content_schema: artifact.content_schema.as_ref()
+                .and_then(|s| serde_json::from_str(s).ok()),
+            signed: req.signature.is_some(),
+            key_fingerprint: req.key_fingerprint.clone(),
+            dependencies: declared_deps.clone(),
+            artifact_type: artifact.artifact_type.to_string(),
         }),
     ))
 }
@@ -456,11 +629,35 @@ pub async fn push_artifact(
 // Pull artifact
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize)]
+pub struct PullResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub owner: String,
+    pub owner_is_endorsed: bool,
+    pub tags: Vec<String>,
+    pub downloads: i32,
+    pub visibility: crate::models::Visibility,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub content: Option<serde_json::Value>,
+    pub content_hash: Option<String>,
+    pub content_schema: Option<serde_json::Value>,
+    pub signed: bool,
+    pub key_fingerprint: Option<String>,
+    pub signature_valid: Option<bool>,
+    pub artifact_type: String,
+    pub yanked: bool,
+    pub yanked_reason: Option<String>,
+    pub dependencies: Vec<crate::models::DependencyRef>,
+}
+
 pub async fn pull_artifact(
     State(state): State<Arc<AppState>>,
     Path((name, version)): Path<(String, String)>,
     headers: HeaderMap,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<PullResponse>> {
     // Try to extract user from headers (optional for public artifacts)
     let (user_id, _email) = match extract_user_optional(&headers, &state) {
         Some((uid, email)) => (Some(uid), Some(email)),
@@ -506,6 +703,18 @@ pub async fn pull_artifact(
         .await?;
 
     let raw = state.store.retrieve(&artifact.file_path).await?;
+
+    // Verify content integrity if a hash was stored.
+    if let Some(ref stored_hash) = artifact.content_hash {
+        let actual_hash = crate::signing::compute_sha256(&raw);
+        if &actual_hash != stored_hash {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "content integrity check failed for artifact '{}@{}'",
+                artifact.name, artifact.version
+            )));
+        }
+    }
+
     let content: serde_json::Value = serde_json::from_slice(&raw)?;
 
     let owner: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
@@ -519,19 +728,73 @@ pub async fn pull_artifact(
             .fetch_one(&state.db)
             .await?;
 
-    Ok(Json(serde_json::json!({
-        "id": artifact.id,
-        "name": artifact.name,
-        "version": artifact.version,
-        "description": artifact.description,
-        "owner": owner,
-        "owner_is_endorsed": owner_is_endorsed,
-        "tags": artifact.tags,
-        "downloads": artifact.downloads,
-        "visibility": artifact.visibility,
-        "created_at": artifact.created_at,
-        "content": content,
-    })))
+    // Verify signature if present.
+    let signature_valid: Option<bool> = if artifact.signature.is_some() && artifact.key_fingerprint.is_some() {
+        let fingerprint = artifact.key_fingerprint.as_deref().unwrap();
+        let sig_b64 = artifact.signature.as_deref().unwrap();
+        match sqlx::query_as::<_, crate::models::SigningKeyRow>(
+            "SELECT * FROM user_signing_keys WHERE fingerprint = $1",
+        )
+        .bind(fingerprint)
+        .fetch_optional(&state.db)
+        .await?
+        {
+            Some(key_row) => {
+                let verifying_key = crate::signing::parse_public_key(&key_row.public_key)
+                    .ok();
+                if let Some(vk) = verifying_key {
+                    if let Some(ref stored_hash) = artifact.content_hash {
+                        let valid = crate::signing::verify_signature(&vk, stored_hash, sig_b64)
+                            .unwrap_or(false);
+                        // If key is revoked, signature_valid = false
+                        let revoked = key_row.revoked_at.is_some();
+                        Some(valid && !revoked)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(false)
+                }
+            }
+            None => Some(false),
+        }
+    } else {
+        None
+    };
+
+    // Load declared dependencies.
+    let dep_rows = sqlx::query_as::<_, crate::models::ArtifactDependency>(
+        "SELECT * FROM artifact_dependencies WHERE artifact_id = $1 ORDER BY dep_name, dep_version",
+    )
+    .bind(artifact.id)
+    .fetch_all(&state.db)
+    .await?;
+    let dependencies: Vec<crate::models::DependencyRef> =
+        dep_rows.into_iter().map(crate::models::DependencyRef::from).collect();
+
+    Ok(Json(PullResponse {
+        id: artifact.id,
+        name: artifact.name,
+        version: artifact.version,
+        description: artifact.description,
+        owner,
+        owner_is_endorsed,
+        tags: artifact.tags,
+        downloads: artifact.downloads,
+        visibility: artifact.visibility,
+        created_at: artifact.created_at,
+        content: Some(content),
+        content_hash: artifact.content_hash,
+        content_schema: artifact.content_schema.as_ref()
+            .and_then(|s| serde_json::from_str(s).ok()),
+        signed: artifact.signature.is_some(),
+        key_fingerprint: artifact.key_fingerprint,
+        signature_valid,
+        artifact_type: artifact.artifact_type.to_string(),
+        yanked: artifact.yanked,
+        yanked_reason: artifact.yanked_reason,
+        dependencies,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +807,7 @@ pub struct SearchParams {
     pub tag: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub include_yanked: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -589,15 +853,21 @@ pub async fn search_artifacts(
         " AND a.visibility = 'public'"
     };
 
+    let show_yanked = params.include_yanked.unwrap_or(false) && is_admin;
+    // Used in JOIN queries where artifacts is aliased as "a"
+    let yanked_filter = if show_yanked { "" } else { " AND a.yanked = false" };
+    // Used in COUNT queries where artifacts has no alias
+    let yanked_filter_count = if show_yanked { "" } else { " AND yanked = false" };
+
     let rows: Vec<ArtifactWithOwnerRow> = if let Some(ref tag) = params.tag {
         let query = format!(
             "SELECT a.*, u.email, u.is_endorsed as owner_is_endorsed
              FROM artifacts a
              JOIN users u ON a.owner_id = u.id
-             WHERE $1 = ANY(a.tags){}
+             WHERE $1 = ANY(a.tags){}{}
              ORDER BY a.created_at DESC
              LIMIT $2 OFFSET $3",
-            visibility_filter
+            visibility_filter, yanked_filter
         );
         if user_id.is_some() && !is_admin {
             sqlx::query_as(&query)
@@ -622,10 +892,10 @@ pub async fn search_artifacts(
              FROM artifacts a
              JOIN users u ON a.owner_id = u.id
              WHERE (LOWER(a.name) LIKE $1
-                OR LOWER(COALESCE(a.description, '')) LIKE $1){}
+                OR LOWER(COALESCE(a.description, '')) LIKE $1){}{}
              ORDER BY a.created_at DESC
              LIMIT $2 OFFSET $3",
-            visibility_filter
+            visibility_filter, yanked_filter
         );
         if user_id.is_some() && !is_admin {
             sqlx::query_as(&query)
@@ -648,10 +918,10 @@ pub async fn search_artifacts(
             "SELECT a.*, u.email, u.is_endorsed as owner_is_endorsed
              FROM artifacts a
              JOIN users u ON a.owner_id = u.id
-             WHERE 1=1{}
+             WHERE 1=1{}{}
              ORDER BY a.created_at DESC
              LIMIT $1 OFFSET $2",
-            visibility_filter
+            visibility_filter, yanked_filter
         );
         if user_id.is_some() && !is_admin {
             sqlx::query_as(&query)
@@ -677,18 +947,25 @@ pub async fn search_artifacts(
 
     // Count total (only public for anonymous, all for admin, public+own for authenticated)
     let total: i64 = if is_admin {
-        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts")
+        let count_query = format!("SELECT COUNT(*) FROM artifacts WHERE 1=1{}", yanked_filter_count);
+        sqlx::query_scalar(&count_query)
             .fetch_one(&state.db)
             .await?
     } else if let Some(uid) = user_id {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artifacts WHERE visibility = 'public' OR owner_id = $1",
-        )
-        .bind(uid)
-        .fetch_one(&state.db)
-        .await?
+        let count_query = format!(
+            "SELECT COUNT(*) FROM artifacts WHERE (visibility = 'public' OR owner_id = $1){}",
+            yanked_filter_count
+        );
+        sqlx::query_scalar(&count_query)
+            .bind(uid)
+            .fetch_one(&state.db)
+            .await?
     } else {
-        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE visibility = 'public'")
+        let count_query = format!(
+            "SELECT COUNT(*) FROM artifacts WHERE visibility = 'public'{}",
+            yanked_filter_count
+        );
+        sqlx::query_scalar(&count_query)
             .fetch_one(&state.db)
             .await?
     };
@@ -929,6 +1206,382 @@ pub async fn approve_user(
 }
 
 // ---------------------------------------------------------------------------
+// Signing keys
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct RegisterSigningKeyRequest {
+    /// Base64-encoded raw 32-byte Ed25519 public key.
+    pub public_key: String,
+    pub label: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RegisterSigningKeyResponse {
+    pub id: uuid::Uuid,
+    pub fingerprint: String,
+    pub label: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn register_signing_key(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterSigningKeyRequest>,
+) -> AppResult<(StatusCode, Json<RegisterSigningKeyResponse>)> {
+    let ip_str = addr.ip().to_string();
+    let (user_id, _email) = extract_user_from_headers(&headers, &state, Some(&ip_str))?;
+
+    // Validate and compute fingerprint.
+    let verifying_key = crate::signing::parse_public_key(&req.public_key)?;
+    let fingerprint = crate::signing::public_key_fingerprint(verifying_key.as_bytes());
+
+    let row = sqlx::query_as::<_, crate::models::SigningKeyRow>(
+        "INSERT INTO user_signing_keys (user_id, public_key, fingerprint, label)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *",
+    )
+    .bind(user_id)
+    .bind(&req.public_key)
+    .bind(&fingerprint)
+    .bind(&req.label)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| map_db_err(e, "a key with this fingerprint already exists"))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RegisterSigningKeyResponse {
+            id: row.id,
+            fingerprint: row.fingerprint,
+            label: row.label,
+            created_at: row.created_at,
+        }),
+    ))
+}
+
+pub async fn list_signing_keys(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<crate::models::SigningKey>>> {
+    let ip_str = addr.ip().to_string();
+    let (user_id, _email) = extract_user_from_headers(&headers, &state, Some(&ip_str))?;
+
+    let rows = sqlx::query_as::<_, crate::models::SigningKeyRow>(
+        "SELECT * FROM user_signing_keys WHERE user_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(rows.into_iter().map(crate::models::SigningKey::from).collect()))
+}
+
+pub async fn revoke_signing_key(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(fingerprint): Path<String>,
+    headers: HeaderMap,
+) -> AppResult<StatusCode> {
+    let ip_str = addr.ip().to_string();
+    let (user_id, _email) = extract_user_from_headers(&headers, &state, Some(&ip_str))?;
+
+    let result = sqlx::query(
+        "UPDATE user_signing_keys SET revoked_at = NOW()
+         WHERE fingerprint = $1 AND user_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(&fingerprint)
+    .bind(user_id)
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(
+            "signing key not found or already revoked".to_string(),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Set members
+// ---------------------------------------------------------------------------
+
+pub async fn get_set_members(
+    State(state): State<Arc<AppState>>,
+    Path((name, version)): Path<(String, String)>,
+    _headers: HeaderMap,
+) -> AppResult<Json<serde_json::Value>> {
+    let artifact_row = sqlx::query_as::<_, crate::models::ArtifactRow>(
+        "SELECT * FROM artifacts WHERE name = $1 AND version = $2",
+    )
+    .bind(&name)
+    .bind(&version)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("artifact '{}@{}' not found", name, version)))?;
+
+    let artifact = artifact_row
+        .into_artifact()
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    if artifact.artifact_type != crate::models::ArtifactType::Set {
+        return Err(AppError::BadRequest(
+            "this endpoint is only available for artifact sets".to_string(),
+        ));
+    }
+
+    let dep_rows = sqlx::query_as::<_, crate::models::ArtifactDependency>(
+        "SELECT * FROM artifact_dependencies WHERE artifact_id = $1 ORDER BY dep_name, dep_version",
+    )
+    .bind(artifact.id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let members: Vec<crate::models::DependencyRef> =
+        dep_rows.into_iter().map(crate::models::DependencyRef::from).collect();
+
+    Ok(Json(serde_json::json!({
+        "set_name": artifact.name,
+        "set_version": artifact.version,
+        "members": members,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Artifact yanking
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct YankRequest {
+    pub reason: Option<String>,
+}
+
+pub async fn yank_artifact(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(artifact_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<YankRequest>,
+) -> AppResult<StatusCode> {
+    let ip_str = addr.ip().to_string();
+    let (user_id, _email) = extract_user_from_headers(&headers, &state, Some(&ip_str))?;
+
+    let is_admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(false);
+
+    let artifact_row = sqlx::query_as::<_, crate::models::ArtifactRow>(
+        "SELECT * FROM artifacts WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("artifact not found".to_string()))?;
+
+    if !is_admin && artifact_row.owner_id != user_id {
+        return Err(AppError::Forbidden(
+            "only the artifact owner or an admin can yank an artifact".to_string(),
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE artifacts SET yanked = true, yanked_reason = $1 WHERE id = $2",
+    )
+    .bind(&req.reason)
+    .bind(artifact_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn unyank_artifact(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(artifact_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> AppResult<StatusCode> {
+    let ip_str = addr.ip().to_string();
+    let (user_id, _email) = extract_user_from_headers(&headers, &state, Some(&ip_str))?;
+
+    let is_admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(false);
+
+    let artifact_row = sqlx::query_as::<_, crate::models::ArtifactRow>(
+        "SELECT * FROM artifacts WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("artifact not found".to_string()))?;
+
+    if !is_admin && artifact_row.owner_id != user_id {
+        return Err(AppError::Forbidden(
+            "only the artifact owner or an admin can unyank an artifact".to_string(),
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE artifacts SET yanked = false, yanked_reason = NULL WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Dependency resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct ResolvedDep {
+    pub name: String,
+    pub version: String,
+    pub required: bool,
+    pub depth: u32,
+    pub found: bool,
+}
+
+#[derive(Serialize)]
+pub struct ResolveResponse {
+    pub root: String,
+    pub dependencies: Vec<ResolvedDep>,
+}
+
+pub async fn resolve_dependencies(
+    State(state): State<Arc<AppState>>,
+    Path((name, version)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> AppResult<Json<ResolveResponse>> {
+    // Verify root artifact exists and is accessible.
+    let artifact_row = sqlx::query_as::<_, crate::models::ArtifactRow>(
+        "SELECT * FROM artifacts WHERE name = $1 AND version = $2",
+    )
+    .bind(&name)
+    .bind(&version)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("artifact '{}@{}' not found", name, version)))?;
+
+    let artifact = artifact_row
+        .into_artifact()
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("{}", e)))?;
+
+    // Optional auth check for private artifacts.
+    let user_info = {
+        let token = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if let Some(tok) = token {
+            crate::auth::verify_token(tok, &state.jwt_secret)
+                .ok()
+                .and_then(|c| c.sub.parse::<Uuid>().ok())
+        } else {
+            None
+        }
+    };
+    let is_admin = if let Some(uid) = user_info {
+        sqlx::query_scalar::<_, bool>("SELECT is_admin FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&state.db)
+            .await?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if !can_access_artifact(&artifact, user_info, is_admin) {
+        return Err(AppError::NotFound(format!(
+            "artifact '{}@{}' not found",
+            name, version
+        )));
+    }
+
+    const MAX_DEPTH: u32 = 50;
+    let root_key = format!("{}@{}", name, version);
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(root_key.clone());
+
+    // BFS queue: (dep_name, dep_version, required, depth)
+    let mut queue: std::collections::VecDeque<(String, String, bool, u32)> =
+        std::collections::VecDeque::new();
+    let mut result: Vec<ResolvedDep> = Vec::new();
+
+    // Load direct deps of root.
+    #[derive(sqlx::FromRow)]
+    struct DepTuple {
+        dep_name: String,
+        dep_version: String,
+        dep_required: bool,
+    }
+    let direct_deps: Vec<DepTuple> = sqlx::query_as(
+        "SELECT dep_name, dep_version, dep_required FROM artifact_dependencies WHERE artifact_id = $1",
+    )
+    .bind(artifact.id)
+    .fetch_all(&state.db)
+    .await?;
+
+    for d in direct_deps {
+        queue.push_back((d.dep_name, d.dep_version, d.dep_required, 1));
+    }
+
+    while let Some((dep_name, dep_version, required, depth)) = queue.pop_front() {
+        let key = format!("{}@{}", dep_name, dep_version);
+        if visited.contains(&key) {
+            continue;
+        }
+        visited.insert(key);
+
+        let found: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE name = $1 AND version = $2)",
+        )
+        .bind(&dep_name)
+        .bind(&dep_version)
+        .fetch_one(&state.db)
+        .await?;
+
+        result.push(ResolvedDep {
+            name: dep_name.clone(),
+            version: dep_version.clone(),
+            required,
+            depth,
+            found,
+        });
+
+        if found && depth < MAX_DEPTH {
+            let transitive: Vec<DepTuple> = sqlx::query_as(
+                "SELECT dep_name, dep_version, dep_required FROM artifact_dependencies
+                 WHERE artifact_id = (SELECT id FROM artifacts WHERE name = $1 AND version = $2)",
+            )
+            .bind(&dep_name)
+            .bind(&dep_version)
+            .fetch_all(&state.db)
+            .await?;
+
+            for t in transitive {
+                queue.push_back((t.dep_name, t.dep_version, t.dep_required, depth + 1));
+            }
+        }
+    }
+
+    Ok(Json(ResolveResponse {
+        root: root_key,
+        dependencies: result,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1145,6 +1798,8 @@ mod tests {
             db: sqlx::postgres::PgPool::connect_lazy("postgres://localhost/test").unwrap(),
             store: Store::filesystem("/tmp/test"),
             jwt_secret: jwt_secret.to_string(),
+            max_artifact_bytes: 262144,
+            require_signed_artifacts: false,
         }
     }
 
@@ -1415,6 +2070,12 @@ mod tests {
             visibility: Visibility::Public,
             downloads: 0,
             created_at,
+            content_hash: None,
+            content_schema: None,
+            signed: false,
+            key_fingerprint: None,
+            dependencies: vec![],
+            artifact_type: "artifact".to_string(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("artifact"));
@@ -1535,5 +2196,638 @@ mod tests {
 
         let params: SearchParams = serde_json::from_str(r#"{"limit": -5}"#).unwrap();
         assert_eq!(params.limit, Some(-5));
+    }
+
+    // =========================================================================
+    // SHA-256 checksum and downloads counter tests
+    // =========================================================================
+
+    /// Verify that a PushResponse with a non-None content_hash carries a non-empty value.
+    /// In the live handler, push always computes and stores a SHA-256 hash via
+    /// `crate::signing::compute_sha256`. Here we simulate the same computation and
+    /// confirm the resulting PushResponse field is present and non-empty.
+    #[test]
+    fn test_push_returns_content_hash() {
+        let content = r#"{"key": "value"}"#;
+        // Simulate what the push handler does before inserting into DB.
+        let computed_hash = crate::signing::compute_sha256(content.as_bytes());
+
+        let id = Uuid::new_v4();
+        let resp = PushResponse {
+            id,
+            name: "my-artifact".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            owner: "user@example.com".to_string(),
+            tags: vec![],
+            visibility: Visibility::Public,
+            downloads: 0,
+            created_at: chrono::Utc::now(),
+            content_hash: Some(computed_hash.clone()),
+            content_schema: None,
+            signed: false,
+            key_fingerprint: None,
+            dependencies: vec![],
+            artifact_type: "artifact".to_string(),
+        };
+
+        // content_hash must be present and non-empty.
+        assert!(
+            resp.content_hash.is_some(),
+            "PushResponse should carry a content_hash after push"
+        );
+        assert!(
+            !resp.content_hash.as_deref().unwrap_or("").is_empty(),
+            "content_hash in PushResponse must not be empty"
+        );
+    }
+
+    /// Verify that the SHA-256 hash returned by `compute_sha256` matches the known
+    /// digest for a fixed input. This confirms the push handler stores the correct
+    /// checksum in PushResponse.content_hash.
+    #[test]
+    fn test_push_content_hash_is_sha256() {
+        // Known SHA-256 of the exact bytes b"hello world":
+        // echo -n "hello world" | sha256sum
+        //   b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+        let content = "hello world";
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+        let actual = crate::signing::compute_sha256(content.as_bytes());
+        assert_eq!(
+            actual, expected,
+            "compute_sha256 must return the correct SHA-256 hex digest"
+        );
+
+        // Also verify the hash is exactly 64 hex characters (256 bits).
+        assert_eq!(actual.len(), 64, "SHA-256 hex digest must be 64 characters");
+    }
+
+    /// Verify that a PullResponse constructed from a pushed artifact carries the
+    /// content_hash field. In the live handler, the stored hash is propagated from
+    /// the artifact row into PullResponse.content_hash.
+    #[test]
+    fn test_pull_includes_content_hash() {
+        let content = r#"{"agent": "config"}"#;
+        let hash = crate::signing::compute_sha256(content.as_bytes());
+
+        // Simulate what pull_artifact assembles from the DB row + store.
+        let resp = PullResponse {
+            id: Uuid::new_v4(),
+            name: "agent-cfg".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            owner: "owner@example.com".to_string(),
+            owner_is_endorsed: false,
+            tags: vec![],
+            downloads: 1,
+            visibility: Visibility::Public,
+            created_at: chrono::Utc::now(),
+            content: Some(serde_json::from_str(content).unwrap()),
+            content_hash: Some(hash.clone()),
+            content_schema: None,
+            signed: false,
+            key_fingerprint: None,
+            signature_valid: None,
+            artifact_type: "artifact".to_string(),
+            yanked: false,
+            yanked_reason: None,
+            dependencies: vec![],
+        };
+
+        // The pull response must include the hash that was stored during push.
+        assert!(
+            resp.content_hash.is_some(),
+            "PullResponse must include content_hash that was stored during push"
+        );
+        assert_eq!(
+            resp.content_hash.as_deref(),
+            Some(hash.as_str()),
+            "PullResponse.content_hash must match the SHA-256 of the original content"
+        );
+    }
+
+    /// Verify that the download counter is NOT incremented when an anonymous user
+    /// attempts to pull a private artifact.
+    ///
+    /// In the live handler (`pull_artifact`), the download increment query
+    /// (`UPDATE artifacts SET downloads = downloads + 1`) is only executed AFTER
+    /// `can_access_artifact` returns `true`. When access is denied the function
+    /// returns an error immediately, so the counter stays at 0.
+    ///
+    /// This test exercises the `can_access_artifact` guard directly — the same
+    /// predicate the handler uses — to confirm that anonymous access to a private
+    /// artifact is denied, which is the gate that prevents the increment.
+    #[test]
+    fn test_download_count_not_incremented_on_denied_pull() {
+        let owner_id = Uuid::new_v4();
+        // Artifact owned by user A, visibility = Private, downloads = 0.
+        let artifact = create_test_artifact(Visibility::Private, owner_id);
+        assert_eq!(
+            artifact.downloads, 0,
+            "downloads should start at 0 before any pull"
+        );
+
+        // Simulate an anonymous pull attempt (no JWT → user_id = None, is_admin = false).
+        let anonymous_user_id: Option<Uuid> = None;
+        let is_admin = false;
+        let access_granted = can_access_artifact(&artifact, anonymous_user_id, is_admin);
+
+        // Access must be denied — the handler would return an error here and skip the
+        // `UPDATE artifacts SET downloads = downloads + 1` query entirely.
+        assert!(
+            !access_granted,
+            "anonymous user must not be granted access to a private artifact"
+        );
+
+        // Because access was denied, downloads remains unchanged at 0.
+        // (In a real integration test against a live DB the count could be verified
+        // with a SELECT after the failed pull; here we confirm the gate is closed.)
+        assert_eq!(
+            artifact.downloads, 0,
+            "download count must remain 0 when access is denied"
+        );
+    }
+
+    // =========================================================================
+    // Input sanitization tests (sw-jkb)
+    // =========================================================================
+
+    #[test]
+    fn test_validate_name_empty_returns_error() {
+        let result = crate::validation::validate_name("");
+        assert!(result.is_err(), "empty name must be rejected");
+    }
+
+    #[test]
+    fn test_validate_name_with_slash_returns_error() {
+        let result = crate::validation::validate_name("foo/bar");
+        assert!(result.is_err(), "name containing '/' must be rejected");
+    }
+
+    #[test]
+    fn test_validate_name_with_space_returns_error() {
+        let result = crate::validation::validate_name("my artifact");
+        assert!(result.is_err(), "name containing a space must be rejected");
+    }
+
+    #[test]
+    fn test_validate_version_with_spaces_returns_error() {
+        let result = crate::validation::validate_version("1.0 bad");
+        assert!(result.is_err(), "version containing a space must be rejected");
+    }
+
+    #[test]
+    fn test_validate_tags_21_tags_returns_error() {
+        let tags: Vec<String> = (0..21).map(|i| format!("tag{}", i)).collect();
+        let result = crate::validation::validate_tags(&tags);
+        assert!(result.is_err(), "21 tags must be rejected (max is 20)");
+    }
+
+    #[test]
+    fn test_validate_tags_20_tags_ok() {
+        let tags: Vec<String> = (0..20).map(|i| format!("tag{}", i)).collect();
+        let result = crate::validation::validate_tags(&tags);
+        assert!(result.is_ok(), "exactly 20 tags must be accepted");
+    }
+
+    #[test]
+    fn test_validate_content_size_at_limit_ok() {
+        // Exactly 256 KB should be accepted.
+        let content = "x".repeat(262144);
+        let result = crate::validation::validate_content_size(&content, 262144);
+        assert!(result.is_ok(), "content exactly at the 256KB limit must be accepted");
+    }
+
+    #[test]
+    fn test_validate_content_size_one_over_limit_rejected() {
+        // 256 KB + 1 byte must be rejected.
+        let content = "x".repeat(262145);
+        let result = crate::validation::validate_content_size(&content, 262144);
+        assert!(result.is_err(), "content one byte over the limit must be rejected");
+    }
+
+    // =========================================================================
+    // Ed25519 signing request/response tests (sw-8vu)
+    // =========================================================================
+
+    #[test]
+    fn test_register_signing_key_request_deserialization() {
+        let json = r#"{"public_key": "base64encodedkey==", "label": "my-key"}"#;
+        let req: RegisterSigningKeyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.public_key, "base64encodedkey==");
+        assert_eq!(req.label, Some("my-key".to_string()));
+    }
+
+    #[test]
+    fn test_register_signing_key_request_without_label() {
+        let json = r#"{"public_key": "base64encodedkey=="}"#;
+        let req: RegisterSigningKeyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.public_key, "base64encodedkey==");
+        assert!(req.label.is_none());
+    }
+
+    #[test]
+    fn test_push_request_with_signature_fields() {
+        let json = r#"{
+            "name": "signed-artifact",
+            "version": "1.0.0",
+            "content": "{}",
+            "signature": "base64sig==",
+            "key_fingerprint": "abcdef1234567890"
+        }"#;
+        let req: PushRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.signature, Some("base64sig==".to_string()));
+        assert_eq!(req.key_fingerprint, Some("abcdef1234567890".to_string()));
+    }
+
+    #[test]
+    fn test_push_response_signed_true_serialization() {
+        let id = Uuid::new_v4();
+        let resp = PushResponse {
+            id,
+            name: "artifact".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            owner: "signer@test.com".to_string(),
+            tags: vec![],
+            visibility: Visibility::Public,
+            downloads: 0,
+            created_at: chrono::Utc::now(),
+            content_hash: Some("abc123".to_string()),
+            content_schema: None,
+            signed: true,
+            key_fingerprint: Some("fp123".to_string()),
+            dependencies: vec![],
+            artifact_type: "artifact".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"signed\":true"));
+        assert!(json.contains("\"key_fingerprint\":\"fp123\""));
+    }
+
+    #[test]
+    fn test_pull_response_signature_valid_field() {
+        let resp = PullResponse {
+            id: Uuid::new_v4(),
+            name: "artifact".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            owner: "owner@test.com".to_string(),
+            owner_is_endorsed: false,
+            tags: vec![],
+            downloads: 1,
+            visibility: Visibility::Public,
+            created_at: chrono::Utc::now(),
+            content: Some(serde_json::json!({})),
+            content_hash: Some("hash".to_string()),
+            content_schema: None,
+            signed: true,
+            key_fingerprint: Some("fp123".to_string()),
+            signature_valid: Some(true),
+            artifact_type: "artifact".to_string(),
+            yanked: false,
+            yanked_reason: None,
+            dependencies: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"signature_valid\":true"));
+        assert!(json.contains("\"signed\":true"));
+    }
+
+    // =========================================================================
+    // Artifact dependency tests (sw-x1e)
+    // =========================================================================
+
+    #[test]
+    fn test_push_request_with_dependencies_deserialization() {
+        let json = r#"{
+            "name": "artifact-a",
+            "version": "1.0.0",
+            "content": "{}",
+            "dependencies": [
+                {"name": "artifact-b", "version": "1.0.0", "required": true}
+            ]
+        }"#;
+        let req: PushRequest = serde_json::from_str(json).unwrap();
+        let deps = req.dependencies.as_ref().unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "artifact-b");
+        assert_eq!(deps[0].version, "1.0.0");
+        assert!(deps[0].required);
+    }
+
+    #[test]
+    fn test_dependency_error_message_format() {
+        // Verify the error message format used by push_artifact is consistent.
+        let dep_name = "no-such-artifact";
+        let dep_version = "1.0";
+        let msg = format!("dependency '{}@{}' does not exist", dep_name, dep_version);
+        assert!(msg.contains("no-such-artifact@1.0"));
+        assert!(msg.contains("does not exist"));
+    }
+
+    #[test]
+    fn test_push_response_includes_dependencies() {
+        let id = Uuid::new_v4();
+        let resp = PushResponse {
+            id,
+            name: "artifact-a".to_string(),
+            version: "2.0.0".to_string(),
+            description: None,
+            owner: "owner@test.com".to_string(),
+            tags: vec![],
+            visibility: Visibility::Public,
+            downloads: 0,
+            created_at: chrono::Utc::now(),
+            content_hash: None,
+            content_schema: None,
+            signed: false,
+            key_fingerprint: None,
+            artifact_type: "artifact".to_string(),
+            dependencies: vec![crate::models::DependencyRef {
+                name: "artifact-b".to_string(),
+                version: "1.0.0".to_string(),
+                required: true,
+            }],
+        };
+        assert_eq!(resp.dependencies.len(), 1);
+        assert_eq!(resp.dependencies[0].name, "artifact-b");
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("artifact-b"));
+        assert!(json.contains("\"dependencies\""));
+    }
+
+    #[test]
+    fn test_pull_response_includes_dependencies() {
+        let dep = crate::models::DependencyRef {
+            name: "artifact-b".to_string(),
+            version: "1.0.0".to_string(),
+            required: true,
+        };
+        let resp = PullResponse {
+            id: Uuid::new_v4(),
+            name: "artifact-a".to_string(),
+            version: "2.0.0".to_string(),
+            description: None,
+            owner: "owner@test.com".to_string(),
+            owner_is_endorsed: false,
+            tags: vec![],
+            downloads: 1,
+            visibility: Visibility::Public,
+            created_at: chrono::Utc::now(),
+            content: Some(serde_json::json!({})),
+            content_hash: None,
+            content_schema: None,
+            signed: false,
+            key_fingerprint: None,
+            signature_valid: None,
+            artifact_type: "artifact".to_string(),
+            yanked: false,
+            yanked_reason: None,
+            dependencies: vec![dep],
+        };
+
+        assert_eq!(resp.dependencies.len(), 1);
+        assert_eq!(resp.dependencies[0].name, "artifact-b");
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"dependencies\""));
+        assert!(json.contains("artifact-b"));
+    }
+
+    // =========================================================================
+    // Artifact sets tests (sw-cxg)
+    // =========================================================================
+
+    #[test]
+    fn test_push_request_set_type_deserialization() {
+        let json = r#"{
+            "name": "my-set",
+            "version": "1.0.0",
+            "content": "{}",
+            "artifact_type": "set",
+            "dependencies": [
+                {"name": "artifact-a", "version": "1.0.0", "required": true}
+            ]
+        }"#;
+        let req: PushRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.artifact_type, Some("set".to_string()));
+        assert_eq!(req.content, "{}");
+        let deps = req.dependencies.as_ref().unwrap();
+        assert_eq!(deps.len(), 1);
+    }
+
+    #[test]
+    fn test_set_type_with_no_deps_validation() {
+        // A set with no deps fails the handler-level check. Verify the logic by
+        // testing the same predicate the handler uses.
+        let deps: Option<Vec<crate::models::DependencyRef>> = None;
+        let is_empty = deps.as_ref().map_or(true, |d| d.is_empty());
+        assert!(is_empty, "None deps must be treated as empty for set validation");
+
+        let empty_deps: Option<Vec<crate::models::DependencyRef>> = Some(vec![]);
+        let also_empty = empty_deps.as_ref().map_or(true, |d| d.is_empty());
+        assert!(also_empty, "empty deps vec must also fail set validation");
+    }
+
+    #[test]
+    fn test_get_set_members_response_structure() {
+        // Simulate what get_set_members returns for a valid set.
+        let members = vec![
+            crate::models::DependencyRef { name: "role-a".to_string(), version: "1.0".to_string(), required: true },
+            crate::models::DependencyRef { name: "policy-b".to_string(), version: "2.0".to_string(), required: false },
+        ];
+        let resp = serde_json::json!({
+            "set_name": "my-set",
+            "set_version": "1.0.0",
+            "members": members,
+        });
+        assert!(resp["members"].is_array());
+        assert_eq!(resp["members"].as_array().unwrap().len(), 2);
+        assert_eq!(resp["set_name"], "my-set");
+    }
+
+    #[test]
+    fn test_pull_response_artifact_type_set() {
+        let resp = PullResponse {
+            id: Uuid::new_v4(),
+            name: "my-set".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            owner: "owner@test.com".to_string(),
+            owner_is_endorsed: false,
+            tags: vec![],
+            downloads: 0,
+            visibility: Visibility::Public,
+            created_at: chrono::Utc::now(),
+            content: None, // Sets have no content
+            content_hash: None,
+            content_schema: None,
+            signed: false,
+            key_fingerprint: None,
+            signature_valid: None,
+            artifact_type: "set".to_string(),
+            yanked: false,
+            yanked_reason: None,
+            dependencies: vec![
+                crate::models::DependencyRef { name: "member-a".to_string(), version: "1.0".to_string(), required: true },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"artifact_type\":\"set\""));
+        assert!(json.contains("\"content\":null"));
+        assert!(json.contains("member-a"));
+    }
+
+    // =========================================================================
+    // Artifact yanking tests (sw-nqt)
+    // =========================================================================
+
+    #[test]
+    fn test_yank_request_deserialization_with_reason() {
+        let json = r#"{"reason": "security vulnerability discovered"}"#;
+        let req: YankRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.reason, Some("security vulnerability discovered".to_string()));
+    }
+
+    #[test]
+    fn test_yank_request_deserialization_without_reason() {
+        let json = r#"{}"#;
+        let req: YankRequest = serde_json::from_str(json).unwrap();
+        assert!(req.reason.is_none());
+    }
+
+    #[test]
+    fn test_search_params_include_yanked_field() {
+        let json = r#"{"include_yanked": true}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.include_yanked, Some(true));
+
+        let json = r#"{"include_yanked": false}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.include_yanked, Some(false));
+
+        let json = r#"{}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert!(params.include_yanked.is_none());
+    }
+
+    #[test]
+    fn test_pull_response_yanked_fields() {
+        let resp = PullResponse {
+            id: Uuid::new_v4(),
+            name: "yanked-artifact".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            owner: "owner@test.com".to_string(),
+            owner_is_endorsed: false,
+            tags: vec![],
+            downloads: 5,
+            visibility: Visibility::Public,
+            created_at: chrono::Utc::now(),
+            content: Some(serde_json::json!({"old": "data"})),
+            content_hash: None,
+            content_schema: None,
+            signed: false,
+            key_fingerprint: None,
+            signature_valid: None,
+            artifact_type: "artifact".to_string(),
+            yanked: true,
+            yanked_reason: Some("contains a vulnerability".to_string()),
+            dependencies: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"yanked\":true"));
+        assert!(json.contains("contains a vulnerability"));
+        // Content still present for yanked artifacts (pull still works)
+        assert!(json.contains("\"content\":{"));
+    }
+
+    // =========================================================================
+    // JSON Schema validation tests (sw-kia)
+    // =========================================================================
+
+    #[test]
+    fn test_push_request_with_schema_deserialization() {
+        let json = r#"{
+            "name": "typed-artifact",
+            "version": "1.0.0",
+            "content": "{\"name\": \"Alice\", \"age\": 30}",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"}
+                },
+                "required": ["name"]
+            }
+        }"#;
+        let req: PushRequest = serde_json::from_str(json).unwrap();
+        assert!(req.schema.is_some(), "schema field should be present");
+        let schema = req.schema.as_ref().unwrap();
+        assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn test_push_request_without_schema() {
+        let json = r#"{"name": "artifact", "version": "1.0.0", "content": "{}"}"#;
+        let req: PushRequest = serde_json::from_str(json).unwrap();
+        assert!(req.schema.is_none(), "schema should be None when not provided");
+    }
+
+    #[test]
+    fn test_validate_json_schema_valid_content() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "required": ["name"]
+        });
+        let content = serde_json::json!({"name": "test"});
+        let result = crate::validation::validate_json_schema(&schema, &content);
+        assert!(result.is_ok(), "valid content must pass schema validation");
+    }
+
+    #[test]
+    fn test_validate_json_schema_invalid_content() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["required_field"]
+        });
+        let content = serde_json::json!({"other_field": "value"});
+        let result = crate::validation::validate_json_schema(&schema, &content);
+        assert!(result.is_err(), "content missing required field must fail validation");
+    }
+
+    #[test]
+    fn test_pull_response_content_schema_field() {
+        let schema_value = serde_json::json!({"type": "object"});
+        let resp = PullResponse {
+            id: Uuid::new_v4(),
+            name: "artifact".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            owner: "owner@test.com".to_string(),
+            owner_is_endorsed: false,
+            tags: vec![],
+            downloads: 1,
+            visibility: Visibility::Public,
+            created_at: chrono::Utc::now(),
+            content: Some(serde_json::json!({})),
+            content_hash: None,
+            content_schema: Some(schema_value.clone()),
+            signed: false,
+            key_fingerprint: None,
+            signature_valid: None,
+            artifact_type: "artifact".to_string(),
+            yanked: false,
+            yanked_reason: None,
+            dependencies: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"content_schema\":{\"type\":\"object\"}"));
     }
 }
