@@ -155,6 +155,29 @@ pub enum HubCommands {
         #[arg(short, long, default_value = "20")]
         limit: i64,
     },
+    /// Yank an artifact by name and version (pulls the ID, then yanks)
+    Yank {
+        /// SevorixHub server URL
+        #[arg(long, env = "SEVORIX_HUB_URL")]
+        hub_url: Option<String>,
+        /// Artifact name
+        name: String,
+        /// Artifact version
+        version: String,
+        /// Optional reason for yanking
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+    /// Unyank a previously yanked artifact
+    Unyank {
+        /// SevorixHub server URL
+        #[arg(long, env = "SEVORIX_HUB_URL")]
+        hub_url: Option<String>,
+        /// Artifact name
+        name: String,
+        /// Artifact version
+        version: String,
+    },
     /// Logout from SevorixHub and remove stored authentication token
     Logout,
     /// Show authentication status

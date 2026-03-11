@@ -810,6 +810,26 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             }
         }
 
+        HubCommands::Yank { hub_url, name, version, reason } => {
+            let client = HubClient::new(hub_url.as_deref())?;
+            // Resolve the UUID via pull
+            let artifact = client.pull(&name, &version).await
+                .map_err(|e| anyhow::anyhow!("Could not find artifact '{}@{}': {}", name, version, e))?;
+            client.yank(&artifact.id, reason.as_deref()).await?;
+            println!("Yanked {}@{}", name, version);
+            if let Some(r) = &reason {
+                println!("  Reason: {}", r);
+            }
+        }
+
+        HubCommands::Unyank { hub_url, name, version } => {
+            let client = HubClient::new(hub_url.as_deref())?;
+            let artifact = client.pull(&name, &version).await
+                .map_err(|e| anyhow::anyhow!("Could not find artifact '{}@{}': {}", name, version, e))?;
+            client.unyank(&artifact.id).await?;
+            println!("Unyanked {}@{}", name, version);
+        }
+
         HubCommands::Logout => {
             clear_token()?;
             println!("✓ Logged out successfully.");

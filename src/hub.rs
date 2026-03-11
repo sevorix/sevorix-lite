@@ -442,6 +442,54 @@ impl HubClient {
             .context("Failed to parse pull response")
     }
 
+    /// Yank an artifact by UUID. Pass `reason` to record why it was yanked.
+    pub async fn yank(&self, artifact_id: &str, reason: Option<&str>) -> Result<()> {
+        let token = self.token.as_ref()
+            .context("Not authenticated. Run 'sevorix hub login' first.")?;
+
+        let url = format!("{}/api/v1/artifacts/{}/yank", self.base_url, artifact_id);
+        let body = serde_json::json!({ "reason": reason });
+
+        let response = self.client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to yank artifact")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Yank failed ({}): {}", status, body);
+        }
+
+        Ok(())
+    }
+
+    /// Unyank an artifact by UUID.
+    pub async fn unyank(&self, artifact_id: &str) -> Result<()> {
+        let token = self.token.as_ref()
+            .context("Not authenticated. Run 'sevorix hub login' first.")?;
+
+        let url = format!("{}/api/v1/artifacts/{}/yank", self.base_url, artifact_id);
+
+        let response = self.client
+            .delete(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .send()
+            .await
+            .context("Failed to unyank artifact")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Unyank failed ({}): {}", status, body);
+        }
+
+        Ok(())
+    }
+
     pub async fn search(&self, query: Option<&str>, tag: Option<&str>) -> Result<SearchResponse> {
         let mut url = format!("{}/api/v1/artifacts/search?", self.base_url);
         let mut params = Vec::new();
