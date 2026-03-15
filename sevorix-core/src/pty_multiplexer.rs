@@ -142,7 +142,7 @@ impl Default for PtyMultiplexerConfig {
             .map(|s| s.to_string())
             .collect(),
             watchtower_url: "http://localhost:3000".to_string(),
-            validation_timeout_ms: 5000,
+            validation_timeout_ms: 120_000,
         }
     }
 }

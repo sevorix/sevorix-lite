@@ -1,6 +1,9 @@
 use axum::Router;
+use dashmap::DashMap;
 use sevorix_watchtower::{policy::Engine, proxy::proxy_handler, AppState};
+use sevorix_core::EnforcementTier;
 use std::sync::Arc;
+use std::sync::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -10,8 +13,15 @@ async fn test_real_connect_handshake() {
     let (tx, _rx) = tokio::sync::broadcast::channel(1);
     let state = Arc::new(AppState {
         tx,
-        policy_engine: Arc::new(Engine::new()),
+        policy_engine: Arc::new(RwLock::new(Engine::new())),
         traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
+        log_dir: std::path::PathBuf::from("/tmp"),
+        session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+        enforcement_tier: EnforcementTier::Standard,
+        active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        pending_decisions: Arc::new(DashMap::new()),
+        intervention_timeout_secs: 30,
+        intervention_timeout_allow: false,
     });
 
     // 2. Setup Router

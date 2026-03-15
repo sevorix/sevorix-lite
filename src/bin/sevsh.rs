@@ -1,5 +1,9 @@
 use clap::Parser;
-use sevorix_core::{PtyMultiplexer, PtyMultiplexerConfig};
+use sevorix_core::{
+    apply_syscall_deny_filter, apply_syscall_notify_filter, run_seccomp_notify_supervisor,
+    PtyMultiplexer, PtyMultiplexerConfig, SyscallInfo,
+};
+use std::os::unix::process::CommandExt;
 use serde_json::json;
 use std::env;
 use std::process::{exit, Command, Stdio};
@@ -90,6 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Register session with Watchtower for synchronous eBPF cgroup ID sync
+    if cgroup_created {
+        let _ = reqwest::Client::new()
+            .post("http://localhost:3000/api/session/register")
+            .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+            .send()
+            .await;
+    }
+
     // Set session ID in environment for child processes and eBPF tagging
     env::set_var("SEVORIX_SESSION_ID", &session_id);
 
@@ -140,7 +153,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If sandbox path returned a real exit code, clean up and exit now.
     if exit_code >= 0 {
-        if cgroup_created { cleanup_session_cgroup(&session_id); }
+        if cgroup_created {
+            let _ = reqwest::Client::new()
+                .post("http://localhost:3000/api/session/unregister")
+                .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+                .send()
+                .await;
+            cleanup_session_cgroup(&session_id);
+        }
         exit(exit_code);
     }
 
@@ -154,6 +174,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cleanup cgroup on exit
     if cgroup_created {
+        let _ = reqwest::Client::new()
+            .post("http://localhost:3000/api/session/unregister")
+            .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+            .send()
+            .await;
         cleanup_session_cgroup(&session_id);
     }
 
@@ -627,13 +652,183 @@ async fn handle_single_command(
         // Add session ID to environment for eBPF tagging
         env_vars.push(("SEVORIX_SESSION_ID".to_string(), session_id.to_string()));
 
-        // Use standard Command execution - eBPF daemon handles syscall interception
+        // Fetch syscall deny list and apply as a per-child seccomp filter.
+        // This provides synchronous kernel-level enforcement: syscalls named here
+        // will fail with EPERM inside the child and all its descendants.
+        // Non-fatal: if the fetch fails we proceed without the filter (eBPF still
+        // monitors and the PtyMultiplexer validates commands for interactive mode).
+        let deny_names: Vec<String> = fetch_syscall_deny_list().await;
+
         let mut command = Command::new(&shell);
         command.args(&final_cmd_args);
         for (key, value) in env_vars {
             command.env(key, value);
         }
-        let status = command.status()?;
+
+        let status = if !deny_names.is_empty() {
+            // Create a pipe so the child's pre_exec can pass the seccomp notify_fd
+            // number back to us. Both ends inherit across fork; O_CLOEXEC closes them
+            // on exec (after the pre_exec write is already done).
+            let mut pipe_fds = [0i32; 2];
+            let pipe_ok = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+
+            if pipe_ok {
+                let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
+
+                // SAFETY: pre_exec runs after fork, before exec. deny_names is
+                // moved into the closure. We use only async-signal-safe primitives.
+                unsafe {
+                    command.pre_exec(move || {
+                        libc::close(pipe_read); // child doesn't need read end
+                        match apply_syscall_notify_filter(&deny_names) {
+                            Ok(notify_fd) => {
+                                let bytes = notify_fd.to_ne_bytes();
+                                libc::write(
+                                    pipe_write,
+                                    bytes.as_ptr() as *const libc::c_void,
+                                    4,
+                                );
+                                libc::close(pipe_write);
+                                Ok(())
+                            }
+                            Err(_) => {
+                                // Notify filter unavailable — signal -1 to parent and
+                                // fall back to the deny filter so syscalls still get EPERM.
+                                let bytes = (-1i32).to_ne_bytes();
+                                libc::write(
+                                    pipe_write,
+                                    bytes.as_ptr() as *const libc::c_void,
+                                    4,
+                                );
+                                libc::close(pipe_write);
+                                apply_syscall_deny_filter(&deny_names).map_err(|e| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        format!("seccomp fallback: {}", e),
+                                    )
+                                })
+                            }
+                        }
+                    });
+                }
+
+                let mut child = command.spawn()?;
+                let child_pid = child.id();
+
+                // Close parent's write end so the pipe read returns EOF after
+                // the child writes its 4 bytes and execs.
+                unsafe { libc::close(pipe_write) };
+
+                // Read the notify_fd number the child wrote (blocking, 4 bytes).
+                let mut fd_bytes = [0u8; 4];
+                let mut nread = 0usize;
+                while nread < 4 {
+                    let r = unsafe {
+                        libc::read(
+                            pipe_read,
+                            fd_bytes[nread..].as_mut_ptr() as *mut libc::c_void,
+                            4 - nread,
+                        )
+                    };
+                    if r <= 0 {
+                        break;
+                    }
+                    nread += r as usize;
+                }
+                unsafe { libc::close(pipe_read) };
+
+                if nread == 4 {
+                    let child_notify_fd = i32::from_ne_bytes(fd_bytes);
+                    // child_notify_fd == -1 means notify filter failed and deny filter
+                    // was loaded as fallback — no supervisor needed.
+                    if child_notify_fd >= 0 {
+                        // pidfd_open(2) = 434, pidfd_getfd(2) = 438 on x86_64.
+                        #[cfg(target_arch = "x86_64")]
+                        const SYS_PIDFD_OPEN: i64 = 434;
+                        #[cfg(target_arch = "x86_64")]
+                        const SYS_PIDFD_GETFD: i64 = 438;
+                        #[cfg(not(target_arch = "x86_64"))]
+                        const SYS_PIDFD_OPEN: i64 = libc::SYS_pidfd_open as i64;
+                        #[cfg(not(target_arch = "x86_64"))]
+                        const SYS_PIDFD_GETFD: i64 = libc::SYS_pidfd_getfd as i64;
+
+                        let pidfd = unsafe {
+                            libc::syscall(SYS_PIDFD_OPEN, child_pid as libc::pid_t, 0u32)
+                        } as i32;
+                        let parent_notify_fd = if pidfd >= 0 {
+                            let fd = unsafe {
+                                libc::syscall(SYS_PIDFD_GETFD, pidfd, child_notify_fd, 0u32)
+                            } as i32;
+                            unsafe { libc::close(pidfd) };
+                            fd
+                        } else {
+                            -1
+                        };
+
+                        if parent_notify_fd >= 0 {
+                            // Spawn a blocking supervisor: intercepts each denied syscall,
+                            // reports it to Watchtower via /analyze-syscall (same path as
+                            // eBPF events), then responds to the kernel with EPERM.
+                            tokio::task::spawn_blocking(move || {
+                                let client = reqwest::blocking::Client::builder()
+                                    .timeout(std::time::Duration::from_millis(500))
+                                    .build()
+                                    .unwrap_or_default();
+                                run_seccomp_notify_supervisor(
+                                    parent_notify_fd,
+                                    |info: &SyscallInfo| {
+                                        let name = sevorix_core::syscall_name(info.syscall_nr);
+                                        let args: Vec<String> = info
+                                            .args
+                                            .iter()
+                                            .map(|a| format!("0x{:x}", a))
+                                            .collect();
+                                        let _ = client
+                                            .post(format!("{}/analyze-syscall", PROXY_URL))
+                                            .json(&serde_json::json!({
+                                                "syscall_name": name,
+                                                "syscall_number": info.syscall_nr,
+                                                "args": args,
+                                                "pid": info.pid,
+                                                "ppid": 0u32,
+                                                "timestamp": chrono::Local::now().to_rfc3339(),
+                                            }))
+                                            .send();
+                                    },
+                                );
+                            });
+                        } else {
+                            // pidfd_getfd failed — we can't attach a supervisor, but the
+                            // child's notify filter is already loaded. Without a supervisor,
+                            // the first monitored syscall would deadlock waiting for a
+                            // unotify response. Kill the child to surface the error cleanly.
+                            eprintln!(
+                                "[SEVSH] Error: could not attach seccomp supervisor (pidfd_getfd failed: {}). Aborting.",
+                                std::io::Error::last_os_error()
+                            );
+                            unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
+                        }
+                    }
+                }
+
+                child.wait()?
+            } else {
+                // Pipe creation failed; fall back to EPERM-only filter (no logging).
+                unsafe {
+                    command.pre_exec(move || {
+                        apply_syscall_deny_filter(&deny_names).map_err(|e| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("seccomp filter failed: {}", e),
+                            )
+                        })
+                    });
+                }
+                command.status()?
+            }
+        } else {
+            command.status()?
+        };
 
         Ok(status.code().unwrap_or(1))
     } else {
@@ -699,6 +894,28 @@ struct Verdict {
     status: String,
     reason: String,
     confidence: String,
+}
+
+/// Fetch the list of syscall names to deny from Watchtower's /syscall-policy endpoint.
+/// Returns an empty list on any error (non-fatal: enforcement degrades gracefully).
+async fn fetch_syscall_deny_list() -> Vec<String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/syscall-policy", PROXY_URL);
+    match client.get(&url).send().await {
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v["deny_names"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+        Err(e) => {
+            eprintln!("[SEVSH] Warning: Could not fetch syscall policy: {}. Seccomp filter not applied.", e);
+            vec![]
+        }
+    }
 }
 
 async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Error>> {

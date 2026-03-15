@@ -10,13 +10,20 @@ use axum::{
 };
 use serde::Deserialize;
 use directories::{ProjectDirs, UserDirs};
+use uuid;
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     process::Command,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
-use tokio::sync::broadcast;
+use dashmap::DashMap;
+use tokio::sync::{broadcast, oneshot, watch, Mutex};
+
+/// Unix socket path used for synchronous cgroup registration between
+/// the Watchtower server and the eBPF daemon.
+pub const EBPF_SOCK_PATH: &str = "/tmp/sevorix-ebpf.sock";
 
 pub mod assets;
 pub mod cli;
@@ -28,21 +35,40 @@ pub mod policy;
 pub mod prime;
 pub mod proxy;
 pub mod scanner;
+pub mod settings;
 
 use assets::Assets;
 pub use cli::{Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands};
 pub use daemon::{DaemonManager, EbpfDaemonManager, is_ebpf_daemon_running, is_watchtower_running};
 pub use integrations::{IntegrationRegistry, Integration, IntegrationStatus, InstallResult, Manifest, claude_code::ClaudeCodeIntegration, codex::CodexIntegration, openclaw::OpenClawIntegration};
-use policy::{Engine, PolicyContext};
+use policy::{Action, Engine, PolicyContext, PolicyType};
 use proxy::proxy_handler;
 use scanner::{log_threat, log_kill, scan_content, scan_for_poison, scan_syscall_with_engine, PoisonPill};
-use sevorix_core::{SyscallEvent, SeccompDecision};
+use sevorix_core::{detect_enforcement_tier, EnforcementTier, SyscallEvent, SeccompDecision};
+
+/// Holds both channel halves for one pending intervention decision.
+pub struct PendingEntry {
+    /// Send `true` (allow) or `false` (block) to unblock the waiting handler.
+    pub decision_tx: oneshot::Sender<bool>,
+    /// Send `true` (paused) or `false` (running) to freeze/unfreeze the countdown.
+    pub pause_tx: watch::Sender<bool>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub tx: broadcast::Sender<String>,
-    pub policy_engine: Arc<Engine>,
+    pub policy_engine: Arc<RwLock<Engine>>,
     pub traffic_log_path: std::path::PathBuf,
+    pub log_dir: std::path::PathBuf,
+    pub session_id: String,
+    pub enforcement_tier: EnforcementTier,
+    pub active_sessions: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Pending intervention decisions keyed by event UUID.
+    pub pending_decisions: Arc<DashMap<String, PendingEntry>>,
+    /// Seconds before an unanswered intervention auto-resolves.
+    pub intervention_timeout_secs: u64,
+    /// If true, auto-allow on timeout; if false (default), auto-block.
+    pub intervention_timeout_allow: bool,
 }
 
 pub fn handle_config(cmd: ConfigCommands) {
@@ -334,8 +360,7 @@ pub fn handle_validate(command: String, role: Option<String>, context: String) {
     }
 
     // Perform the scan
-    let text = command.to_uppercase();
-    let result = scan_content(&text, role.as_deref(), &engine, policy_context);
+    let result = scan_content(&command, role.as_deref(), &engine, policy_context);
 
     // Build output JSON
     let output = json!({
@@ -357,7 +382,7 @@ pub fn handle_validate(command: String, role: Option<String>, context: String) {
     }
 }
 
-pub async fn run_server(allowed_roles: Option<Vec<String>>) -> anyhow::Result<()> {
+pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uuid) -> anyhow::Result<()> {
     // Setup paths
     let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
         .ok_or_else(|| anyhow::anyhow!("No home dir"))?;
@@ -441,26 +466,62 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>) -> anyhow::Result<()
         tracing::warn!("Warning: No policies loaded. Engine is empty.");
     }
 
+    // Load settings from ~/.sevorix/settings.json (optional; missing = all defaults)
+    let intervention_settings = base_dirs
+        .first()
+        .map(|d| d.join("settings.json"))
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<settings::Settings>(&s).ok())
+        .and_then(|s| s.intervention)
+        .unwrap_or_default();
+
+    let enforcement_tier = detect_enforcement_tier();
+
+    // Per-session traffic log: ~/.sevorix/logs/{session_id}-traffic.jsonl
+    let log_dir = if let Some(user_dirs) = UserDirs::new() {
+        user_dirs.home_dir().join(".sevorix").join("logs")
+    } else {
+        std::path::PathBuf::from(".sevorix/logs")
+    };
+    let _ = std::fs::create_dir_all(&log_dir);
+    let session_id_str = session_id.to_string();
+    let traffic_log_path = log_dir.join(format!("{}-traffic.jsonl", session_id_str));
+
     let app_state = Arc::new(AppState {
         tx,
-        policy_engine: Arc::new(engine),
-        traffic_log_path: proj_dirs
-            .state_dir()
-            .unwrap_or_else(|| proj_dirs.cache_dir())
-            .join("traffic_events.jsonl"),
+        policy_engine: Arc::new(RwLock::new(engine)),
+        traffic_log_path,
+        log_dir: log_dir.clone(),
+        session_id: session_id_str,
+        enforcement_tier,
+        active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        pending_decisions: Arc::new(DashMap::new()),
+        intervention_timeout_secs: intervention_settings.timeout_secs(),
+        intervention_timeout_allow: intervention_settings.timeout_action_allow(),
     });
 
     // Define the Routes
     let app = Router::new()
         .route("/analyze", post(analyze_intent))
         .route("/analyze-syscall", post(analyze_syscall))
+        .route("/syscall-policy", get(syscall_policy_handler))
+        .route("/policies/ebpf", get(ebpf_policies_handler))
         .route("/api/ebpf-event", post(ebpf_event_handler))
+        .route("/api/policies/reload", post(reload_policies_handler))
         .route("/open-log", post(open_log_file))
         .route("/ws", get(ws_handler))
         .route("/api/events", get(get_recent_events))
+        .route("/api/decide", post(decide_handler))
+        .route("/api/pause", post(pause_handler))
+        .route("/api/stats", get(get_stats_handler))
+        .route("/api/sessions", get(get_sessions_handler))
         .route("/dashboard/*file", get(static_handler))
         // also redirect /dashboard to /dashboard/index.html
-        .route("/dashboard", get(dashboard_redirect));
+        .route("/dashboard", get(dashboard_redirect))
+        .route("/api/session/register", post(session_register))
+        .route("/api/session/unregister", post(session_unregister))
+        .route("/api/active-sessions", get(active_sessions_handler));
 
 
     let app = app
@@ -475,6 +536,10 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>) -> anyhow::Result<()
     tracing::info!("🛡️  SEVORIX WATCHTOWER ACTIVE");
     tracing::info!("📡 API: http://localhost:3000/analyze");
     tracing::info!("📊 Dashboard: http://localhost:3000/dashboard/desktop.html");
+    tracing::info!("🔒 Enforcement tier: {}", enforcement_tier);
+    if enforcement_tier == EnforcementTier::Standard {
+        tracing::info!("   (BPF LSM unavailable — 'bpf' not in /sys/kernel/security/lsm)");
+    }
     if let Some(state_dir) = proj_dirs.state_dir() {
         tracing::info!("📝 Logging Threats to: {}/threat_log.txt", state_dir.display());
     }
@@ -484,6 +549,126 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>) -> anyhow::Result<()
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+async fn session_register(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
+    if let Some(path) = body["cgroup_path"].as_str() {
+        state.active_sessions.lock().await.insert(path.to_string());
+
+        // Synchronously notify the eBPF daemon so SEVORIX_CGROUP_IDS is updated
+        // before sevsh runs the child process. Best-effort: if the daemon socket
+        // is not available (e.g. non-ebpf build), we continue without blocking.
+        notify_ebpf_daemon_cgroup(path).await;
+    }
+    StatusCode::OK
+}
+
+/// Send a cgroup registration message to the eBPF daemon over a Unix socket.
+///
+/// The daemon inserts the cgroup's inode into SEVORIX_CGROUP_IDS before returning ACK,
+/// ensuring the BPF filter recognises the new session immediately.
+/// Timeout is 200ms — if the daemon is not running or the socket is unavailable,
+/// this returns promptly without blocking session startup.
+async fn notify_ebpf_daemon_cgroup(cgroup_path: &str) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let msg = format!("{}\n", json!({"cgroup_path": cgroup_path}));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        async {
+            let stream = UnixStream::connect(EBPF_SOCK_PATH).await?;
+            let (reader, mut writer) = stream.into_split();
+            writer.write_all(msg.as_bytes()).await?;
+            let mut lines = BufReader::new(reader).lines();
+            let _ack = lines.next_line().await?;
+            Ok::<_, std::io::Error>(())
+        },
+    )
+    .await;
+
+    match result {
+        Ok(Ok(())) => {} // ACK received — cgroup ID is in the BPF map
+        Ok(Err(e)) => tracing::debug!("eBPF socket notify failed: {}", e),
+        Err(_) => tracing::debug!("eBPF socket notify timed out — daemon may not be running"),
+    }
+}
+
+async fn active_sessions_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions: Vec<String> = state.active_sessions.lock().await.iter().cloned().collect();
+    Json(json!({ "sessions": sessions }))
+}
+
+async fn session_unregister(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
+    if let Some(path) = body["cgroup_path"].as_str() {
+        state.active_sessions.lock().await.remove(path);
+    }
+    StatusCode::OK
+}
+
+/// Hot-reload all policies and roles from disk without restarting the server.
+///
+/// Re-reads `~/.sevorix/policies/`, `~/.sevorix/roles/`, and the legacy
+/// `~/.config/sevorix/policies.json` fallback, then atomically swaps the engine.
+async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let proj_dirs = match ProjectDirs::from("com", "sevorix", "sevorix") {
+        Some(d) => d,
+        None => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "status": "error", "reason": "No home dir" })),
+            )
+                .into_response()
+        }
+    };
+
+    let mut engine = Engine::new();
+
+    let mut base_dirs = Vec::new();
+    if let Some(user_dirs) = UserDirs::new() {
+        base_dirs.push(user_dirs.home_dir().join(".sevorix"));
+    }
+    base_dirs.push(proj_dirs.config_dir().to_path_buf());
+    base_dirs.push(std::path::PathBuf::from(".sevorix"));
+
+    let mut policies_loaded = false;
+    for base in &base_dirs {
+        let policy_dir = base.join("policies");
+        if policy_dir.exists() && policy_dir.is_dir() {
+            if engine.load_policies_from_dir(&policy_dir).is_ok() {
+                policies_loaded = true;
+            }
+        }
+    }
+    for base in &base_dirs {
+        let role_dir = base.join("roles");
+        if role_dir.exists() && role_dir.is_dir() {
+            let _ = engine.load_roles_from_dir(&role_dir);
+        }
+    }
+
+    if !policies_loaded {
+        let mut candidate_paths = vec![std::path::PathBuf::from(".sevorix/policies.json")];
+        if let Some(user_dirs) = UserDirs::new() {
+            candidate_paths.push(user_dirs.home_dir().join(".sevorix/policies.json"));
+        }
+        candidate_paths.push(proj_dirs.config_dir().join("policies.json"));
+        candidate_paths.push(std::path::PathBuf::from("policies.json"));
+        for path in &candidate_paths {
+            if path.exists() {
+                if let Ok(legacy) = Engine::load_from_file(path.to_str().unwrap_or("policies.json")) {
+                    engine.merge(legacy);
+                    break;
+                }
+            }
+        }
+    }
+
+    *state.policy_engine.write().unwrap() = engine;
+    tracing::info!("Policies reloaded via API");
+    Json(json!({ "status": "reloaded" })).into_response()
+}
+
 
 async fn dashboard_redirect() -> impl IntoResponse {
     axum::response::Redirect::permanent("/dashboard/index.html")
@@ -512,12 +697,119 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     }
 }
 
+/// Await a user intervention decision, respecting a pause/resume signal.
+///
+/// - While paused: the timeout clock is frozen; only a decision or unpause can proceed.
+/// - On timeout (unpaused): returns `timeout_allow`.
+/// - On user decision: returns the decision value.
+async fn await_decision_with_pause(
+    mut decision_rx: oneshot::Receiver<bool>,
+    mut pause_rx: watch::Receiver<bool>,
+    timeout_secs: u64,
+    timeout_allow: bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        let paused = *pause_rx.borrow_and_update();
+        if paused {
+            // Frozen — wait indefinitely until a decision arrives or pause is lifted.
+            tokio::select! {
+                result = &mut decision_rx => return result.unwrap_or(timeout_allow),
+                _ = pause_rx.changed() => continue,
+            }
+        } else {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return timeout_allow;
+            }
+            tokio::select! {
+                result = &mut decision_rx => return result.unwrap_or(timeout_allow),
+                _ = pause_rx.changed() => continue,
+                _ = tokio::time::sleep(remaining) => return timeout_allow,
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DecidePayload {
+    event_id: String,
+    action: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PausePayload {
+    event_id: String,
+    paused: bool,
+}
+
+/// Receive a human decision (allow/block) for a pending intervention.
+async fn decide_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DecidePayload>,
+) -> Response {
+    let event_id = body.event_id.clone();
+    let allow = match body.action.to_lowercase().as_str() {
+        "allow" => true,
+        "block" => false,
+        _ => {
+            return (StatusCode::BAD_REQUEST, "action must be 'allow' or 'block'").into_response();
+        }
+    };
+
+    match state.pending_decisions.remove(&event_id) {
+        Some((_, entry)) => {
+            let _ = entry.decision_tx.send(allow);
+            let ev = json!({
+                "type": "DECIDED",
+                "event_id": event_id,
+                "action": body.action.to_lowercase(),
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            });
+            let _ = state.tx.send(ev.to_string());
+            Json(json!({ "status": "ok", "event_id": event_id })).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            "event_id not found or already decided",
+        )
+            .into_response(),
+    }
+}
+
+/// Pause or resume the countdown timer for a pending intervention.
+async fn pause_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PausePayload>,
+) -> Response {
+    let event_id = body.event_id.clone();
+    match state.pending_decisions.get(&event_id) {
+        Some(entry) => {
+            let _ = entry.pause_tx.send(body.paused);
+            let ev = json!({
+                "type": "PAUSED",
+                "event_id": event_id,
+                "paused": body.paused,
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            });
+            let _ = state.tx.send(ev.to_string());
+            Json(json!({ "status": "ok", "paused": body.paused })).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            "event_id not found or already decided",
+        )
+            .into_response(),
+    }
+}
+
 async fn analyze_intent(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Response {
     let start_time = std::time::Instant::now();
-    let text = payload["payload"].as_str().unwrap_or("").to_uppercase();
+    let text = payload["payload"].as_str().unwrap_or("").to_string();
     let agent_id = payload["agent"].as_str().unwrap_or("Unknown-Agent");
     let role = payload["role"].as_str();
 
@@ -540,8 +832,82 @@ async fn analyze_intent(
     }
 
     // --- DECISION RULES ---
-    let mut scan = scan_content(&text, role, &state.policy_engine, context);
+    let mut scan = scan_content(&text, role, &state.policy_engine.read().unwrap(), context);
 
+
+    // --- USER INTERVENTION for FLAG (shell channel) ---
+    if scan.verdict == "FLAG" {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let (decision_tx, decision_rx) = oneshot::channel::<bool>();
+        let (pause_tx, pause_rx) = watch::channel(false);
+        state.pending_decisions.insert(event_id.clone(), PendingEntry { decision_tx, pause_tx });
+
+        let pending_event = json!({
+            "type": "PENDING",
+            "event_id": event_id,
+            "verdict": "FLAG",
+            "lane": "YELLOW",
+            "layer": "shell",
+            "payload": &text,
+            "timestamp": chrono::Local::now().to_rfc3339(),
+            "reason": scan.log_msg,
+            "context": context_str,
+            "timeout_secs": state.intervention_timeout_secs,
+            "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
+        });
+        log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
+        let _ = state.tx.send(pending_event.to_string());
+
+        let allowed = await_decision_with_pause(
+            decision_rx,
+            pause_rx,
+            state.intervention_timeout_secs,
+            state.intervention_timeout_allow,
+        ).await;
+
+        // Still in map → timeout fired (not resolved by user via decide_handler)
+        if state.pending_decisions.remove(&event_id).is_some() {
+            let decided_event = json!({
+                "type": "DECIDED",
+                "event_id": event_id,
+                "action": if allowed { "allow" } else { "block" },
+                "reason": "timeout",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            });
+            let _ = state.tx.send(decided_event.to_string());
+        }
+
+        if !allowed {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            let block_event = json!({
+                "verdict": "BLOCK",
+                "lane": "RED",
+                "layer": "shell",
+                "payload": &text,
+                "timestamp": chrono::Local::now().to_rfc3339(),
+                "latency": elapsed,
+                "reason": "Blocked by operator",
+                "confidence": null,
+                "context": context_str,
+            });
+            let block_str = block_event.to_string();
+            log_traffic_event(&state.traffic_log_path, &block_str);
+            let _ = state.tx.send(block_str);
+            return Json(json!({
+                "status": "BLOCK",
+                "latency_ms": elapsed,
+                "lane": "RED",
+                "reason": "Blocked by operator",
+                "confidence": null,
+            })).into_response();
+        }
+
+        // Operator allowed — update verdict so the event logs as ALLOW
+        scan.verdict = "ALLOW".to_string();
+        scan.lane = "GREEN".to_string();
+        scan.log_msg = Some("Allowed by operator intervention".to_string());
+        scan.delay = 0;
+    }
 
     if let Some(msg) = &scan.log_msg {
         log_threat(
@@ -595,7 +961,7 @@ async fn analyze_syscall(
     let start_time = std::time::Instant::now();
 
     // Get decision from policy engine
-    let decision = scan_syscall_with_engine(&event, &state.policy_engine);
+    let decision = scan_syscall_with_engine(&event, &state.policy_engine.read().unwrap());
 
     // Determine verdict and lane
     let (verdict, lane) = match &decision {
@@ -642,9 +1008,9 @@ async fn analyze_syscall(
         "timestamp": chrono::Local::now().to_rfc3339(),
         "latency": elapsed,
         "reason": match &decision {
-            SeccompDecision::Block { errno } => format!("Syscall blocked (errno={})", errno),
-            SeccompDecision::Kill => "Critical violation - process killed".to_string(),
-            SeccompDecision::Allow => "Syscall allowed".to_string(),
+            SeccompDecision::Block { errno } => Some(format!("Syscall blocked (errno={})", errno)),
+            SeccompDecision::Kill => Some("Critical violation - process killed".to_string()),
+            SeccompDecision::Allow => None,
         },
         "confidence": "Policy Match",
         "context": "Syscall",
@@ -672,6 +1038,124 @@ async fn analyze_syscall(
         "latency_ms": elapsed
     }))
     .into_response()
+}
+
+/// Query parameters for role-scoped policy endpoints.
+#[derive(Deserialize, Default)]
+struct RoleQuery {
+    /// Role name to scope policies by (defaults to "default").
+    role: Option<String>,
+}
+
+/// Return the list of syscall names that should be denied for the current policy set.
+///
+/// Used by `sevsh` at session startup to build a per-session seccomp filter. Only
+/// `Simple`-pattern policies with `context: Syscall` (or `All`) and `action: Block`
+/// contribute to this list — regex and executable patterns cannot be safely mapped
+/// to individual syscall names at filter-build time.
+///
+/// Policies are scoped to the role specified by the `?role=` query parameter, or
+/// the "default" role if not provided. If the role does not exist, returns an empty list.
+async fn syscall_policy_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<RoleQuery>,
+) -> impl IntoResponse {
+    let engine = state.policy_engine.read().unwrap();
+    let role_name = q.role.as_deref().unwrap_or("default");
+    let policy_ids = match engine.roles.get(role_name) {
+        Some(role) => role.policies.clone(),
+        None => return Json(json!({ "deny_names": [] })),
+    };
+
+    let deny_names: Vec<String> = policy_ids
+        .iter()
+        .filter_map(|id| engine.policies.get(id))
+        .filter(|p| {
+            (p.context == PolicyContext::Syscall || p.context == PolicyContext::All)
+                && p.action == Action::Block
+        })
+        .filter_map(|p| match &p.match_type {
+            PolicyType::Simple(pattern) => Some(pattern.clone()),
+            _ => None,
+        })
+        .collect();
+
+    Json(json!({ "deny_names": deny_names }))
+}
+
+/// Map syscall name to x86-64 syscall number.
+fn syscall_nr_by_name(name: &str) -> Option<u64> {
+    match name {
+        "read" => Some(0), "write" => Some(1), "open" => Some(2), "close" => Some(3),
+        "stat" => Some(4), "fstat" => Some(5), "lstat" => Some(6),
+        "mmap" => Some(9), "mprotect" => Some(10), "munmap" => Some(11),
+        "brk" => Some(12), "pipe" => Some(22),
+        "dup" => Some(32), "dup2" => Some(33),
+        "socket" => Some(41), "connect" => Some(42), "accept" => Some(43),
+        "sendto" => Some(44), "recvfrom" => Some(45),
+        "bind" => Some(49), "listen" => Some(50),
+        "clone" => Some(56), "fork" => Some(57), "vfork" => Some(58),
+        "execve" => Some(59), "exit" => Some(60), "wait4" => Some(61),
+        "kill" => Some(62), "uname" => Some(63),
+        "fcntl" => Some(72), "getcwd" => Some(79),
+        "chdir" => Some(80), "fchdir" => Some(81),
+        "rename" => Some(82), "mkdir" => Some(83), "rmdir" => Some(84),
+        "creat" => Some(85), "link" => Some(86), "unlink" => Some(87),
+        "symlink" => Some(88), "readlink" => Some(89),
+        "chmod" => Some(90), "chown" => Some(92),
+        "ptrace" => Some(101), "getuid" => Some(102), "getgid" => Some(104),
+        "setuid" => Some(105), "setgid" => Some(106),
+        "mount" => Some(165), "umount2" => Some(166),
+        "openat" => Some(257), "mkdirat" => Some(258),
+        "unlinkat" => Some(263), "renameat" => Some(264),
+        "fchmodat" => Some(268), "faccessat" => Some(269),
+        "renameat2" => Some(316), "execveat" => Some(322),
+        _ => None,
+    }
+}
+
+/// Return structured eBPF policy rules for map pre-population.
+///
+/// The eBPF daemon calls this at startup and on each new session to pre-populate
+/// GLOBAL_DENYLIST and NET_DENYLIST before any session process runs, closing the
+/// first-occurrence gap in reactive enforcement.
+///
+/// Returns:
+/// - `syscall_rules`: `[{syscall_nr, errno}]` for all Simple/Block/Syscall policies
+/// - `net_rules`: reserved, always empty until network policies support IP/port matching
+///
+/// Policies are scoped to the role specified by the `?role=` query parameter, or
+/// the "default" role if not provided. If the role does not exist, returns empty lists.
+async fn ebpf_policies_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<RoleQuery>,
+) -> impl IntoResponse {
+    let engine = state.policy_engine.read().unwrap();
+    let role_name = q.role.as_deref().unwrap_or("default");
+    let policy_ids = match engine.roles.get(role_name) {
+        Some(role) => role.policies.clone(),
+        None => return Json(json!({ "syscall_rules": [], "net_rules": [] })),
+    };
+
+    let syscall_rules: Vec<Value> = policy_ids
+        .iter()
+        .filter_map(|id| engine.policies.get(id))
+        .filter(|p| {
+            (p.context == PolicyContext::Syscall || p.context == PolicyContext::All)
+                && p.action == Action::Block
+        })
+        .filter_map(|p| match &p.match_type {
+            PolicyType::Simple(name) => syscall_nr_by_name(name.trim()).map(|nr| {
+                json!({ "syscall_nr": nr, "errno": libc::EPERM })
+            }),
+            _ => None,
+        })
+        .collect();
+
+    Json(json!({
+        "syscall_rules": syscall_rules,
+        "net_rules": [],
+    }))
 }
 
 /// Handle eBPF events from the eBPF daemon.
@@ -801,6 +1285,9 @@ struct EventQuery {
     page: Option<usize>,
     /// Results per page (default 50, max 500).
     limit: Option<usize>,
+    /// Optional session UUID to query a past session's traffic file.
+    /// Use "legacy" to query the old global traffic_events.jsonl.
+    session: Option<String>,
 }
 
 /// Query the traffic event log with server-side filtering, search, and pagination.
@@ -811,7 +1298,7 @@ struct EventQuery {
 async fn get_recent_events(
     State(state): State<Arc<AppState>>,
     Query(q): Query<EventQuery>,
-) -> impl IntoResponse {
+) -> Response {
     let limit = q.limit.unwrap_or(50).min(500);
     let page = q.page.unwrap_or(1).max(1);
 
@@ -826,9 +1313,35 @@ async fn get_recent_events(
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty());
 
+    // Resolve which session's traffic file to read.
+    let traffic_path: std::path::PathBuf = if q.session.as_deref() == Some("legacy") {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
+            proj_dirs.state_dir()
+                .unwrap_or_else(|| proj_dirs.cache_dir())
+                .join("traffic_events.jsonl")
+        } else {
+            state.traffic_log_path.clone()
+        }
+    } else if let Some(ref sid) = q.session {
+        if uuid::Uuid::parse_str(sid).is_ok() {
+            state.log_dir.join(format!("{}-traffic.jsonl", sid))
+        } else {
+            return Json(json!({
+                "events": [],
+                "total": 0,
+                "page": 1,
+                "limit": limit,
+                "total_pages": 0,
+                "error": "invalid session id"
+            })).into_response();
+        }
+    } else {
+        state.traffic_log_path.clone()
+    };
+
     let mut matched: Vec<Value> = Vec::new();
 
-    if let Ok(file) = std::fs::File::open(&state.traffic_log_path) {
+    if let Ok(file) = std::fs::File::open(&traffic_path) {
         use std::io::{BufRead, BufReader};
         let reader = BufReader::new(file);
 
@@ -836,11 +1349,9 @@ async fn get_recent_events(
             let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
 
             // Layer filter.
-            // "network" in the filter matches both "network" (eBPF) and "http" (proxy).
             if let Some(ref layers) = layer_filter {
                 let event_layer = event.get("layer").and_then(|v| v.as_str()).unwrap_or("shell");
-                let canonical = if event_layer == "http" { "network" } else { event_layer };
-                if !layers.iter().any(|l| l == canonical) {
+                if !layers.iter().any(|l| l == event_layer) {
                     continue;
                 }
             }
@@ -888,7 +1399,167 @@ async fn get_recent_events(
         "page": page,
         "limit": limit,
         "total_pages": total_pages,
+    })).into_response()
+}
+
+/// Compute aggregate stats from a traffic log file.
+async fn get_stats_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StatsQuery>,
+) -> impl IntoResponse {
+    let traffic_path: std::path::PathBuf = if q.session.as_deref() == Some("legacy") {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
+            proj_dirs.state_dir()
+                .unwrap_or_else(|| proj_dirs.cache_dir())
+                .join("traffic_events.jsonl")
+        } else {
+            state.traffic_log_path.clone()
+        }
+    } else if let Some(ref sid) = q.session {
+        if uuid::Uuid::parse_str(sid).is_ok() {
+            state.log_dir.join(format!("{}-traffic.jsonl", sid))
+        } else {
+            state.traffic_log_path.clone()
+        }
+    } else {
+        state.traffic_log_path.clone()
+    };
+
+    let mut total: u64 = 0;
+    let mut blocked: u64 = 0;
+    let mut latency_sum: u64 = 0;
+    let mut latency_count: u64 = 0;
+    let mut shell: u64 = 0;
+    let mut syscall: u64 = 0;
+    let mut network: u64 = 0;
+
+    if let Ok(file) = std::fs::File::open(&traffic_path) {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+            total += 1;
+
+            if event.get("lane").and_then(|v| v.as_str()) == Some("RED") {
+                blocked += 1;
+            }
+            if let Some(ms) = event.get("latency").and_then(|v| v.as_u64()) {
+                latency_sum += ms;
+                latency_count += 1;
+            }
+
+            let layer = event.get("layer").and_then(|v| v.as_str()).unwrap_or("shell");
+            match layer {
+                "syscall" => syscall += 1,
+                "network" => network += 1,
+                _ => shell += 1,
+            }
+        }
+    }
+
+    let avg_latency = if latency_count > 0 { latency_sum / latency_count } else { 0 };
+
+    Json(json!({
+        "total": total,
+        "blocked": blocked,
+        "avg_latency": avg_latency,
+        "shell": shell,
+        "syscall": syscall,
+        "network": network,
     }))
+}
+
+#[derive(Deserialize, Default)]
+struct StatsQuery {
+    session: Option<String>,
+}
+
+/// List all traffic log sessions found in the log directory.
+async fn get_sessions_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut sessions: Vec<Value> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&state.log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let fname = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if !fname.ends_with("-traffic.jsonl") {
+                continue;
+            }
+            let uuid_part = &fname[..fname.len() - "-traffic.jsonl".len()];
+            if uuid::Uuid::parse_str(uuid_part).is_err() {
+                continue;
+            }
+            let is_current = uuid_part == state.session_id;
+            let (event_count, first_ts, last_ts) = summarize_traffic_file(&path);
+            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            sessions.push(json!({
+                "session_id": uuid_part,
+                "is_current": is_current,
+                "event_count": event_count,
+                "started_at": first_ts,
+                "last_event_at": last_ts,
+                "size_bytes": size_bytes,
+            }));
+        }
+    }
+
+    // Expose legacy global file if it exists and has events.
+    if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
+        let legacy_path = proj_dirs
+            .state_dir()
+            .unwrap_or_else(|| proj_dirs.cache_dir())
+            .join("traffic_events.jsonl");
+        if legacy_path.exists() {
+            let (event_count, first_ts, last_ts) = summarize_traffic_file(&legacy_path);
+            if event_count > 0 {
+                let size_bytes = std::fs::metadata(&legacy_path).map(|m| m.len()).unwrap_or(0);
+                sessions.push(json!({
+                    "session_id": "legacy",
+                    "is_current": false,
+                    "event_count": event_count,
+                    "started_at": first_ts,
+                    "last_event_at": last_ts,
+                    "size_bytes": size_bytes,
+                }));
+            }
+        }
+    }
+
+    // Sort newest-first by last_event_at.
+    sessions.sort_by(|a, b| {
+        let ta = a["last_event_at"].as_str().unwrap_or("");
+        let tb = b["last_event_at"].as_str().unwrap_or("");
+        tb.cmp(ta)
+    });
+
+    Json(json!({
+        "current_session": state.session_id,
+        "sessions": sessions,
+    }))
+}
+
+/// Scan a traffic JSONL file and return (event_count, first_timestamp, last_timestamp).
+fn summarize_traffic_file(path: &std::path::Path) -> (usize, Option<String>, Option<String>) {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(path) else {
+        return (0, None, None);
+    };
+    let reader = BufReader::new(file);
+    let mut count = 0usize;
+    let mut first_ts: Option<String> = None;
+    let mut last_ts: Option<String> = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        count += 1;
+        let ts = v["timestamp"].as_str().map(String::from);
+        if first_ts.is_none() {
+            first_ts = ts.clone();
+        }
+        last_ts = ts;
+    }
+    (count, first_ts, last_ts)
 }
 
 /// Get version and edition info
@@ -896,13 +1567,19 @@ async fn health_handler() -> impl IntoResponse {
     StatusCode::OK
 }
 
-async fn get_version() -> impl IntoResponse {
+async fn get_version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     #[cfg(not(feature = "pro"))]
     let edition = "lite";
 
+    let tier = match state.enforcement_tier {
+        EnforcementTier::Standard => "standard",
+        EnforcementTier::Advanced => "advanced",
+    };
+
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "edition": edition
+        "edition": edition,
+        "enforcement_tier": tier,
     }))
 }
 
@@ -952,8 +1629,15 @@ mod tests {
         let (tx, _) = broadcast::channel(100);
         Arc::new(AppState {
             tx,
-            policy_engine: Arc::new(Engine::new()),
+            policy_engine: Arc::new(RwLock::new(Engine::new())),
             traffic_log_path: PathBuf::from("/tmp/test_traffic.jsonl"),
+            log_dir: PathBuf::from("/tmp"),
+            session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            enforcement_tier: EnforcementTier::Standard,
+            active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_decisions: Arc::new(DashMap::new()),
+            intervention_timeout_secs: 30,
+            intervention_timeout_allow: false,
         })
     }
 
@@ -962,8 +1646,15 @@ mod tests {
         let (tx, _) = broadcast::channel(100);
         Arc::new(AppState {
             tx,
-            policy_engine: Arc::new(Engine::new()),
+            policy_engine: Arc::new(RwLock::new(Engine::new())),
             traffic_log_path: path,
+            log_dir: PathBuf::from("/tmp"),
+            session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            enforcement_tier: EnforcementTier::Standard,
+            active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_decisions: Arc::new(DashMap::new()),
+            intervention_timeout_secs: 30,
+            intervention_timeout_allow: false,
         })
     }
 
@@ -971,8 +1662,15 @@ mod tests {
         let (tx, _) = broadcast::channel(100);
         Arc::new(AppState {
             tx,
-            policy_engine: Arc::new(engine),
+            policy_engine: Arc::new(RwLock::new(engine)),
             traffic_log_path: PathBuf::from("/tmp/test_traffic.jsonl"),
+            log_dir: PathBuf::from("/tmp"),
+            session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            enforcement_tier: EnforcementTier::Standard,
+            active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_decisions: Arc::new(DashMap::new()),
+            intervention_timeout_secs: 30,
+            intervention_timeout_allow: false,
         })
     }
 
@@ -1067,7 +1765,7 @@ mod tests {
         });
 
         let state = create_test_app_state_with_engine(engine);
-        assert!(state.policy_engine.policies.contains_key("test"));
+        assert!(state.policy_engine.read().unwrap().policies.contains_key("test"));
     }
 
     #[test]
@@ -1290,7 +1988,7 @@ mod tests {
         });
 
         let state = create_test_app_state_with_engine(engine);
-        assert!(state.policy_engine.policies.contains_key("test"));
+        assert!(state.policy_engine.read().unwrap().policies.contains_key("test"));
     }
 
     #[tokio::test]
@@ -1330,13 +2028,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_version() {
+        use axum::extract::State;
         use axum::response::IntoResponse;
-        let response = get_version().await.into_response();
-        // Should return JSON with version and edition
+        let state = create_test_app_state();
+        let response = get_version(State(state)).await.into_response();
+        // Should return JSON with version, edition, and enforcement_tier
         let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("version").is_some());
         assert!(json.get("edition").is_some());
+        assert!(json.get("enforcement_tier").is_some());
     }
 
     #[test]

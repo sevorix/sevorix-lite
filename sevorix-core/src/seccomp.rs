@@ -1457,6 +1457,154 @@ pub(crate) fn build_syscall_event(pid: u32, syscall_nr: i64, name: &str, raw_arg
     }
 }
 
+/// Apply a classic seccomp deny filter to the current process.
+///
+/// Installs a `SCMP_ACT_ALLOW`-default filter with `SCMP_ACT_ERRNO(EPERM)` rules
+/// for each named syscall. The filter is inherited by all descendant processes.
+///
+/// This is the primary syscall enforcement mechanism for kernels where BPF LSM is
+/// not active (i.e., `bpf` is absent from the kernel's LSM list). It should be
+/// called after fork but before exec — typically from `std::os::unix::process::CommandExt::pre_exec`.
+///
+/// Unknown syscall names are silently skipped (they may be arch-specific or misspelled).
+/// An empty slice is a no-op.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::os::unix::process::CommandExt;
+/// use std::process::Command;
+///
+/// let deny = vec!["ptrace", "mount", "kexec_load"];
+/// let mut cmd = Command::new("sh");
+/// unsafe {
+///     cmd.pre_exec(move || {
+///         sevorix_core::seccomp::apply_syscall_deny_filter(&deny)
+///             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+///         Ok(())
+///     });
+/// }
+/// ```
+/// Returns a list of additional syscall names that should also be blocked
+/// when blocking the given syscall name. Modern glibc typically calls the
+/// `*at` variants (e.g. `unlinkat` instead of `unlink`), so a policy that
+/// blocks `"unlink"` would otherwise have no effect on `rm`.
+fn syscall_family_aliases(name: &str) -> &'static [&'static str] {
+    match name {
+        "unlink" => &["unlinkat"],
+        "mkdir" => &["mkdirat"],
+        "rmdir" => &["unlinkat"],
+        "rename" => &["renameat", "renameat2"],
+        "open" => &["openat", "openat2"],
+        "stat" => &["newfstatat", "statx"],
+        "chmod" => &["fchmodat"],
+        "chown" => &["fchownat"],
+        "link" => &["linkat"],
+        "symlink" => &["symlinkat"],
+        "readlink" => &["readlinkat"],
+        _ => &[],
+    }
+}
+
+/// Build a seccomp filter applying `action` to each named syscall (plus family aliases).
+/// All unknown syscall names on the current arch are silently skipped.
+fn build_syscall_filter(
+    syscall_names: &[impl AsRef<str>],
+    action: ScmpAction,
+) -> Result<ScmpFilterContext, SeccompNotifierError> {
+    let mut filter = ScmpFilterContext::new(ScmpAction::Allow)
+        .map_err(SeccompNotifierError::FilterCreation)?;
+    for name in syscall_names {
+        let name_str = name.as_ref();
+        if let Ok(syscall) = ScmpSyscall::from_name(name_str) {
+            filter
+                .add_rule(action, syscall)
+                .map_err(SeccompNotifierError::AddRule)?;
+        }
+        for alias in syscall_family_aliases(name_str) {
+            if let Ok(syscall) = ScmpSyscall::from_name(alias) {
+                filter
+                    .add_rule(action, syscall)
+                    .map_err(SeccompNotifierError::AddRule)?;
+            }
+        }
+    }
+    Ok(filter)
+}
+
+pub fn apply_syscall_deny_filter(
+    syscall_names: &[impl AsRef<str>],
+) -> Result<(), SeccompNotifierError> {
+    if syscall_names.is_empty() {
+        return Ok(());
+    }
+    build_syscall_filter(syscall_names, ScmpAction::Errno(libc::EPERM))?
+        .load()
+        .map_err(SeccompNotifierError::LoadFilter)
+}
+
+/// Load a `SCMP_ACT_NOTIFY` seccomp filter for the given syscall names.
+///
+/// Must be called inside a `pre_exec` closure (after fork, before exec).
+/// Returns the notify file descriptor with `O_CLOEXEC` cleared so it survives
+/// the subsequent `exec()` call. The parent process should retrieve a duplicate
+/// using `pidfd_getfd(2)` while the child's fd is still open.
+///
+/// The caller is responsible for closing the returned fd (usually handled by
+/// `run_seccomp_notify_supervisor` on the parent side).
+pub fn apply_syscall_notify_filter(
+    syscall_names: &[impl AsRef<str>],
+) -> Result<RawFd, SeccompNotifierError> {
+    if syscall_names.is_empty() {
+        return Err(SeccompNotifierError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no syscalls to intercept",
+        )));
+    }
+    let filter = build_syscall_filter(syscall_names, ScmpAction::Notify)?;
+    filter.load().map_err(SeccompNotifierError::LoadFilter)?;
+    let notify_fd = filter
+        .get_notify_fd()
+        .map_err(SeccompNotifierError::GetNotifyFd)?;
+    // Clear O_CLOEXEC so the fd survives exec() in the child.
+    // The parent will use pidfd_getfd(2) to dup it into the parent's table.
+    unsafe {
+        let flags = libc::fcntl(notify_fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(notify_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
+    }
+    Ok(notify_fd)
+}
+
+/// Run a blocking supervisor loop for a seccomp-unotify notify fd.
+///
+/// Receives notifications on `notify_fd`, calls `on_intercepted` for each
+/// blocked syscall (for logging/reporting), then responds with EPERM denial.
+/// Exits when the supervised process terminates (receive returns an error).
+///
+/// This function blocks the calling thread and is intended to be run inside
+/// `tokio::task::spawn_blocking`. It closes `notify_fd` when done.
+pub fn run_seccomp_notify_supervisor<F>(notify_fd: RawFd, mut on_intercepted: F)
+where
+    F: FnMut(&SyscallInfo),
+{
+    loop {
+        match ScmpNotifReq::receive(notify_fd) {
+            Ok(req) => {
+                let info = SyscallInfo::from(&req);
+                on_intercepted(&info);
+                let resp = SeccompNotifier::deny_eperm(&req);
+                if resp.respond(notify_fd).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    unsafe { libc::close(notify_fd) };
+}
+
 /// Run the seccomp notification loop in the parent process.
 ///
 /// This function receives notifications from the kernel about intercepted syscalls,

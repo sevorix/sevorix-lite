@@ -28,10 +28,18 @@
                 historyLimit: 50,
                 historyLoading: false,
 
+                // ── Session switcher ─────────────────────────────────────────
+                sessions: [],
+                selectedSession: null,
+                sessionsLoading: false,
+
+                // ── Intervention panel ──────────────────────────────────────
+                pendingRequests: [],
+
                 // ── Shared UI state ─────────────────────────────────────────
                 activeTab: 'history',   // 'live' | 'history'
                 selected: null,
-                stats: { total: 0, blocked: 0, latency: 0 },
+                stats: { total: 0, blocked: 0, latency: 0, shell: 0, syscall: 0, network: 0 },
                 edition: 'pro',
                 search: '',
                 filters: { shell: true, syscall: true, network: true },
@@ -45,10 +53,40 @@
                 _addLive(data) {
                     const layer = (data.layer || 'shell').toLowerCase();
                     const bucket = layer === 'syscall' ? 'syscall'
-                                 : (layer === 'network' || layer === 'http') ? 'network' : 'shell';
+                                 : layer === 'network' ? 'network' : 'shell';
                     this._live[bucket].unshift(data);
                     if (this._live[bucket].length > this.LIVE_PER_LAYER)
                         this._live[bucket].pop();
+                },
+
+                // ── Stats ────────────────────────────────────────────────────
+                loadStats() {
+                    fetch('/api/stats')
+                        .then(r => r.json())
+                        .then(data => {
+                            this.stats.total   = data.total   || 0;
+                            this.stats.blocked = data.blocked || 0;
+                            this.stats.latency = data.avg_latency || 0;
+                            this.stats.shell   = data.shell   || 0;
+                            this.stats.syscall = data.syscall || 0;
+                            this.stats.network = data.network || 0;
+                        })
+                        .catch(() => {});
+                },
+
+                // ── Session switcher ─────────────────────────────────────────
+                loadSessions() {
+                    this.sessionsLoading = true;
+                    fetch('/api/sessions')
+                        .then(r => r.json())
+                        .then(data => {
+                            this.sessions = data.sessions || [];
+                            if (this.selectedSession === null && data.current_session) {
+                                this.selectedSession = data.current_session;
+                            }
+                            this.sessionsLoading = false;
+                        })
+                        .catch(() => { this.sessionsLoading = false; });
                 },
 
                 // ── History query ───────────────────────────────────────────
@@ -57,14 +95,14 @@
                     this.historyLoading = true;
 
                     const params = new URLSearchParams({ page: this.historyPage, limit: this.historyLimit });
-                    // "network" checkbox covers both "network" (eBPF) and "http" (proxy).
                     const activeKeys = Object.entries(this.filters).filter(([, v]) => v).map(([k]) => k);
-                    const activeLayers = activeKeys.flatMap(k => k === 'network' ? ['network', 'http'] : [k]).join(',');
-                    const allLayers = 'shell,syscall,network,http';
+                    const activeLayers = activeKeys.join(',');
+                    const allLayers = 'shell,syscall,network';
                     if (activeLayers && activeLayers !== allLayers) {
                         params.set('layer', activeLayers);
                     }
                     if (this.search.trim()) params.set('search', this.search.trim());
+                    if (this.selectedSession) params.set('session', this.selectedSession);
 
                     fetch('/api/events?' + params)
                         .then(r => r.json())
@@ -100,30 +138,86 @@
                         .catch(err => console.warn("Could not load version info:", err));
 
                     // Initial history load
+                    this.loadSessions();
                     this.queryHistory(1);
+                    this.loadStats();
+                    setInterval(() => this.loadStats(), 5000);
 
-                    // Stats from full log (no filters)
-                    fetch('/api/events?limit=1')
-                        .then(r => r.json())
-                        .then(data => {
-                            this.stats.total   = data.total || 0;
-                        })
-                        .catch(() => {});
+                    // Countdown ticker — decrements non-paused, non-decided pending requests
+                    setInterval(() => {
+                        this.pendingRequests = this.pendingRequests.map(r =>
+                            (r._paused || r._decided || r.notification_only)
+                                ? r
+                                : { ...r, _remainingSecs: Math.max(0, r._remainingSecs - 1) }
+                        );
+                    }, 1000);
 
                     const ws = new WebSocket("ws://localhost:3000/ws");
                     ws.onopen = () => console.log("CONNECTED TO SERVER!");
                     ws.onmessage = (msg) => {
                         const data = JSON.parse(msg.data);
+
+                        if (data.type === 'PENDING') {
+                            this.pendingRequests.unshift({
+                                ...data,
+                                _remainingSecs: data.timeout_secs || 30,
+                                _paused: false,
+                                _decided: false,
+                            });
+                            return;
+                        }
+
+                        if (data.type === 'DECIDED') {
+                            const req = this.pendingRequests.find(r => r.event_id === data.event_id);
+                            if (req) {
+                                req._decided = true;
+                                req._decisionAction = data.action;
+                                setTimeout(() => {
+                                    this.pendingRequests = this.pendingRequests.filter(r => r.event_id !== data.event_id);
+                                }, 2000);
+                            }
+                            return;
+                        }
+
+                        if (data.type === 'PAUSED') {
+                            const req = this.pendingRequests.find(r => r.event_id === data.event_id);
+                            if (req) req._paused = data.paused;
+                            return;
+                        }
+
                         this._addLive(data);
-                        this.stats.total++;
-                        if (data.lane === 'RED') this.stats.blocked++;
-                        if (data.latency !== undefined) this.stats.latency = data.latency;
                         if (data.lane === 'RED') this.selected = data;
                     };
                     ws.onclose = () => {
                         console.log("Disconnected. Retrying...");
                         setTimeout(() => this.connect(), 1000);
                     };
+                },
+
+                // ── Intervention actions ────────────────────────────────────
+                decide(eventId, action) {
+                    const req = this.pendingRequests.find(r => r.event_id === eventId);
+                    if (req) { req._decided = true; req._decisionAction = action; }
+                    fetch('/api/decide', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ event_id: eventId, action })
+                    })
+                    .then(r => { if (!r.ok && req) req._decided = false; })
+                    .catch(() => { if (req) req._decided = false; });
+                },
+
+                togglePause(eventId) {
+                    const req = this.pendingRequests.find(r => r.event_id === eventId);
+                    if (!req) return;
+                    const newPaused = !req._paused;
+                    req._paused = newPaused;
+                    fetch('/api/pause', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ event_id: eventId, paused: newPaused })
+                    })
+                    .catch(() => { if (req) req._paused = !newPaused; });
                 }
             }
         }
@@ -169,10 +263,99 @@
         <div class="absolute inset-0 opacity-5" 
              style="background-image: radial-gradient(#334155 1px, transparent 1px); background-size: 30px 30px;"></div>
 
+        <!-- ── INTERVENTION PANEL ─────────────────────────────────────────── -->
+        <div x-show="pendingRequests.length > 0"
+             x-transition:enter="transition ease-out duration-200"
+             x-transition:enter-start="opacity-0 -translate-y-2"
+             x-transition:enter-end="opacity-100 translate-y-0"
+             class="absolute inset-x-0 top-0 z-50 bg-yellow-950/95 border-b border-yellow-500/50
+                    backdrop-blur-sm shadow-[0_4px_30px_rgba(234,179,8,0.2)] p-4"
+             style="display:none;">
+
+            <div class="flex items-center gap-3 mb-3">
+                <span class="h-2.5 w-2.5 rounded-full bg-yellow-400 animate-pulse"></span>
+                <h2 class="text-xs font-bold text-yellow-300 uppercase tracking-widest">Awaiting Operator Decision</h2>
+                <span class="ml-auto text-[10px] text-yellow-600 font-mono"
+                      x-text="pendingRequests.length + ' pending'"></span>
+            </div>
+
+            <div class="space-y-2 max-h-60 overflow-y-auto pr-1">
+                <template x-for="req in pendingRequests" :key="req.event_id">
+                    <div class="flex items-start gap-3 p-3 bg-yellow-900/30 border border-yellow-700/40 rounded">
+
+                        <!-- Layer badge + info -->
+                        <div class="flex-1 min-w-0">
+                            <div class="flex items-center gap-2 mb-0.5">
+                                <span class="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded border"
+                                      :class="{
+                                          'border-blue-600 text-blue-400 bg-blue-950/50': req.layer === 'network',
+                                          'border-purple-600 text-purple-400 bg-purple-950/50': req.layer === 'shell',
+                                          'border-orange-600 text-orange-400 bg-orange-950/50': req.layer === 'syscall',
+                                      }"
+                                      x-text="(req.layer || 'unknown').toUpperCase()"></span>
+                                <span class="text-[11px] text-yellow-500 font-mono truncate"
+                                      x-text="req.reason || 'Flagged by scanner'"></span>
+                            </div>
+                            <p class="text-sm text-slate-200 truncate font-mono" x-text="req.payload"></p>
+                            <p class="text-[10px] text-slate-500 mt-0.5" x-text="req.timestamp"></p>
+                        </div>
+
+                        <!-- Countdown + action buttons -->
+                        <div class="flex flex-col items-end gap-1.5 shrink-0">
+                            <!-- Badge -->
+                            <span class="text-xs font-mono px-2 py-0.5 rounded border transition-colors"
+                                  :class="{
+                                      'border-slate-600 text-slate-400': req._paused && !req._decided,
+                                      'border-red-500 text-red-400 animate-pulse': !req._paused && !req._decided && req._remainingSecs <= 5,
+                                      'border-yellow-600 text-yellow-400': !req._paused && !req._decided && req._remainingSecs > 5,
+                                      'border-green-600 text-green-400': req._decided && req._decisionAction === 'allow',
+                                      'border-red-700 text-red-400': req._decided && req._decisionAction === 'block',
+                                  }"
+                                  x-text="req._decided
+                                      ? (req._decisionAction === 'allow' ? '✓ ALLOWED' : '✗ BLOCKED')
+                                      : (req._paused ? '⏸ PAUSED' : req._remainingSecs + 's')">
+                            </span>
+
+                            <!-- Buttons — hidden after decision -->
+                            <template x-if="!req._decided">
+                                <div class="flex gap-1.5">
+                                    <button @click="togglePause(req.event_id)"
+                                            class="px-2 py-1 text-[11px] font-bold uppercase rounded border transition-all active:scale-95"
+                                            :class="req._paused
+                                                ? 'bg-yellow-900/60 border-yellow-600 text-yellow-300 hover:bg-yellow-500 hover:text-white'
+                                                : 'bg-slate-800 border-slate-600 text-slate-400 hover:border-yellow-600 hover:text-yellow-300'"
+                                            x-text="req._paused ? 'Resume' : 'Pause'">
+                                    </button>
+                                    <button @click="decide(req.event_id, 'allow')"
+                                            class="px-2.5 py-1 text-[11px] font-bold uppercase rounded border
+                                                   bg-green-900/50 border-green-700 text-green-400
+                                                   hover:bg-green-500 hover:text-white transition-all active:scale-95">
+                                        Allow
+                                    </button>
+                                    <button @click="decide(req.event_id, 'block')"
+                                            class="px-2.5 py-1 text-[11px] font-bold uppercase rounded border
+                                                   bg-red-900/50 border-red-700 text-red-400
+                                                   hover:bg-red-500 hover:text-white transition-all active:scale-95">
+                                        Block
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+        <!-- ── END INTERVENTION PANEL ─────────────────────────────────────── -->
+
         <aside class="w-64 bg-slate-950 border-r border-slate-800 p-4 flex flex-col gap-6 z-10">
             <div class="cyber-border bg-slate-900/50 p-4 rounded relative overflow-hidden">
                 <p class="text-xs text-slate-500 uppercase mb-1">Total Traffic</p>
                 <h2 class="text-4xl font-bold text-white" x-text="stats.total">0</h2>
+                <div class="flex gap-3 mt-2 text-[10px] font-mono">
+                    <span class="text-cyan-400"><span x-text="stats.shell"></span> shell</span>
+                    <span class="text-purple-400"><span x-text="stats.syscall"></span> syscall</span>
+                    <span class="text-yellow-400"><span x-text="stats.network"></span> network</span>
+                </div>
                 <div class="absolute bottom-0 left-0 h-1 bg-blue-500 transition-all duration-300" style="width: 100%"></div>
             </div>
             <div class="cyber-border bg-slate-900/50 p-4 rounded relative overflow-hidden">
@@ -206,8 +389,13 @@
                         <span class="ml-1 h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse inline-block"></span>
                     </button>
                 </div>
-                <span class="text-xs text-slate-500" x-show="activeTab === 'history'"
-                      x-text="historyTotal + ' events · page ' + historyPage + ' of ' + historyTotalPages"></span>
+                <span class="text-xs text-slate-500 flex items-center gap-2" x-show="activeTab === 'history'">
+                    <span x-text="historyTotal + ' events · page ' + historyPage + ' of ' + historyTotalPages"></span>
+                    <button @click="queryHistory(historyPage)"
+                            :disabled="historyLoading"
+                            class="px-1.5 py-0.5 rounded border border-slate-700 text-slate-500 hover:text-slate-300 hover:border-slate-500 disabled:opacity-30 transition-all"
+                            title="Refresh">↻</button>
+                </span>
                 <span class="text-xs text-slate-500" x-show="activeTab === 'live'"
                       x-text="liveEvents.length + ' live events (last ' + LIVE_PER_LAYER + ' per layer)'"></span>
             </div>
@@ -236,6 +424,23 @@
                 <span x-show="historyLoading" class="text-xs text-slate-500 animate-pulse">Loading…</span>
             </div>
 
+            <!-- Session switcher (history only) -->
+            <div x-show="activeTab === 'history'"
+                 class="px-4 py-1.5 bg-slate-950/40 border-b border-slate-800/60 flex items-center gap-2">
+                <span class="text-[10px] text-slate-600 uppercase tracking-widest whitespace-nowrap">Session</span>
+                <select x-model="selectedSession"
+                        @change="historyPage = 1; queryHistory(1)"
+                        :disabled="sessionsLoading || sessions.length === 0"
+                        class="flex-1 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:ring-1 focus:ring-cyan-600 disabled:opacity-40">
+                    <template x-for="s in sessions" :key="s.session_id">
+                        <option :value="s.session_id"
+                                x-text="(s.is_current ? '● ' : '○ ') + s.session_id.substring(0,8) + '…  (' + s.event_count + ' events' + (s.started_at ? ', ' + (s.started_at || '').replace('T', ' ').substring(0, 19) : '') + ')'">
+                        </option>
+                    </template>
+                </select>
+                <span x-show="sessionsLoading" class="text-[10px] text-slate-600 animate-pulse">Loading…</span>
+            </div>
+
             <!-- Event list -->
             <div class="flex-1 overflow-y-auto p-4 space-y-3" id="feed-container">
                 <template x-for="event in displayEvents" :key="event.timestamp + (event.pid || '')">
@@ -258,7 +463,7 @@
                                       :class="{
                                         'bg-cyan-900/60 text-cyan-400':     (event.layer || 'shell') === 'shell',
                                         'bg-purple-900/60 text-purple-400': event.layer === 'syscall',
-                                        'bg-yellow-900/60 text-yellow-400': event.layer === 'network' || event.layer === 'http'
+                                        'bg-yellow-900/60 text-yellow-400': event.layer === 'network'
                                       }"
                                       x-text="event.layer || 'shell'"></span>
                             </div>
@@ -337,12 +542,7 @@
                                 <span class="text-red-400 text-lg italic" x-text="selected.reason"></span>
                             </div>
                         </template>
-                        <template x-if="selected.confidence">
-                             <div class="mb-6">
-                                <span class="text-slate-500 block mb-2">AI CONFIDENCE</span>
-                                <span class="text-slate-300 text-lg font-mono" x-text="selected.confidence"></span>
-                            </div>
-                        </template>
+
                         <div>
                             <span class="text-slate-500 block mb-2">PAYLOAD CONTENT</span>
                             <div class="p-4 bg-slate-900 rounded text-green-400 break-words border border-slate-800 text-base leading-relaxed shadow-inner font-medium">

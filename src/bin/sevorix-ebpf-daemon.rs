@@ -8,7 +8,19 @@
 //! 2. Attaches to tracepoints and cgroups
 //! 3. Consumes events from ring buffer
 //! 4. Evaluates policy via HTTP to Watchtower
-//! 5. Updates eBPF maps with policy decisions
+//! 5. Updates eBPF maps with policy decisions (enforcing future syscalls/connections)
+//!
+//! # Enforcement Model
+//!
+//! Syscall enforcement uses a caching/reactive model: the first occurrence of an
+//! unknown syscall by a PID passes through while Watchtower evaluates it async.
+//! On a BLOCK decision, the (pid, syscall_nr) pair is inserted into SYSCALL_DENYLIST
+//! so all future occurrences are rejected at the kernel level without a userspace
+//! round-trip.
+//!
+//! Network enforcement via sock_ops is synchronous for known entries (pre-populated
+//! in NET_DENYLIST). Unknown connections pass through on first occurrence and are
+//! blocked for future attempts after Watchtower returns a BLOCK decision.
 //!
 //! # Usage
 //!
@@ -27,19 +39,21 @@ fn main() {
 #[cfg(feature = "ebpf")]
 mod ebpf_impl {
     use std::net::IpAddr;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     use anyhow::{Context, Result};
     use aya::maps::RingBuf;
-    use aya::programs::{CgroupAttachMode, SockOps, TracePoint};
-    use aya::Ebpf;
+    use aya::programs::{CgroupAttachMode, Lsm, SockOps, TracePoint};
+    use aya::programs::lsm::LsmLink;
+    use aya::{Btf, Ebpf};
     use directories::ProjectDirs;
-    use sevorix_ebpf_common::{NetworkEvent, SyscallEvent};
-    use tokio::sync::broadcast;
+    use sevorix_core::{detect_enforcement_tier, EnforcementTier};
+    use sevorix_ebpf_common::{NetworkEvent, NetworkKey, PolicyKey, SyscallEvent};
+    use tokio::sync::{broadcast, Mutex};
     use tracing::{error, info, warn};
 
-    /// Syscall numbers considered interesting enough to forward to watchtower.
+    /// Syscall numbers considered interesting enough to forward to Watchtower.
     /// Excludes high-frequency noise (read, write, futex, poll, etc.).
     const INTERESTING_SYSCALLS: &[u64] = &[
         2,   // open
@@ -84,13 +98,24 @@ mod ebpf_impl {
         .pipe(|s| if s.is_empty() { format!("syscall_{}", nr) } else { s })
     }
 
-    /// Shared HTTP client — created once, reused for all forwarding calls.
-    /// reqwest::Client uses connection pooling internally, so reusing it avoids
-    /// the per-event TCP handshake overhead that caused the 17-second backlog.
+    /// Shared HTTP client — created once, reused for all policy query calls.
     static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
     fn http_client() -> &'static reqwest::Client {
         HTTP_CLIENT.get_or_init(reqwest::Client::new)
+    }
+
+    /// Semaphore limiting concurrent HTTP evaluations.
+    ///
+    /// Each `evaluate_and_enforce_syscall` / `evaluate_and_enforce_network` call opens
+    /// a TCP socket (1 FD). Without a cap, a burst of ring-buffer events spawns unbounded
+    /// tasks, quickly exhausting the process's 1024-FD soft limit and causing EMFILE.
+    /// 64 permits leaves ~960 FDs headroom for eBPF maps, program links, tokio internals,
+    /// the log file, and the Unix socket.
+    static EVAL_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+    fn eval_sem() -> &'static Arc<tokio::sync::Semaphore> {
+        EVAL_SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64)))
     }
 
     trait Pipe: Sized {
@@ -98,11 +123,87 @@ mod ebpf_impl {
     }
     impl<T> Pipe for T {}
 
-    async fn forward_syscall_to_watchtower(
+    /// Policy decision returned by Watchtower's /analyze-syscall endpoint.
+    #[derive(Debug, Clone, serde::Deserialize)]
+    struct WatchtowerDecision {
+        /// "allow", "block", or "kill"
+        pub action: String,
+        /// errno to return when blocking (e.g. EPERM=1, EACCES=13). Defaults to EPERM.
+        #[serde(default)]
+        pub errno: Option<i32>,
+    }
+
+    /// Structured policy rules returned by `GET /policies/ebpf`.
+    #[derive(Debug, serde::Deserialize)]
+    struct SyscallRule {
+        syscall_nr: u64,
+        errno: i32,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct EbpfPolicies {
+        syscall_rules: Vec<SyscallRule>,
+        // net_rules reserved for future use
+        #[allow(dead_code)]
+        net_rules: Vec<serde_json::Value>,
+    }
+
+    /// Shared, mutable handles to eBPF enforcement maps.
+    ///
+    /// Cloning is cheap — all fields are Arc-wrapped.
+    #[derive(Clone)]
+    struct PolicyMaps {
+        syscall_denylist: Arc<Mutex<aya::maps::Map>>,
+        net_denylist: Arc<Mutex<aya::maps::Map>>,
+        global_denylist: Arc<Mutex<aya::maps::Map>>,
+    }
+
+    impl PolicyMaps {
+        /// Insert (pid, syscall_nr) → errno into SYSCALL_DENYLIST.
+        /// Future occurrences of this syscall by this PID will be rejected at the kernel level.
+        ///
+        /// Uses PolicyKey (repr(C) with explicit padding) as the map key — this has the same
+        /// byte layout as the kernel-side (u32, u64) key and implements aya::Pod.
+        async fn deny_syscall(&self, pid: u32, syscall_nr: u64, errno: i32) {
+            let key = PolicyKey { pid, _padding: 0, id: syscall_nr };
+            let mut guard = self.syscall_denylist.lock().await;
+            match aya::maps::HashMap::<_, PolicyKey, i32>::try_from(&mut *guard) {
+                Ok(mut map) => match map.insert(key, errno, 0) {
+                    Ok(_) => info!("eBPF: denied pid={} syscall={} errno={}", pid, syscall_nr, errno),
+                    Err(e) => warn!("eBPF: SYSCALL_DENYLIST insert failed: {}", e),
+                },
+                Err(e) => warn!("eBPF: failed to access SYSCALL_DENYLIST: {}", e),
+            }
+        }
+
+        /// Insert dst_ip:dst_port → errno into NET_DENYLIST.
+        /// Future TCP connections to this destination will be rejected by sock_ops.
+        async fn deny_network(&self, dst_ip: u32, dst_port: u16, errno: i32) {
+            let mut guard = self.net_denylist.lock().await;
+            match aya::maps::HashMap::<_, NetworkKey, i32>::try_from(&mut *guard) {
+                Ok(mut map) => {
+                    let key = NetworkKey { dst_ip, dst_port, protocol: 6, _padding: 0 };
+                    match map.insert(key, errno, 0) {
+                        Ok(_) => info!("eBPF: denied network dst_ip={} dst_port={}", dst_ip, dst_port),
+                        Err(e) => warn!("eBPF: NET_DENYLIST insert failed: {}", e),
+                    }
+                }
+                Err(e) => warn!("eBPF: failed to access NET_DENYLIST: {}", e),
+            }
+        }
+    }
+
+    /// Query Watchtower for a policy decision on a syscall, then enforce via eBPF maps.
+    ///
+    /// On BLOCK: inserts into SYSCALL_DENYLIST so future calls are rejected in-kernel.
+    /// On ALLOW: no map update — every occurrence is evaluated (correctness > fast-path).
+    /// On KILL:  sends SIGKILL to the process and also denies the syscall.
+    async fn evaluate_and_enforce_syscall(
         watchtower_url: String,
         pid: u32,
         syscall_nr: u64,
         args: [u64; 6],
+        maps: PolicyMaps,
     ) {
         let name = syscall_name(syscall_nr);
         let args_str: Vec<String> = args.iter().map(|a| format!("0x{:x}", a)).collect();
@@ -115,9 +216,240 @@ mod ebpf_impl {
             "timestamp": chrono::Local::now().to_rfc3339(),
         });
 
-        let url = format!("{}/analyze-syscall", watchtower_url);
-        if let Err(e) = http_client().post(&url).json(&payload).send().await {
-            warn!("Failed to forward syscall to watchtower: {}", e);
+        let resp = match http_client()
+            .post(format!("{}/analyze-syscall", watchtower_url))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to query Watchtower for syscall: {}", e);
+                return;
+            }
+        };
+
+        let decision: WatchtowerDecision = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Failed to parse Watchtower syscall decision: {}", e);
+                return;
+            }
+        };
+
+        match decision.action.as_str() {
+            "block" => {
+                let errno = decision.errno.unwrap_or(libc::EPERM);
+                maps.deny_syscall(pid, syscall_nr, errno).await;
+            }
+            "kill" => {
+                let errno = decision.errno.unwrap_or(libc::EPERM);
+                unsafe {
+                    if libc::kill(pid as libc::pid_t, libc::SIGKILL) != 0 {
+                        warn!("Failed to SIGKILL pid={}", pid);
+                    } else {
+                        info!("eBPF: sent SIGKILL to pid={} for policy violation", pid);
+                    }
+                }
+                maps.deny_syscall(pid, syscall_nr, errno).await;
+            }
+            "allow" => {
+                // No map update — SYSCALL_ALLOWLIST removed to prevent stale
+                // fast-path entries causing missed logs after PID reuse.
+            }
+            other => {
+                warn!("Unknown Watchtower action '{}' for syscall; defaulting to allow", other);
+            }
+        }
+    }
+
+    /// Query Watchtower for a policy decision on a network connection, then enforce via eBPF maps.
+    ///
+    /// Formats the connection as a "connect" syscall event to reuse the existing
+    /// /analyze-syscall endpoint. On BLOCK/KILL, inserts into NET_DENYLIST so future
+    /// connections to the same destination are rejected by sock_ops in-kernel.
+    async fn evaluate_and_enforce_network(
+        watchtower_url: String,
+        pid: u32,
+        dst_ip_str: String,
+        dst_ip: u32,
+        dst_port: u16,
+        maps: PolicyMaps,
+    ) {
+        let payload = serde_json::json!({
+            "syscall_name": "connect",
+            "syscall_number": 42i64,
+            "args": [format!("{}:{}", dst_ip_str, dst_port), "TCP"],
+            "pid": pid,
+            "ppid": 0,
+            "timestamp": chrono::Local::now().to_rfc3339(),
+        });
+
+        let resp = match http_client()
+            .post(format!("{}/analyze-syscall", watchtower_url))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to query Watchtower for network event: {}", e);
+                return;
+            }
+        };
+
+        let decision: WatchtowerDecision = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Failed to parse Watchtower network decision: {}", e);
+                return;
+            }
+        };
+
+        match decision.action.as_str() {
+            "block" | "kill" => {
+                let errno = decision.errno.unwrap_or(libc::EPERM);
+                maps.deny_network(dst_ip, dst_port, errno).await;
+
+                // Log blocked network event to Watchtower for audit trail
+                let log_payload = serde_json::json!({
+                    "event_type": "network",
+                    "verdict": "BLOCK",
+                    "lane": "RED",
+                    "layer": "network",
+                    "payload": format!("connect to {}:{}", dst_ip_str, dst_port),
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "latency": 0,
+                    "reason": format!("Network connection blocked (errno={})", errno),
+                    "confidence": "Policy Match",
+                    "context": "Network",
+                    "pid": pid,
+                    "destination": format!("{}:{}", dst_ip_str, dst_port),
+                });
+
+                if let Err(e) = http_client()
+                    .post(format!("{}/api/ebpf-event", watchtower_url))
+                    .json(&log_payload)
+                    .send()
+                    .await
+                {
+                    warn!("Failed to log blocked network event to Watchtower: {}", e);
+                }
+            }
+            _ => {} // allow / unknown: no map update needed
+        }
+    }
+
+    /// Fetch policy rules from Watchtower and pre-populate eBPF enforcement maps.
+    ///
+    /// Handle a single cgroup registration connection on the eBPF Unix socket.
+    ///
+    /// Reads a JSON line `{"cgroup_path":"..."}`, stats the path for its inode,
+    /// inserts it into `SEVORIX_CGROUP_IDS`, prefills policy maps, and sends ACK.
+    async fn handle_cgroup_registration(
+        stream: tokio::net::UnixStream,
+        map: Arc<tokio::sync::Mutex<aya::maps::Map>>,
+        pmaps: PolicyMaps,
+        wt_url: String,
+    ) {
+        use aya::maps::HashMap;
+        use std::os::unix::fs::MetadataExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (reader, mut writer) = stream.into_split();
+        let line = match BufReader::new(reader).lines().next_line().await {
+            Ok(Some(l)) => l,
+            _ => return,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let path = match v["cgroup_path"].as_str() {
+            Some(p) => p,
+            None => return,
+        };
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("eBPF socket: stat({}) failed: {}", path, e);
+                let _ = writer.write_all(b"{\"ok\":false}\n").await;
+                return;
+            }
+        };
+        let ino = meta.ino();
+        let mut guard = map.lock().await;
+        match HashMap::<_, u64, u8>::try_from(&mut *guard) {
+            Ok(mut ids_map) => match ids_map.insert(ino, 1u8, 0) {
+                Ok(_) => {
+                    info!("eBPF socket: registered cgroup path={} ino={}", path, ino);
+                    drop(guard);
+                    prefill_policy_maps(&wt_url, &pmaps).await;
+                    let _ = writer.write_all(b"{\"ok\":true}\n").await;
+                }
+                Err(e) => {
+                    warn!("eBPF socket: SEVORIX_CGROUP_IDS insert failed: {}", e);
+                    let _ = writer.write_all(b"{\"ok\":false}\n").await;
+                }
+            },
+            Err(e) => {
+                warn!("eBPF socket: failed to access SEVORIX_CGROUP_IDS: {}", e);
+                let _ = writer.write_all(b"{\"ok\":false}\n").await;
+            }
+        }
+    }
+
+    /// Called at daemon startup and on each new session cgroup creation to close the
+    /// first-occurrence gap: without pre-population, the first forbidden syscall passes
+    /// through (triggering the feedback loop for future calls). With pre-population,
+    /// GLOBAL_DENYLIST is filled before any session process runs.
+    async fn prefill_policy_maps(watchtower_url: &str, maps: &PolicyMaps) {
+        let resp = match http_client()
+            .get(format!("{}/policies/ebpf", watchtower_url))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Policy prefill: failed to fetch /policies/ebpf: {}", e);
+                return;
+            }
+        };
+
+        let policies: EbpfPolicies = match resp.json().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Policy prefill: failed to parse /policies/ebpf response: {}", e);
+                return;
+            }
+        };
+
+        if policies.syscall_rules.is_empty() {
+            info!("Policy prefill: no syscall rules to populate");
+            return;
+        }
+
+        let mut guard = maps.global_denylist.lock().await;
+        match aya::maps::HashMap::<_, u64, i32>::try_from(&mut *guard) {
+            Ok(mut map) => {
+                for rule in &policies.syscall_rules {
+                    match map.insert(rule.syscall_nr, rule.errno, 0) {
+                        Ok(_) => info!(
+                            "Policy prefill: GLOBAL_DENYLIST[syscall={}] = errno={}",
+                            rule.syscall_nr, rule.errno
+                        ),
+                        Err(e) => warn!(
+                            "Policy prefill: GLOBAL_DENYLIST insert failed for syscall={}: {}",
+                            rule.syscall_nr, e
+                        ),
+                    }
+                }
+                info!(
+                    "Policy prefill complete: {} syscall rules applied to GLOBAL_DENYLIST",
+                    policies.syscall_rules.len()
+                );
+            }
+            Err(e) => warn!("Policy prefill: failed to access GLOBAL_DENYLIST: {}", e),
         }
     }
 
@@ -131,22 +463,18 @@ mod ebpf_impl {
         Ok(())
     }
 
-    /// Event received from eBPF program.
+    /// Event received from eBPF program (used for dashboard broadcast).
+    // Fields are written via broadcast::Sender and will be consumed by future dashboard subscribers.
+    #[allow(dead_code)]
     #[derive(Debug, Clone)]
     pub struct EbpfEvent {
-        /// Event type (syscall or network).
         pub event_type: EventType,
-        /// Process ID.
         pub pid: u32,
-        /// Thread ID.
         pub tid: u32,
-        /// Timestamp (ns since boot).
         pub timestamp: u64,
-        /// Event-specific data.
         pub data: serde_json::Value,
     }
 
-    /// Type of eBPF event.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum EventType {
         SyscallEntry,
@@ -157,9 +485,7 @@ mod ebpf_impl {
     /// Daemon configuration.
     #[derive(Debug, Clone)]
     pub struct DaemonConfig {
-        /// Watchtower HTTP endpoint for policy decisions.
         pub watchtower_url: String,
-        /// Cgroup path for network interception.
         pub cgroup_path: String,
     }
 
@@ -173,11 +499,17 @@ mod ebpf_impl {
     }
 
     /// Load and attach eBPF programs.
-    pub fn load_and_attach(bpf: &mut Ebpf, cgroup_path: &str) -> Result<()> {
-        info!("Attaching eBPF programs...");
+    /// Load and attach all eBPF programs.
+    ///
+    /// Returns any LSM links that must stay alive for the program lifetime.
+    /// Dropping an `LsmLink` detaches the program from the kernel.
+    pub fn load_and_attach(
+        bpf: &mut Ebpf,
+        cgroup_path: &str,
+        tier: EnforcementTier,
+    ) -> Result<Vec<LsmLink>> {
+        info!("Attaching eBPF programs (tier: {})...", tier);
 
-        // Attach syscall tracepoint (sys_enter)
-        info!("Attaching sys_enter tracepoint...");
         let sys_enter: &mut TracePoint = bpf
             .program_mut("sys_enter")
             .context("Failed to get sys_enter program")?
@@ -187,8 +519,6 @@ mod ebpf_impl {
         sys_enter.attach("raw_syscalls", "sys_enter")?;
         info!("sys_enter tracepoint attached");
 
-        // Attach syscall tracepoint (sys_exit)
-        info!("Attaching sys_exit tracepoint...");
         let sys_exit: &mut TracePoint = bpf
             .program_mut("sys_exit")
             .context("Failed to get sys_exit program")?
@@ -198,8 +528,6 @@ mod ebpf_impl {
         sys_exit.attach("raw_syscalls", "sys_exit")?;
         info!("sys_exit tracepoint attached");
 
-        // Attach sockops for network interception
-        info!("Attaching sockops for network interception...");
         let sock_ops: &mut SockOps = bpf
             .program_mut("sock_ops")
             .context("Failed to get sock_ops program")?
@@ -207,24 +535,83 @@ mod ebpf_impl {
             .context("Failed to convert sock_ops to SockOps")?;
         sock_ops.load()?;
 
-        // Attach to cgroup
         let cgroup_file = std::fs::File::open(cgroup_path)
             .with_context(|| format!("Failed to open cgroup: {}", cgroup_path))?;
         sock_ops.attach(cgroup_file, CgroupAttachMode::Single)?;
         info!("Sockops attached to cgroup: {}", cgroup_path);
 
+        // On Advanced tier: load and attach BPF LSM programs.
+        // These provide true enforcement (unlike tracepoints, LSM hook returns are enforced).
+        // Failure is non-fatal — log a warning and continue with Standard-tier enforcement.
+        let mut lsm_links: Vec<LsmLink> = Vec::new();
+        if tier == EnforcementTier::Advanced {
+            match Btf::from_sys_fs() {
+                Ok(btf) => {
+                    attach_lsm(bpf, "bprm_check_security", &btf, &mut lsm_links);
+                    attach_lsm(bpf, "lsm_socket_connect", &btf, &mut lsm_links);
+                    if lsm_links.is_empty() {
+                        warn!("Advanced tier: no LSM programs attached — falling back to Standard-tier enforcement");
+                    } else {
+                        info!("Advanced tier: {} LSM program(s) attached", lsm_links.len());
+                    }
+                }
+                Err(e) => {
+                    warn!("Advanced tier: BTF unavailable ({}), falling back to Standard-tier enforcement", e);
+                }
+            }
+        }
+
         info!("eBPF programs loaded and attached successfully");
-        Ok(())
+        Ok(lsm_links)
+    }
+
+    /// Attempt to load and attach a single BPF LSM program by name.
+    ///
+    /// On success, takes ownership of the link and pushes it into `links`.
+    /// On failure, logs a warning and returns — non-fatal.
+    fn attach_lsm(bpf: &mut Ebpf, prog_name: &str, btf: &Btf, links: &mut Vec<LsmLink>) {
+        // The hook name passed to lsm.load() is the kernel LSM hook name,
+        // which matches the aya #[lsm(hook = "...")] attribute.
+        // prog_name may differ from hook_name (e.g. "lsm_socket_connect" → "socket_connect").
+        let hook_name = prog_name.trim_start_matches("lsm_");
+
+        let prog: &mut Lsm = match bpf.program_mut(prog_name).and_then(|p| p.try_into().ok()) {
+            Some(p) => p,
+            None => {
+                warn!("LSM program '{}' not found in eBPF object", prog_name);
+                return;
+            }
+        };
+
+        if let Err(e) = prog.load(hook_name, btf) {
+            warn!("Failed to load LSM program '{}': {}", prog_name, e);
+            return;
+        }
+
+        match prog.attach() {
+            Ok(link_id) => match prog.take_link(link_id) {
+                Ok(link) => {
+                    info!("LSM program '{}' attached (hook: {})", prog_name, hook_name);
+                    links.push(link);
+                }
+                Err(e) => warn!("Failed to take LSM link for '{}': {}", prog_name, e),
+            },
+            Err(e) => warn!("Failed to attach LSM program '{}': {}", prog_name, e),
+        }
     }
 
     /// Process a single event from the ring buffer.
-    fn process_event(data: &[u8], event_tx: &broadcast::Sender<EbpfEvent>, watchtower_url: &str) -> Result<()> {
+    fn process_event(
+        data: &[u8],
+        event_tx: &broadcast::Sender<EbpfEvent>,
+        watchtower_url: &str,
+        maps: &PolicyMaps,
+    ) -> Result<()> {
         if data.len() < 4 {
             warn!("Event data too short: {} bytes", data.len());
             return Ok(());
         }
 
-        // Read event type from first 4 bytes
         let event_type = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
 
         match event_type {
@@ -233,9 +620,8 @@ mod ebpf_impl {
                     warn!("SyscallEvent data too short: {} bytes", data.len());
                     return Ok(());
                 }
-                // Parse the event manually to avoid lifetime issues
                 let event = parse_syscall_event(data)?;
-                handle_syscall_event(event, event_tx, EventType::SyscallEntry, watchtower_url)?;
+                handle_syscall_event(event, event_tx, EventType::SyscallEntry, watchtower_url, maps)?;
             }
             SyscallEvent::EVENT_TYPE_EXIT => {
                 if data.len() < std::mem::size_of::<SyscallEvent>() {
@@ -243,16 +629,15 @@ mod ebpf_impl {
                     return Ok(());
                 }
                 let event = parse_syscall_event(data)?;
-                handle_syscall_event(event, event_tx, EventType::SyscallExit, watchtower_url)?;
+                handle_syscall_event(event, event_tx, EventType::SyscallExit, watchtower_url, maps)?;
             }
             NetworkEvent::EVENT_TYPE => {
                 if data.len() < std::mem::size_of::<NetworkEvent>() {
                     warn!("NetworkEvent data too short: {} bytes", data.len());
                     return Ok(());
                 }
-                // Parse the event manually to avoid lifetime issues
                 let event = parse_network_event(data)?;
-                handle_network_event(event, event_tx)?;
+                handle_network_event(event, event_tx, watchtower_url, maps)?;
             }
             _ => {
                 warn!("Unknown event type: {}", event_type);
@@ -262,48 +647,27 @@ mod ebpf_impl {
         Ok(())
     }
 
-    /// Parse a SyscallEvent from raw bytes.
     fn parse_syscall_event(data: &[u8]) -> Result<SyscallEvent> {
-        // Ensure we have enough data
         if data.len() < std::mem::size_of::<SyscallEvent>() {
             anyhow::bail!("SyscallEvent data too short");
         }
-
-        // Use unsafe to transmute the bytes to the struct
-        // This is safe because we've verified the size and the struct is repr(C)
         Ok(unsafe { std::ptr::read_unaligned(data.as_ptr() as *const SyscallEvent) })
     }
 
-    /// Parse a NetworkEvent from raw bytes.
     fn parse_network_event(data: &[u8]) -> Result<NetworkEvent> {
-        // Ensure we have enough data
         if data.len() < std::mem::size_of::<NetworkEvent>() {
             anyhow::bail!("NetworkEvent data too short");
         }
-
-        // Use unsafe to transmute the bytes to the struct
-        // This is safe because we've verified the size and the struct is repr(C)
         Ok(unsafe { std::ptr::read_unaligned(data.as_ptr() as *const NetworkEvent) })
     }
 
-    /// Check if a PID belongs to a process inside the sevorix cgroup hierarchy.
-    ///
-    /// Reads `/proc/<pid>/cgroup` (cgroup v2 single-hierarchy format) and checks
-    /// whether the cgroup path contains `/sevorix/`, indicating it was placed there
-    /// by sevsh's session cgroup setup.
-    fn is_pid_in_sevorix_cgroup(pid: u32) -> bool {
-        let path = format!("/proc/{}/cgroup", pid);
-        std::fs::read_to_string(&path)
-            .map(|s| s.contains("/sevorix/"))
-            .unwrap_or(false)
-    }
-
-    /// Handle a syscall event.
+    /// Handle a syscall event: broadcast to dashboard and spawn policy evaluation if interesting.
     fn handle_syscall_event(
         event: SyscallEvent,
         event_tx: &broadcast::Sender<EbpfEvent>,
         event_type: EventType,
         watchtower_url: &str,
+        maps: &PolicyMaps,
     ) -> Result<()> {
         let ebpf_event = EbpfEvent {
             event_type,
@@ -316,43 +680,49 @@ mod ebpf_impl {
             }),
         };
 
-        match event_type {
-            EventType::SyscallEntry => {
-                // Only forward syscalls from processes inside a sevsh session cgroup.
-                // This prevents flooding watchtower with unrelated system activity.
-                // The kernel already filtered to sevorix-cgroup processes only.
-                // Forward interesting syscalls to watchtower for policy evaluation.
-                if INTERESTING_SYSCALLS.contains(&event.syscall_nr) {
-                    info!(
-                        "Syscall entry (sevorix): pid={}, tid={}, syscall={}",
-                        event.pid, event.tid, event.syscall_nr
-                    );
-                    let url = watchtower_url.to_string();
-                    let (pid, nr, args) = (event.pid, event.syscall_nr, event.args);
-                    tokio::spawn(async move {
-                        forward_syscall_to_watchtower(url, pid, nr, args).await;
-                    });
-                }
+        if event_type == EventType::SyscallEntry
+            && INTERESTING_SYSCALLS.contains(&event.syscall_nr)
+        {
+            info!(
+                "Syscall entry: pid={}, syscall={}",
+                event.pid,
+                syscall_name(event.syscall_nr)
+            );
+            if let Ok(permit) = eval_sem().clone().try_acquire_owned() {
+                let url = watchtower_url.to_string();
+                let maps = maps.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    evaluate_and_enforce_syscall(url, event.pid, event.syscall_nr, event.args, maps)
+                        .await;
+                });
+            } else {
+                tracing::trace!("eval semaphore full — dropping syscall event pid={} nr={}", event.pid, event.syscall_nr);
             }
-            EventType::SyscallExit => {}
-            _ => {}
         }
 
-        // Broadcast to subscribers
         let _ = event_tx.send(ebpf_event);
-
         Ok(())
     }
 
-    /// Handle a network event.
-    fn handle_network_event(event: NetworkEvent, event_tx: &broadcast::Sender<EbpfEvent>) -> Result<()> {
-        // Convert IP from network byte order to human-readable
+    /// Handle a network event: broadcast to dashboard and spawn policy evaluation.
+    fn handle_network_event(
+        event: NetworkEvent,
+        event_tx: &broadcast::Sender<EbpfEvent>,
+        watchtower_url: &str,
+        maps: &PolicyMaps,
+    ) -> Result<()> {
         let dst_ip = u32::from_be(event.dst_ip);
         let src_ip = u32::from_be(event.src_ip);
         let dst_ip_addr = IpAddr::from(std::net::Ipv4Addr::from(dst_ip));
         let src_ip_addr = IpAddr::from(std::net::Ipv4Addr::from(src_ip));
         let dst_port = u16::from_be(event.dst_port);
         let src_port = u16::from_be(event.src_port);
+
+        info!(
+            "Network event: pid={}, dst={}:{} (protocol={})",
+            event.pid, dst_ip_addr, dst_port, event.protocol
+        );
 
         let ebpf_event = EbpfEvent {
             event_type: EventType::Network,
@@ -369,76 +739,65 @@ mod ebpf_impl {
             }),
         };
 
-        info!(
-            "Network event: pid={}, dst={}:{} ({})",
-            event.pid, dst_ip_addr, dst_port, event.protocol
-        );
+        // Log network event to Watchtower for audit trail (async, non-blocking)
+        let log_url = watchtower_url.to_string();
+        let log_dst_ip = dst_ip_addr.to_string();
+        let log_pid = event.pid;
+        tokio::spawn(async move {
+            let log_payload = serde_json::json!({
+                "event_type": "network",
+                "verdict": "EVENT",
+                "lane": "GREEN",
+                "layer": "network",
+                "payload": format!("connect to {}:{} (protocol={})", log_dst_ip, dst_port, event.protocol),
+                "timestamp": chrono::Local::now().to_rfc3339(),
+                "latency": 0,
+                "reason": "Network connection observed",
+                "confidence": "N/A",
+                "context": "Network",
+                "pid": log_pid,
+                "destination": format!("{}:{}", log_dst_ip, dst_port),
+            });
 
-        // Broadcast to subscribers
+            if let Err(e) = http_client()
+                .post(format!("{}/api/ebpf-event", log_url))
+                .json(&log_payload)
+                .send()
+                .await
+            {
+                tracing::trace!("Failed to log network event to Watchtower: {}", e);
+            }
+        });
+
+        // Spawn policy evaluation. The first connection to an unknown destination
+        // passes through; on BLOCK, the destination is added to NET_DENYLIST so
+        // future connections are rejected by sock_ops in-kernel.
+        if let Ok(permit) = eval_sem().clone().try_acquire_owned() {
+            let url = watchtower_url.to_string();
+            let maps = maps.clone();
+            let dst_ip_str = dst_ip_addr.to_string();
+            tokio::spawn(async move {
+                let _permit = permit;
+                evaluate_and_enforce_network(url, event.pid, dst_ip_str, event.dst_ip, dst_port, maps)
+                    .await;
+            });
+        } else {
+            tracing::trace!("eval semaphore full — dropping network event pid={} dst={}:{}", event.pid, dst_ip_addr, dst_port);
+        }
+
         let _ = event_tx.send(ebpf_event);
-
-        // TODO: Perform DNS reverse lookup for enrichment
-        // tokio::spawn(async move {
-        //     if let Some(hostname) = reverse_dns_lookup(dst_ip_addr).await {
-        //         info!("DNS enrichment: {} -> {}", dst_ip_addr, hostname);
-        //     }
-        // });
-
         Ok(())
     }
 
-    /// Policy decision from Watchtower.
-    #[derive(Debug, Clone, serde::Deserialize)]
-    pub struct PolicyDecision {
-        pub action: String,
-        pub reason: String,
-        #[serde(default)]
-        pub confidence: f32,
-    }
-
-    /// Query watchtower for policy decision.
-    pub async fn query_policy(
-        watchtower_url: &str,
-        event: &EbpfEvent,
-    ) -> Result<PolicyDecision> {
-        let response = http_client()
-            .post(format!("{}/analyze-syscall", watchtower_url))
-            .json(&serde_json::json!({
-                "event_type": match event.event_type {
-                    EventType::SyscallEntry => "syscall_entry",
-                    EventType::SyscallExit => "syscall_exit",
-                    EventType::Network => "network",
-                },
-                "pid": event.pid,
-                "tid": event.tid,
-                "data": event.data,
-            }))
-            .send()
-            .await
-            .context("Failed to query Watchtower")?;
-
-        let decision: PolicyDecision = response
-            .json()
-            .await
-            .context("Failed to parse Watchtower response")?;
-
-        Ok(decision)
-    }
-
-    /// Perform DNS reverse lookup for an IP address.
-    pub async fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
-        // Use spawn_blocking for synchronous DNS lookup
-        let handle = tokio::task::spawn_blocking(move || {
-            dns_lookup::lookup_addr(&ip).ok()
-        });
-        handle.await.ok().flatten()
-    }
-
-    /// Write a diagnostic line to /tmp/sevorix-ebpf-daemon-diag.log (world-writable path).
+    /// Write a diagnostic line before tracing is initialized.
     fn diag(msg: &str) {
         let line = format!("[{}] {}\n", std::process::id(), msg);
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/sevorix-ebpf-daemon-diag.log") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/sevorix-ebpf-daemon-diag.log")
+        {
             let _ = f.write_all(line.as_bytes());
         }
     }
@@ -446,12 +805,9 @@ mod ebpf_impl {
     pub fn run() -> Result<()> {
         diag("run() entered");
 
-        // Write PID file so EbpfDaemonManager::is_running() can detect us.
         write_pid_file().context("Failed to write eBPF daemon PID file")?;
         diag("PID file written");
 
-        // Initialize logging — write to the dedicated log file passed via an env var
-        // (set by watchtower before spawning us), falling back to stdout.
         let log_path = std::env::var("SEVORIX_EBPF_LOG")
             .unwrap_or_else(|_| "/tmp/sevorix-ebpf-daemon.log".to_string());
         diag(&format!("log path = {}", log_path));
@@ -460,7 +816,6 @@ mod ebpf_impl {
             .append(true)
             .open(&log_path)
             .unwrap_or_else(|_| {
-                // Last resort: /tmp
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -477,29 +832,26 @@ mod ebpf_impl {
             .block_on(async {
                 info!("Sevorix eBPF Daemon starting...");
 
-                let config = DaemonConfig::default();
+                let tier = detect_enforcement_tier();
+                info!("Enforcement tier: {}", tier);
+                if tier == EnforcementTier::Standard {
+                    info!("  (BPF LSM unavailable — 'bpf' not in /sys/kernel/security/lsm)");
+                }
 
-                // Create event broadcast channel
+                let config = DaemonConfig::default();
                 let (event_tx, _) = broadcast::channel(1024);
 
                 info!("Loading eBPF programs...");
 
-                // Load the eBPF object file
-                // Note: In production, this would load the compiled .o file
-                // The eBPF program must be compiled separately using:
-                // cargo build --target bpfel-unknown-none -Zbuild-std --release
-                //
-                // For now, we'll try to load from the expected location
-                // In a proper setup, this would be included at compile time when the eBPF
-                // target is available
-
-                // Look for the eBPF bytecode alongside this binary, then fall back
-                // to the build output path (for development).
                 let ebpf_path = std::env::current_exe()
                     .ok()
                     .and_then(|p| p.parent().map(|d| d.join("sevorix-ebpf")))
                     .filter(|p| p.exists())
-                    .unwrap_or_else(|| std::path::PathBuf::from("target/bpfel-unknown-none/release/sevorix-ebpf"));
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(
+                            "target/bpfel-unknown-none/release/sevorix-ebpf",
+                        )
+                    });
 
                 let mut bpf = if ebpf_path.exists() {
                     let bytes = std::fs::read(&ebpf_path)
@@ -512,44 +864,171 @@ mod ebpf_impl {
                     anyhow::bail!("eBPF binary not found");
                 };
 
-                // Attach programs
-                load_and_attach(&mut bpf, &config.cgroup_path)?;
+                // _lsm_links must stay alive for the duration of the daemon.
+                // Dropping them would detach the BPF LSM programs from the kernel.
+                let _lsm_links = load_and_attach(&mut bpf, &config.cgroup_path, tier)?;
 
-                // Ensure the sevorix cgroup base directory exists.
-                // All session sub-cgroups live under it; the eBPF map tracks their IDs.
+                // Extract enforcement maps before taking the ring buffer.
+                // Wrapped in Arc<Mutex<>> so they can be shared across async tasks.
+                let policy_maps = PolicyMaps {
+                    syscall_denylist: Arc::new(Mutex::new(
+                        bpf.take_map("SYSCALL_DENYLIST")
+                            .context("SYSCALL_DENYLIST map not found in eBPF object")?,
+                    )),
+                    net_denylist: Arc::new(Mutex::new(
+                        bpf.take_map("NET_DENYLIST")
+                            .context("NET_DENYLIST map not found in eBPF object")?,
+                    )),
+                    global_denylist: Arc::new(Mutex::new(
+                        bpf.take_map("GLOBAL_DENYLIST")
+                            .context("GLOBAL_DENYLIST map not found in eBPF object")?,
+                    )),
+                };
+                info!("eBPF enforcement maps acquired");
+
+                // Pre-populate maps at startup so any already-running sessions get
+                // the current policy set applied without waiting for first occurrence.
+                prefill_policy_maps(&config.watchtower_url, &policy_maps).await;
+
                 let sevorix_cgroup_base = "/sys/fs/cgroup/sevorix";
                 if let Err(e) = std::fs::create_dir_all(sevorix_cgroup_base) {
-                    warn!("Could not create sevorix cgroup base {}: {}", sevorix_cgroup_base, e);
+                    warn!(
+                        "Could not create sevorix cgroup base {}: {}",
+                        sevorix_cgroup_base, e
+                    );
                 }
 
-                info!("Starting eBPF event processor");
-
-                // Take ownership of the SEVORIX_CGROUP_IDS map so we can move it into the
-                // background sync task (aya's HashMap requires &mut Map for writes).
                 let cgroup_ids_map = bpf.take_map("SEVORIX_CGROUP_IDS");
-
-                // Get the ring buffer (must be done after take_map).
                 let events_map = bpf.map("EVENTS").context("Failed to get EVENTS map")?;
                 let mut ring_buf = RingBuf::try_from(events_map)
                     .context("Failed to create RingBuf from EVENTS map")?;
 
                 // Background task: sync active sevorix session cgroup IDs into the BPF map.
-                //
-                // Uses inotify to detect new session cgroup directories the instant they are
-                // created by the cgroup helper, eliminating the race condition where fast
-                // commands (like `ls`) complete before a polling loop can register the cgroup.
-                //
-                // A periodic re-scan every 5s acts as a safety net for missed events (e.g.
-                // if the cgroup base was created after the watch was set up).
-                if let Some(mut cgroup_map) = cgroup_ids_map {
+                if let Some(cgroup_map_raw) = cgroup_ids_map {
+                    // Wrap in Arc<Mutex> so both the inotify task and the fast-poll task can share it.
+                    let shared_cgroup_map = Arc::new(Mutex::new(cgroup_map_raw));
+                    let cgroup_maps = policy_maps.clone();
+                    let cgroup_watchtower_url = config.watchtower_url.clone();
+
+                    // Unix socket listener: synchronous cgroup registration.
+                    // Watchtower's session_register handler connects here immediately after
+                    // creating the cgroup, sends {"cgroup_path":"..."}, and waits for ACK.
+                    // This ensures SEVORIX_CGROUP_IDS is updated before sevsh runs the child.
+                    {
+                        use tokio::net::UnixListener;
+                        use sevorix_watchtower::EBPF_SOCK_PATH;
+
+                        let _ = std::fs::remove_file(EBPF_SOCK_PATH);
+                        let socket_cgroup_map = shared_cgroup_map.clone();
+                        let socket_policy_maps = policy_maps.clone();
+                        let socket_watchtower_url = config.watchtower_url.clone();
+
+                        match UnixListener::bind(EBPF_SOCK_PATH) {
+                            Ok(listener) => {
+                                // Make socket world-writable so unprivileged watchtower can connect.
+                                let _ = std::fs::set_permissions(
+                                    EBPF_SOCK_PATH,
+                                    std::os::unix::fs::PermissionsExt::from_mode(0o666),
+                                );
+                                info!("Unix socket listener bound at {}", EBPF_SOCK_PATH);
+                                tokio::spawn(async move {
+                                    loop {
+                                        match listener.accept().await {
+                                            Ok((stream, _)) => {
+                                                let map = socket_cgroup_map.clone();
+                                                let pmaps = socket_policy_maps.clone();
+                                                let wt_url = socket_watchtower_url.clone();
+                                                tokio::spawn(handle_cgroup_registration(stream, map, pmaps, wt_url));
+                                            }
+                                            Err(e) => {
+                                                warn!("eBPF socket: accept error: {}", e);
+                                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => warn!("eBPF socket: failed to bind {}: {} — synchronous registration disabled", EBPF_SOCK_PATH, e),
+                        }
+                    }
+
+                    // Fast-poll task: polls /api/active-sessions every 200ms and syncs
+                    // SEVORIX_CGROUP_IDS from the returned paths. This closes the race
+                    // condition where fast commands complete before the inotify watcher
+                    // detects the new cgroup.
+                    let fast_poll_map = shared_cgroup_map.clone();
+                    let fast_poll_url = config.watchtower_url.clone();
+                    let fast_poll_maps = policy_maps.clone();
                     tokio::spawn(async move {
                         use aya::maps::HashMap;
-                        use inotify::{EventMask, Inotify, WatchMask};
                         use std::collections::HashSet;
                         use std::os::unix::fs::MetadataExt;
 
-                        /// Scan the sevorix cgroup directory and return the inode of every
-                        /// sub-cgroup directory (= cgroup ID in cgroupfs v2).
+                        let mut known: HashSet<u64> = HashSet::new();
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            // Fetch active sessions from Watchtower
+                            let sessions: Vec<String> = match http_client()
+                                .get(format!("{}/api/active-sessions", fast_poll_url))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) => resp
+                                    .json::<serde_json::Value>()
+                                    .await
+                                    .ok()
+                                    .and_then(|v| v["sessions"].as_array().cloned())
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter_map(|s| s.as_str().map(str::to_string))
+                                    .collect(),
+                                Err(_) => continue,
+                            };
+
+                            // Stat each path to get its inode (cgroup ID)
+                            let active: HashSet<u64> = sessions
+                                .iter()
+                                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.ino()))
+                                .collect();
+
+                            // Sync map
+                            let mut any_new = false;
+                            let mut guard = fast_poll_map.lock().await;
+                            if let Ok(mut ids_map) = HashMap::<_, u64, u8>::try_from(&mut *guard) {
+                                for &id in active.difference(&known) {
+                                    if ids_map.insert(id, 1u8, 0).is_ok() {
+                                        tracing::info!(
+                                            "eBPF fast-poll: added session cgroup id={}",
+                                            id
+                                        );
+                                        any_new = true;
+                                    }
+                                }
+                                for &id in known.difference(&active) {
+                                    let _ = ids_map.remove(&id);
+                                    tracing::info!(
+                                        "eBPF fast-poll: removed session cgroup id={}",
+                                        id
+                                    );
+                                }
+                            }
+                            drop(guard);
+                            known = active;
+                            if any_new {
+                                prefill_policy_maps(&fast_poll_url, &fast_poll_maps).await;
+                            }
+                        }
+                    });
+
+                    let cgroup_map_arc = shared_cgroup_map;
+                    let cgroup_maps = cgroup_maps;
+                    let cgroup_watchtower_url = cgroup_watchtower_url;
+                    tokio::spawn(async move {
+                        use aya::maps::HashMap;
+                        use inotify::{Inotify, WatchMask};
+                        use std::collections::HashSet;
+                        use std::os::unix::fs::MetadataExt;
+
                         fn scan_cgroup_ids(base: &str) -> HashSet<u64> {
                             let mut ids = HashSet::new();
                             if let Ok(rd) = std::fs::read_dir(base) {
@@ -564,36 +1043,46 @@ mod ebpf_impl {
                             ids
                         }
 
-                        /// Push differences between `known` and `active` into the BPF map.
+                        /// Returns true if any new session cgroups were added.
                         fn sync_map(
                             cgroup_map: &mut aya::maps::Map,
                             known: &mut HashSet<u64>,
                             active: &HashSet<u64>,
-                        ) {
-                            if let Ok(mut ids_map) = HashMap::<_, u64, u8>::try_from(&mut *cgroup_map) {
+                        ) -> bool {
+                            let mut any_new = false;
+                            if let Ok(mut ids_map) =
+                                HashMap::<_, u64, u8>::try_from(&mut *cgroup_map)
+                            {
                                 for &id in active.difference(known) {
                                     if ids_map.insert(id, 1u8, 0).is_ok() {
-                                        tracing::info!("eBPF cgroup filter: added session cgroup id={}", id);
+                                        tracing::info!(
+                                            "eBPF cgroup filter: added session cgroup id={}",
+                                            id
+                                        );
+                                        any_new = true;
                                     }
                                 }
                                 for &id in known.difference(active) {
                                     let _ = ids_map.remove(&id);
-                                    tracing::info!("eBPF cgroup filter: removed session cgroup id={}", id);
+                                    tracing::info!(
+                                        "eBPF cgroup filter: removed session cgroup id={}",
+                                        id
+                                    );
                                 }
                             }
                             *known = active.clone();
+                            any_new
                         }
 
                         let mut known: HashSet<u64> = HashSet::new();
-
-                        // Perform an initial scan so sessions that existed before the daemon
-                        // started (or before the watch is ready) are registered immediately.
                         let active = scan_cgroup_ids(sevorix_cgroup_base);
-                        sync_map(&mut cgroup_map, &mut known, &active);
+                        // Initial sync — any already-running sessions are covered by the
+                        // startup prefill call in run(), so we don't re-prefill here.
+                        {
+                            let mut guard = cgroup_map_arc.lock().await;
+                            sync_map(&mut *guard, &mut known, &active);
+                        }
 
-                        // Set up inotify on the sevorix cgroup base directory.
-                        // Wrap inotify in AsyncFd for non-blocking use in tokio.
-                        // Falls back to 500ms polling if inotify is unavailable.
                         let inotify_result = Inotify::init().and_then(|mut i| {
                             i.add_watch(
                                 sevorix_cgroup_base,
@@ -606,58 +1095,97 @@ mod ebpf_impl {
 
                         match inotify_result {
                             Ok(inotify) => {
-                                // Use AsyncFd so we can await readability without blocking tokio.
-                                use tokio::io::unix::AsyncFd;
                                 use std::os::unix::io::AsRawFd;
+                                use tokio::io::unix::AsyncFd;
 
-                                // Set inotify fd to non-blocking.
                                 let fd = inotify.as_raw_fd();
-                                unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK); }
+                                unsafe {
+                                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                                }
 
-                                // Safety: we own the inotify instance and it lives for the task.
                                 let async_fd = match AsyncFd::new(inotify) {
                                     Ok(a) => a,
                                     Err(e) => {
-                                        warn!("AsyncFd init failed ({}), falling back to polling", e);
+                                        warn!(
+                                            "AsyncFd init failed ({}), falling back to polling",
+                                            e
+                                        );
                                         loop {
                                             tokio::time::sleep(Duration::from_millis(500)).await;
-                                            sync_map(&mut cgroup_map, &mut known, &scan_cgroup_ids(sevorix_cgroup_base));
+                                            let any_new = {
+                                                let mut guard = cgroup_map_arc.lock().await;
+                                                sync_map(
+                                                    &mut *guard,
+                                                    &mut known,
+                                                    &scan_cgroup_ids(sevorix_cgroup_base),
+                                                )
+                                            };
+                                            if any_new {
+                                                prefill_policy_maps(&cgroup_watchtower_url, &cgroup_maps).await;
+                                            }
                                         }
                                     }
                                 };
 
-                                // Periodic re-scan ticker (safety net for missed events).
-                                let mut rescan = tokio::time::interval(Duration::from_secs(5));
-                                rescan.tick().await; // consume immediate tick
+                                let mut rescan =
+                                    tokio::time::interval(Duration::from_secs(5));
+                                rescan.tick().await;
 
                                 loop {
                                     tokio::select! {
-                                        // inotify signals a directory was created or deleted.
                                         ready = async_fd.readable() => {
                                             if let Ok(mut guard) = ready {
                                                 guard.clear_ready();
-                                                // Drain events via the raw fd; we only care
-                                                // that something changed, not what.
                                                 unsafe {
-                                                    libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len());
+                                                    libc::read(
+                                                        fd,
+                                                        buf.as_mut_ptr() as *mut _,
+                                                        buf.len(),
+                                                    );
                                                 }
                                             }
-                                            // Small delay so the cgroup helper finishes writing
-                                            // cgroup.procs before we stat the directory.
                                             tokio::time::sleep(Duration::from_millis(10)).await;
-                                            sync_map(&mut cgroup_map, &mut known, &scan_cgroup_ids(sevorix_cgroup_base));
+                                            let any_new = {
+                                                let mut guard = cgroup_map_arc.lock().await;
+                                                sync_map(
+                                                    &mut *guard,
+                                                    &mut known,
+                                                    &scan_cgroup_ids(sevorix_cgroup_base),
+                                                )
+                                            };
+                                            if any_new {
+                                                prefill_policy_maps(&cgroup_watchtower_url, &cgroup_maps).await;
+                                            }
                                         },
                                         _ = rescan.tick() => {
-                                            sync_map(&mut cgroup_map, &mut known, &scan_cgroup_ids(sevorix_cgroup_base));
+                                            let mut guard = cgroup_map_arc.lock().await;
+                                            sync_map(
+                                                &mut *guard,
+                                                &mut known,
+                                                &scan_cgroup_ids(sevorix_cgroup_base),
+                                            );
                                         },
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("inotify unavailable ({}), falling back to 500ms polling", e);
+                                warn!(
+                                    "inotify unavailable ({}), falling back to 500ms polling",
+                                    e
+                                );
                                 loop {
                                     tokio::time::sleep(Duration::from_millis(500)).await;
-                                    sync_map(&mut cgroup_map, &mut known, &scan_cgroup_ids(sevorix_cgroup_base));
+                                    let any_new = {
+                                        let mut guard = cgroup_map_arc.lock().await;
+                                        sync_map(
+                                            &mut *guard,
+                                            &mut known,
+                                            &scan_cgroup_ids(sevorix_cgroup_base),
+                                        )
+                                    };
+                                    if any_new {
+                                        prefill_policy_maps(&cgroup_watchtower_url, &cgroup_maps).await;
+                                    }
                                 }
                             }
                         }
@@ -669,20 +1197,22 @@ mod ebpf_impl {
                 info!("Ring buffer ready, waiting for sevorix session events...");
 
                 loop {
-                    // Poll for events with a short yield to keep tokio responsive.
                     let mut processed = 0u32;
                     while let Some(event) = ring_buf.next() {
-                        if let Err(e) = process_event(&event, &event_tx, &config.watchtower_url) {
+                        if let Err(e) = process_event(
+                            &event,
+                            &event_tx,
+                            &config.watchtower_url,
+                            &policy_maps,
+                        ) {
                             error!("Failed to process event: {}", e);
                         }
                         processed += 1;
-                        // Yield every 64 events to let tokio schedule the cgroup sync task.
                         if processed % 64 == 0 {
                             tokio::task::yield_now().await;
                         }
                     }
 
-                    // Buffer empty — sleep before next poll.
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })

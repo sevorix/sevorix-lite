@@ -2871,6 +2871,7 @@ dependencies = [
  "chrono",
  "clap",
  "daemonize",
+ "dashmap 6.1.0",
  "dialoguer",
  "directories",
  "dns-lookup",

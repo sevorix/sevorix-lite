@@ -1,3 +1,4 @@
+pub mod enforcement;
 pub mod input_buffer;
 pub mod pty;
 pub mod pty_multiplexer;
@@ -14,8 +15,10 @@ pub use pty_multiplexer::{
     MultiplexerMode, PassthroughDetector, PtyMultiplexer, PtyMultiplexerConfig,
     PtyMultiplexerError, Verdict,
 };
+pub use enforcement::{detect_enforcement_tier, EnforcementTier};
 pub use seccomp::{
-    extract_args_from_seccomp, kernel_supports_seccomp_notify, spawn_seccomp_shell,
+    apply_syscall_deny_filter, apply_syscall_notify_filter, extract_args_from_seccomp,
+    kernel_supports_seccomp_notify, run_seccomp_notify_supervisor, spawn_seccomp_shell,
     spawn_seccomp_shell_with_handler, syscall_event_from_request, syscall_name, AllowAllHandler,
     CallbackPolicyHandler, SeccompDecision, SeccompNotifier, SeccompNotifierError,
     SeccompPolicyHandler, SyscallCategory, SyscallInfo,
@@ -97,7 +100,7 @@ pub struct Policy {
 impl Policy {
     pub fn matches(&self, content: &str, regex_cache: &HashMap<String, Regex>) -> bool {
         match &self.match_type {
-            PolicyType::Simple(pattern) => content.contains(pattern),
+            PolicyType::Simple(pattern) => content.contains(pattern.as_str()),
             PolicyType::Regex(_) => {
                 if let Some(re) = regex_cache.get(&self.id) {
                     re.is_match(content)

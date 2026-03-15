@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                start_runtime(allowed_roles.clone())?;
+                start_runtime(allowed_roles.clone(), session_id)?;
             } else if start_ebpf {
                 // eBPF-only mode: spawn daemon and wait for it
                 #[cfg(feature = "ebpf")]
@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             daemon.start()?;
             let (_guard, session_id) = init_logging();
             info!("Daemon restarted. Session ID: {}", session_id);
-            start_runtime(allowed_roles.clone())?;
+            start_runtime(allowed_roles.clone(), session_id)?;
         }
         Some(Commands::Status) => {
             daemon.status();
@@ -112,18 +112,18 @@ fn main() -> anyhow::Result<()> {
             // Default foreground run
             let (_guard, session_id) = init_logging();
             info!("Running in foreground. Session ID: {}", session_id);
-            start_runtime(allowed_roles)?;
+            start_runtime(allowed_roles, session_id)?;
         }
     }
     Ok(())
 }
 
-fn start_runtime(allowed_roles: Option<Vec<String>>) -> anyhow::Result<()> {
+fn start_runtime(allowed_roles: Option<Vec<String>>, session_id: uuid::Uuid) -> anyhow::Result<()> {
     // Initialize the Tokio runtime here, after potential daemonization
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_server(allowed_roles))
+        .block_on(run_server(allowed_roles, session_id))
 }
 
 /// Spawn the eBPF daemon via `sudo -n` and write its PID to the state directory.

@@ -1,7 +1,7 @@
 use crate::log_traffic_event;
 use crate::policy::PolicyContext;
 use crate::scanner::{log_threat, scan_content, scan_for_poison, PoisonPill};
-use crate::AppState;
+use crate::{AppState, PendingEntry, await_decision_with_pause};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::net::TcpStream;
+use tokio::sync::{oneshot, watch};
 
 struct NoHintBody;
 
@@ -76,7 +77,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             let event = json!({
                 "verdict": "ALLOW",
                 "lane": "GREEN",
-                "layer": "http",
+                "layer": "network",
                 "payload": format!("CONNECT tunnel to {}", addr),
                 "timestamp": chrono::Local::now().to_rfc3339(),
                 "latency": start_time.elapsed().as_millis() as u64,
@@ -164,10 +165,17 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     let agent_id = "Proxy-Agent";
     let role = "default";
 
+    // Include the request line (method + URL) in the scanned content so URL-based policies match.
+    let scan_payload = if body_str.is_empty() {
+        format!("{} {}", method, uri)
+    } else {
+        format!("{} {}\n\n{}", method, uri, body_str)
+    };
+
     let mut scan = scan_content(
-        &body_str,
+        &scan_payload,
         Some(role),
-        &state.policy_engine,
+        &state.policy_engine.read().unwrap(),
         PolicyContext::Network,
     );
 
@@ -200,7 +208,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         let event = json!({
             "verdict": scan.verdict,
             "lane": scan.lane,
-            "layer": "http",
+            "layer": "network",
             "payload": display_payload,
             "timestamp": chrono::Local::now().to_rfc3339(),
             "latency": elapsed,
@@ -213,6 +221,79 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         let _ = state.tx.send(event_str);
 
         return (StatusCode::FORBIDDEN, format!("Request Blocked: {}", msg)).into_response();
+    }
+
+    // --- USER INTERVENTION for FLAG (network channel) ---
+    if scan.verdict == "FLAG" {
+        let display_payload_flag = if body_str.is_empty() {
+            format!("{} {}", method, uri)
+        } else {
+            format!("{} {}\n\n{}", method, uri, body_str.chars().take(2000).collect::<String>())
+        };
+
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let (decision_tx, decision_rx) = oneshot::channel::<bool>();
+        let (pause_tx, pause_rx) = watch::channel(false);
+        state.pending_decisions.insert(event_id.clone(), PendingEntry { decision_tx, pause_tx });
+
+        let pending_event = json!({
+            "type": "PENDING",
+            "event_id": event_id,
+            "verdict": "FLAG",
+            "lane": "YELLOW",
+            "layer": "network",
+            "payload": display_payload_flag,
+            "timestamp": chrono::Local::now().to_rfc3339(),
+            "reason": scan.log_msg,
+            "context": "Network",
+            "timeout_secs": state.intervention_timeout_secs,
+            "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
+        });
+        log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
+        let _ = state.tx.send(pending_event.to_string());
+
+        let allowed = await_decision_with_pause(
+            decision_rx,
+            pause_rx,
+            state.intervention_timeout_secs,
+            state.intervention_timeout_allow,
+        ).await;
+
+        // Still in map → timeout fired (not resolved by decide_handler)
+        if state.pending_decisions.remove(&event_id).is_some() {
+            let decided_event = json!({
+                "type": "DECIDED",
+                "event_id": event_id,
+                "action": if allowed { "allow" } else { "block" },
+                "reason": "timeout",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            });
+            let _ = state.tx.send(decided_event.to_string());
+        }
+
+        if !allowed {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            let block_event = json!({
+                "verdict": "BLOCK",
+                "lane": "RED",
+                "layer": "network",
+                "payload": display_payload_flag,
+                "timestamp": chrono::Local::now().to_rfc3339(),
+                "latency": elapsed,
+                "reason": "Blocked by operator",
+                "confidence": "Manual Override",
+                "context": "Network",
+            });
+            let block_str = block_event.to_string();
+            log_traffic_event(&state.traffic_log_path, &block_str);
+            let _ = state.tx.send(block_str);
+            return (StatusCode::FORBIDDEN, "Request blocked by operator.").into_response();
+        }
+
+        // Operator allowed — update verdict for the broadcast below
+        scan.verdict = "ALLOW".to_string();
+        scan.lane = "GREEN".to_string();
+        scan.log_msg = Some("Allowed by operator intervention".to_string());
     }
 
     // Broadcast allow event if needed (maybe too noisy? Main app does it)
@@ -234,7 +315,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     let event = json!({
         "verdict": scan.verdict,
         "lane": scan.lane,
-        "layer": "http",
+        "layer": "network",
         "payload": display_payload,
         "timestamp": chrono::Local::now().to_rfc3339(),
         "latency": elapsed,
@@ -315,13 +396,22 @@ mod tests {
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::{Request, StatusCode};
+    use dashmap::DashMap;
+    use std::sync::RwLock;
 
     fn create_test_state() -> Arc<AppState> {
         let (tx, _) = tokio::sync::broadcast::channel(1);
         Arc::new(AppState {
             tx,
-            policy_engine: Arc::new(Engine::new()),
+            policy_engine: Arc::new(RwLock::new(Engine::new())),
             traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
+            log_dir: std::path::PathBuf::from("/tmp"),
+            session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            enforcement_tier: sevorix_core::EnforcementTier::Standard,
+            active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            pending_decisions: Arc::new(DashMap::new()),
+            intervention_timeout_secs: 30,
+            intervention_timeout_allow: false,
         })
     }
 
@@ -350,8 +440,15 @@ mod tests {
 
         Arc::new(AppState {
             tx,
-            policy_engine: Arc::new(engine),
+            policy_engine: Arc::new(RwLock::new(engine)),
             traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
+            log_dir: std::path::PathBuf::from("/tmp"),
+            session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            enforcement_tier: sevorix_core::EnforcementTier::Standard,
+            active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            pending_decisions: Arc::new(DashMap::new()),
+            intervention_timeout_secs: 30,
+            intervention_timeout_allow: false,
         })
     }
 
