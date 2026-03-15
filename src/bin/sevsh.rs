@@ -98,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cgroup_created {
         let _ = reqwest::Client::new()
             .post("http://localhost:3000/api/session/register")
+            .header("X-Sevorix-Internal", "true")
             .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
             .send()
             .await;
@@ -156,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cgroup_created {
             let _ = reqwest::Client::new()
                 .post("http://localhost:3000/api/session/unregister")
+                .header("X-Sevorix-Internal", "true")
                 .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
                 .send()
                 .await;
@@ -208,6 +210,7 @@ async fn check_watchtower_reachable() -> Result<(), Box<dyn std::error::Error>> 
 
     let resp = client
         .get("http://localhost:3000/health")
+        .header("X-Sevorix-Internal", "true")
         .send()
         .await?;
 

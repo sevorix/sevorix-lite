@@ -218,6 +218,7 @@ mod ebpf_impl {
 
         let resp = match http_client()
             .post(format!("{}/analyze-syscall", watchtower_url))
+            .header("X-Sevorix-Internal", "true")
             .json(&payload)
             .send()
             .await
@@ -287,6 +288,7 @@ mod ebpf_impl {
 
         let resp = match http_client()
             .post(format!("{}/analyze-syscall", watchtower_url))
+            .header("X-Sevorix-Internal", "true")
             .json(&payload)
             .send()
             .await
@@ -329,6 +331,7 @@ mod ebpf_impl {
 
                 if let Err(e) = http_client()
                     .post(format!("{}/api/ebpf-event", watchtower_url))
+                    .header("X-Sevorix-Internal", "true")
                     .json(&log_payload)
                     .send()
                     .await
@@ -719,6 +722,24 @@ mod ebpf_impl {
         let dst_port = u16::from_be(event.dst_port);
         let src_port = u16::from_be(event.src_port);
 
+        // Fix 1: Drop LSM pre-bind events. When src_port=0 the socket hasn't been
+        // bound yet — a duplicate sock_ops event with full port info always follows.
+        if src_port == 0 {
+            return Ok(());
+        }
+
+        // Fix 2: Skip internal control-plane traffic destined for Watchtower itself.
+        // These are loopback connections from sevsh (health checks, session mgmt) and
+        // from this daemon (event logging), and would otherwise create a feedback loop.
+        let watchtower_port = watchtower_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(3000);
+        if dst_ip_addr.is_loopback() && dst_port == watchtower_port {
+            return Ok(());
+        }
+
         info!(
             "Network event: pid={}, dst={}:{} (protocol={})",
             event.pid, dst_ip_addr, dst_port, event.protocol
@@ -761,6 +782,7 @@ mod ebpf_impl {
 
             if let Err(e) = http_client()
                 .post(format!("{}/api/ebpf-event", log_url))
+                .header("X-Sevorix-Internal", "true")
                 .json(&log_payload)
                 .send()
                 .await
