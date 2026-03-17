@@ -94,6 +94,12 @@ fn main() -> anyhow::Result<()> {
             daemon.start()?;
             let (_guard, session_id) = init_logging();
             info!("Daemon restarted. Session ID: {}", session_id);
+            #[cfg(feature = "ebpf")]
+            {
+                info!("Starting eBPF daemon...");
+                let ebpf_process = spawn_ebpf_daemon()?;
+                info!("eBPF daemon started with PID: {}", ebpf_process.id());
+            }
             start_runtime(allowed_roles.clone(), session_id)?;
         }
         Some(Commands::Status) => {
