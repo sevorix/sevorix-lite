@@ -21,7 +21,44 @@ It sits on the wire between your Agent and the World, enforcing a **<20ms latenc
 
 ## 🚀 Key Features
 
-### 1. 🧑‍💼 Human-in-the-Loop Intervention
+### 1. ⚡ Red Lane: Policy-Based Blocking
+
+The Red Lane provides **zero-latency, deterministic blocking** driven entirely by your configured policies. Any policy with `Action: Block` that matches a request sends it to the Red Lane — no LLM involved, ~0ms latency.
+
+#### Traffic Channel Coverage
+
+| Channel | Red Lane support |
+|---------|-----------------|
+| Network (HTTP proxy) | ✅ Request blocked before forwarding |
+| Shell (via `sevsh`) | ✅ Command denied before execution |
+| Syscall (eBPF tracepoints) | ✅ Syscall denied via `EPERM` (or process killed if `kill: true`) |
+
+#### Policy Match Types
+
+| Type | Description |
+|------|-------------|
+| `Simple` | Substring match |
+| `Regex` | Full regular expression match |
+| `Executable` | Pipes content to an external command; blocks if exit code is 0 |
+
+Policies are scoped by **context** (`Shell`, `Network`, `Syscall`, `All`) and assigned to **roles**. If no role is configured for an agent, all traffic is blocked by default.
+
+#### Example Policy
+
+```json
+{
+  "id": "block-drop",
+  "type": "Simple",
+  "pattern": "DROP TABLE",
+  "action": "Block",
+  "context": "Shell",
+  "kill": false
+}
+```
+
+---
+
+### 2. 🧑‍💼 Human-in-the-Loop Intervention
 
 When a request is flagged as Yellow Lane, Watchtower **holds the request open** and routes it to a human operator for review.
 
@@ -66,35 +103,6 @@ The operator can also **Pause** the countdown for longer review without committi
 |----------|--------|------|-------------|
 | `/api/decide` | POST | `{ "event_id": "...", "action": "allow"\|"block" }` | Submit an operator decision. |
 | `/api/pause` | POST | `{ "event_id": "...", "paused": true\|false }` | Freeze or resume the countdown. |
-
----
-
-### 2. ⚡ Red Lane: Policy-Based Blocking
-
-The Red Lane provides **zero-latency, deterministic blocking** driven entirely by your configured policies. Any policy with `Action: Block` that matches a request sends it to the Red Lane — no LLM involved, ~0ms latency.
-
-#### Policy Match Types
-
-| Type | Description |
-|------|-------------|
-| `Simple` | Substring match |
-| `Regex` | Full regular expression match |
-| `Executable` | Pipes content to an external command; blocks if exit code is 0 |
-
-Policies are scoped by **context** (`Shell`, `Network`, `Syscall`, `All`) and assigned to **roles**. If no role is configured for an agent, all traffic is blocked by default.
-
-#### Example Policy
-
-```json
-{
-  "id": "block-drop",
-  "type": "Simple",
-  "pattern": "DROP TABLE",
-  "action": "Block",
-  "context": "Shell",
-  "kill": false
-}
-```
 
 ---
 
