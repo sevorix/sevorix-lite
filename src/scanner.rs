@@ -85,6 +85,16 @@ pub fn scan_content(
             kill: false,
         };
     };
+    if !engine.roles.contains_key(role) {
+        return SecurityScanResult {
+            verdict: "BLOCK".to_string(),
+            lane: "RED".to_string(),
+            delay: 0,
+            log_msg: Some(format!("Role '{}' not found in policy engine", role)),
+            log_score: Some("100%".to_string()),
+            kill: false,
+        };
+    }
     if let Some(decision) = engine.check_role(role, text, context) {
         match decision.action {
             Action::Block => {

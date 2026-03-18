@@ -1152,10 +1152,21 @@ async fn fetch_syscall_deny_list() -> Vec<String> {
 }
 
 async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Error>> {
-    let timeout_secs = sevorix_watchtower::settings::Settings::load()
-        .sevsh
+    let settings = sevorix_watchtower::settings::Settings::load();
+    // The validation timeout must exceed the intervention timeout so that flagged
+    // commands can wait for an operator decision without sevsh timing out first.
+    // Use explicit validation_timeout_secs if set; otherwise derive from the
+    // intervention timeout (default 30s) plus a 10s buffer.
+    let timeout_secs = settings.sevsh
+        .as_ref()
         .and_then(|s| s.validation_timeout_secs)
-        .unwrap_or(5);
+        .unwrap_or_else(|| {
+            let intervention_secs = settings.intervention
+                .as_ref()
+                .map(|i| i.timeout_secs())
+                .unwrap_or(30);
+            intervention_secs + 10
+        });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?;

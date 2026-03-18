@@ -393,6 +393,44 @@ pub fn handle_validate(command: String, role: Option<String>, context: String) {
     }
 }
 
+/// Pre-flight validation run in the parent process before daemonizing.
+/// Returns an error if configuration is invalid so `sevorix start` can exit
+/// with a clear message before reporting success.
+pub fn validate_startup_config() -> anyhow::Result<()> {
+    use directories::UserDirs;
+    use crate::policy::Engine;
+
+    // Load roles from disk (same search path as run_server)
+    let mut engine = Engine::new();
+    let mut base_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
+        base_dirs.push(proj_dirs.config_dir().to_path_buf());
+    }
+    if let Some(user_dirs) = UserDirs::new() {
+        base_dirs.push(user_dirs.home_dir().join(".sevorix"));
+    }
+    for base in &base_dirs {
+        let role_dir = base.join("roles");
+        if role_dir.exists() && role_dir.is_dir() {
+            let _ = engine.load_roles_from_dir(&role_dir);
+        }
+    }
+
+    // Read settings and validate default_role
+    let settings = settings::Settings::load();
+    if let Some(role) = settings.sevsh.and_then(|s| s.default_role) {
+        if !engine.roles.contains_key(role.as_str()) {
+            anyhow::bail!(
+                "settings.json specifies default_role '{}' but that role is not loaded. \
+                 Check ~/.sevorix/roles/ and ensure the role file exists.",
+                role
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uuid) -> anyhow::Result<()> {
     // Setup paths
     let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
@@ -621,11 +659,18 @@ async fn session_unregister(State(state): State<Arc<AppState>>, Json(body): Json
 }
 
 async fn session_set_role(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
-    if let Some(role) = body["role"].as_str() {
-        *state.current_role.write().unwrap() = Some(role.to_string());
-        tracing::info!("Session role updated to '{}'", role);
+    let Some(role) = body["role"].as_str() else {
+        return (StatusCode::BAD_REQUEST, "Missing 'role' field").into_response();
+    };
+    if !state.policy_engine.read().unwrap().roles.contains_key(role) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Role '{}' not found. Load it into ~/.sevorix/roles/ and reload policies.", role),
+        ).into_response();
     }
-    StatusCode::OK
+    *state.current_role.write().unwrap() = Some(role.to_string());
+    tracing::info!("Session role updated to '{}'", role);
+    StatusCode::OK.into_response()
 }
 
 /// Hot-reload all policies and roles from disk without restarting the server.
@@ -1777,7 +1822,12 @@ mod tests {
 
     #[test]
     fn test_scan_syscall_with_engine_integration() {
-        let engine = Engine::new();
+        let mut engine = Engine::new();
+        engine.roles.insert("default".to_string(), Role {
+            name: "default".to_string(),
+            policies: vec![],
+            is_dynamic: false,
+        });
         let event = SyscallEvent {
             syscall_name: "read".to_string(),
             syscall_number: 0,

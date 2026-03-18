@@ -160,10 +160,14 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     }
 
     // 2. Decision Engine
-    // For proxy, we don't know the "agent" ID or "role" easily unless headers are used.
-    // We'll use defaults.
     let agent_id = "Proxy-Agent";
-    let role = "default";
+    let resolved_role: Option<String> = state.current_role.read().unwrap().clone();
+    let Some(ref role) = resolved_role else {
+        return (
+            StatusCode::FORBIDDEN,
+            "SEVORIX: No role configured for this session. Use `sevorix session set-role`.".to_string(),
+        ).into_response();
+    };
 
     // Include the request line (method + URL) in the scanned content so URL-based policies match.
     let scan_payload = if body_str.is_empty() {
@@ -174,7 +178,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
 
     let mut scan = scan_content(
         &scan_payload,
-        Some(role),
+        Some(role.as_str()),
         &state.policy_engine.read().unwrap(),
         PolicyContext::Network,
     );
@@ -401,9 +405,15 @@ mod tests {
 
     fn create_test_state() -> Arc<AppState> {
         let (tx, _) = tokio::sync::broadcast::channel(1);
+        let mut engine = Engine::new();
+        engine.roles.insert("default".to_string(), Role {
+            name: "default".to_string(),
+            policies: vec![],
+            is_dynamic: false,
+        });
         Arc::new(AppState {
             tx,
-            policy_engine: Arc::new(RwLock::new(Engine::new())),
+            policy_engine: Arc::new(RwLock::new(engine)),
             traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
             log_dir: std::path::PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
@@ -412,7 +422,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
-            current_role: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            current_role: std::sync::Arc::new(std::sync::RwLock::new(Some("default".to_string()))),
         })
     }
 
@@ -450,7 +460,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
-            current_role: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            current_role: std::sync::Arc::new(std::sync::RwLock::new(Some("default".to_string()))),
         })
     }
 

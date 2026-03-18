@@ -1,5 +1,5 @@
 use clap::Parser;
-use sevorix_watchtower::{handle_config, handle_integrations, handle_validate, logging::{init_logging, init_logging_with_session}, run_server, Cli, Commands, DaemonManager, HubCommands, SessionCommands};
+use sevorix_watchtower::{handle_config, handle_integrations, handle_validate, logging::{init_logging, init_logging_with_session}, run_server, validate_startup_config, Cli, Commands, DaemonManager, HubCommands, SessionCommands};
 use sevorix_watchtower::prime::print_prime;
 use tracing::info;
 
@@ -40,6 +40,13 @@ fn main() -> anyhow::Result<()> {
 
             // Start Watchtower if requested
             if start_watchtower {
+                // Pre-flight: validate config before daemonizing so errors surface
+                // to the user immediately rather than silently crashing the child.
+                if let Err(e) = validate_startup_config() {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+
                 let session_id = uuid::Uuid::new_v4();
                 daemon.start(session_id, start_ebpf)?;
                 let _guard = init_logging_with_session(session_id);
@@ -92,6 +99,10 @@ fn main() -> anyhow::Result<()> {
             }
             // Brief pause to ensure OS releases resources
             std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Err(e) = validate_startup_config() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
             let session_id = uuid::Uuid::new_v4();
             daemon.start(session_id, true)?;
             let _guard = init_logging_with_session(session_id);
