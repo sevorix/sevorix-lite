@@ -570,7 +570,6 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
         .route("/policies/ebpf", get(ebpf_policies_handler))
         .route("/api/ebpf-event", post(ebpf_event_handler))
         .route("/api/policies/reload", post(reload_policies_handler))
-        .route("/open-log", post(open_log_file))
         .route("/ws", get(ws_handler))
         .route("/api/events", get(get_recent_events))
         .route("/api/decide", post(decide_handler))
@@ -1313,16 +1312,6 @@ async fn ebpf_event_handler(
     .into_response()
 }
 
-
-async fn open_log_file() {
-    // Try xdg-open for Linux desktops, fallback to notepad for WSL/Windows users who might run this
-    // But since this is a CLI Refactor task, we might want to defer this or log the path
-    // For now keep notepad but also try xdg-open
-    if Command::new("xdg-open").arg("threat_log.txt").spawn().is_ok() {
-        return;
-    }
-    let _ = Command::new("notepad").arg("threat_log.txt").spawn();
-}
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))

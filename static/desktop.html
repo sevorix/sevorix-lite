@@ -554,19 +554,6 @@
                             </div>
                         </div>
                         
-                        <div class="mt-8 pt-8 border-t border-slate-800 space-y-4">
-                             <template x-if="selected.lane === 'YELLOW' || selected.lane === 'RED'">
-                                <button @click="alert('⛔ KILL SIGNAL SENT\n\nAgent connection severed.')" 
-                                        class="w-full py-3 bg-red-900/20 border-2 border-red-500 text-red-500 hover:bg-red-500 hover:text-white transition-all uppercase text-sm font-bold tracking-[0.2em] active:scale-95 shadow-[0_0_15px_rgba(239,68,68,0.3)]">
-                                    Force Terminate Agent
-                                </button>
-                             </template>
-
-                             <button @click="fetch('/open-log', {method: 'POST'})" 
-                                     class="w-full py-3 bg-slate-800 border-2 border-slate-600 text-slate-400 hover:bg-cyan-900 hover:text-cyan-400 hover:border-cyan-500 transition-all uppercase text-sm font-bold tracking-[0.2em] active:scale-95 flex items-center justify-center gap-3 shadow-[0_0_15px_rgba(6,182,212,0.1)]">
-                                 <span class="text-lg">📄</span> Open Forensic Report
-                             </button>
-                        </div>
                     </div>
                 </template>
                 <template x-if="!selected">
