@@ -63,6 +63,20 @@ pub enum Commands {
         /// Agent type to prime: policy-manager (pm) or guarded-agent (guard)
         agent_type: String,
     },
+    /// Session management commands
+    Session {
+        #[command(subcommand)]
+        subcmd: SessionCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommands {
+    /// Set the active policy role for the current session
+    SetRole {
+        /// Role name to apply to this session
+        role: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -194,6 +208,9 @@ pub enum IntegrationsCommands {
     Install {
         /// Name of the integration to install
         name: String,
+        /// Shell alias to create for the launcher (Claude Code only, default: claude)
+        #[arg(long, default_value = "claude")]
+        alias: String,
     },
     /// Uninstall an integration
     Uninstall {

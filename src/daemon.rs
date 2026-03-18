@@ -1,9 +1,23 @@
 use anyhow::{Context, Result};
-use daemonize::Daemonize;
-use directories::ProjectDirs;
+use daemonize::{Daemonize, Outcome};
+use directories::{ProjectDirs, UserDirs};
 use libc;
 use std::fs;
 use std::path::PathBuf;
+
+/// Poll a PID file until a valid PID is found or retries are exhausted.
+fn poll_pid_file(path: &PathBuf, retries: u32, delay_ms: u64) -> Option<i32> {
+    for _ in 0..retries {
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(pid) = content.trim().parse::<i32>() {
+                return Some(pid);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    // one final try
+    fs::read_to_string(path).ok()?.trim().parse::<i32>().ok()
+}
 
 /// Manages Watchtower daemon lifecycle (start/stop/status).
 pub struct DaemonManager {
@@ -34,28 +48,24 @@ impl DaemonManager {
         })
     }
 
-    pub fn start(&self) -> Result<()> {
+    pub fn start(&self, session_id: uuid::Uuid, start_ebpf: bool) -> Result<()> {
         if self.is_running() {
             println!(
                 "Sevorix is already running (PID: {})",
                 self.read_pid().unwrap_or(0)
             );
-            // If we return Ok, the main function continues and tries to run the server which will fail binding port
-            // We should probably error or exit here to prevent double run.
-            // Actually, if we are the user running 'sevorix start', we are the parent.
-            // We want to exit and NOT become a daemon (because one exists).
-            // But start() is only supposed to return if it BECAME the daemon.
-            // So we should return an error.
             return Err(anyhow::anyhow!("Sevorix is already running."));
         }
 
-        println!("Starting Sevorix Watchtower in background...");
-        println!("Logs => {}", self.log_path.display());
-        println!("📡 API: http://localhost:3000/analyze");
-        println!("📊 Dashboard: http://localhost:3000/dashboard/desktop.html");
+        // Compute session log and traffic log paths
+        let log_dir = if let Some(user_dirs) = UserDirs::new() {
+            user_dirs.home_dir().join(".sevorix").join("logs")
+        } else {
+            PathBuf::from(".sevorix/logs")
+        };
+        let session_log_path = log_dir.join(format!("{}.log", session_id));
+        let traffic_log_path = log_dir.join(format!("{}-traffic.jsonl", session_id));
 
-        // Append mode might be better for logs?
-        // Let's use OpenOptions for append
         let stdout = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -74,10 +84,55 @@ impl DaemonManager {
             .stdout(stdout)
             .stderr(stderr);
 
-        match daemonize.start() {
-            Ok(_) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("Error daemonizing: {}", e)),
+        match daemonize.execute() {
+            Outcome::Parent(Ok(_)) => {
+                // Poll for watchtower PID (up to 2s)
+                let wt_pid = self.poll_pid(20, 100);
+                let wt_pid_str = wt_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| format!("(see {})", self.pid_path.display()));
+
+                let ebpf_pid_str = if start_ebpf {
+                    let ebpf_pid_path = ProjectDirs::from("com", "sevorix", "sevorix")
+                        .map(|d| {
+                            d.state_dir()
+                                .unwrap_or_else(|| d.cache_dir())
+                                .join("sevorix-ebpf.pid")
+                        })
+                        .unwrap_or_else(|| PathBuf::from("sevorix-ebpf.pid"));
+                    // Poll for eBPF PID (up to 4.5s — eBPF takes longer due to sudo)
+                    let ebpf_pid = poll_pid_file(&ebpf_pid_path, 30, 150);
+                    Some(
+                        ebpf_pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| format!("(see {})", ebpf_pid_path.display())),
+                    )
+                } else {
+                    None
+                };
+
+                println!("Sevorix Watchtower started.");
+                println!("  Watchtower PID:  {}", wt_pid_str);
+                if let Some(ref s) = ebpf_pid_str {
+                    println!("  eBPF daemon PID: {}", s);
+                }
+                println!("  Session ID:      {}", session_id);
+                println!("  Service log:     {}", self.log_path.display());
+                println!("  Session log:     {}", session_log_path.display());
+                println!("  Traffic log:     {}", traffic_log_path.display());
+                println!("📡 API:            http://localhost:3000/analyze");
+                println!("📊 Dashboard:      http://localhost:3000/dashboard/desktop.html");
+
+                std::process::exit(0);
+            }
+            Outcome::Parent(Err(e)) => Err(anyhow::anyhow!("Error daemonizing: {}", e)),
+            Outcome::Child(Ok(_)) => Ok(()),
+            Outcome::Child(Err(e)) => Err(anyhow::anyhow!("Error in daemon child: {}", e)),
         }
+    }
+
+    fn poll_pid(&self, retries: u32, delay_ms: u64) -> Option<i32> {
+        poll_pid_file(&self.pid_path, retries, delay_ms)
     }
 
     pub fn stop(&self) -> Result<()> {

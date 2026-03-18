@@ -11,6 +11,184 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use uuid::Uuid;
 
 const PROXY_URL: &str = "http://localhost:3000";
+
+// -----------------------------------------------------------------------------
+// Bash-compatible argument parsing
+// -----------------------------------------------------------------------------
+
+/// Represents a parsed bash-compatible invocation.
+///
+/// Sevsh is bind-mounted over /bin/bash when used with the Claude Code
+/// integration, so it must accept every form of invocation that bash accepts.
+#[derive(Debug, PartialEq, Default)]
+pub struct BashInvocation {
+    /// Command string from `-c STRING`.
+    pub command: Option<String>,
+    /// Script file to execute (`bash script.sh`).
+    pub script_file: Option<String>,
+    /// Positional args: after `--` in `-c` mode, or after the script name.
+    /// These become `$0`, `$1`, … inside the command string.
+    pub positional_args: Vec<String>,
+    /// Single-char set options (`-e`, `-x`, `-v`, `-u`, `-n`, `-l`, `-r`).
+    /// Collected and forwarded to the inner bash invocation.
+    pub set_options: Vec<String>,
+    /// Long options (`--norc`, `--noprofile`, `--login`, `--rcfile FILE`, …).
+    /// Collected and forwarded to the inner bash invocation.
+    pub extra_options: Vec<String>,
+    /// `-i` flag: caller wants an interactive shell (no command or script).
+    pub interactive: bool,
+}
+
+impl BashInvocation {
+    /// Build the argument list to pass to the real bash binary.
+    ///
+    /// For command-string mode: `[set_opts…, extra_opts…, "-c", cmd, positional…]`
+    /// For script-file mode:    `[set_opts…, extra_opts…, script, args…]`
+    /// For interactive mode:    `[set_opts…, extra_opts…]`
+    pub fn to_bash_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        args.extend(self.set_options.iter().cloned());
+        args.extend(self.extra_options.iter().cloned());
+        if let Some(ref cmd) = self.command {
+            args.push("-c".to_string());
+            args.push(cmd.clone());
+            args.extend(self.positional_args.iter().cloned());
+        } else if let Some(ref script) = self.script_file {
+            args.push(script.clone());
+            args.extend(self.positional_args.iter().cloned());
+        }
+        args
+    }
+
+    /// The payload to send to Watchtower for validation.
+    pub fn payload(&self) -> Option<String> {
+        if let Some(ref cmd) = self.command {
+            Some(cmd.clone())
+        } else {
+            self.script_file.clone()
+        }
+    }
+}
+
+/// Parse a bash-compatible argument list into a `BashInvocation`.
+///
+/// Handles all common bash invocation forms:
+/// - `bash -c 'cmd'`
+/// - `bash -c 'cmd' -- arg0 arg1`
+/// - `bash -e -x -c 'cmd'`
+/// - `bash --norc --noprofile -c 'cmd'`
+/// - `bash script.sh arg1 arg2`
+/// - `bash -i`
+/// - `bash` (no args → interactive)
+///
+/// Unknown flags are passed through in `extra_options` rather than rejected,
+/// matching bash's behaviour of erroring on them at execution time.
+pub fn parse_bash_invocation(args: &[String]) -> BashInvocation {
+    let mut inv = BashInvocation::default();
+    let mut i = 0;
+
+    // Single-char flags that bash accepts at invocation and that we pass through.
+    // -i (interactive) is handled specially.
+    const SET_OPTION_CHARS: &str = "eilnrsTuvx";
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        // End of options: everything after is positional.
+        if arg == "--" {
+            i += 1;
+            inv.positional_args.extend_from_slice(&args[i..]);
+            break;
+        }
+
+        // `-c COMMAND_STRING`
+        if arg == "-c" {
+            i += 1;
+            if i < args.len() {
+                inv.command = Some(args[i].clone());
+                i += 1;
+                // Optional `--` then positional args ($0, $1, …)
+                if i < args.len() && args[i] == "--" {
+                    i += 1;
+                }
+                inv.positional_args.extend_from_slice(&args[i..]);
+            }
+            break;
+        }
+
+        // Long options
+        if arg.starts_with("--") {
+            match arg.as_str() {
+                "--login" | "--restricted" | "--norc" | "--noprofile"
+                | "--noediting" | "--posix" | "--debugger" => {
+                    inv.extra_options.push(arg.clone());
+                }
+                "--rcfile" | "--init-file" => {
+                    inv.extra_options.push(arg.clone());
+                    i += 1;
+                    if i < args.len() {
+                        inv.extra_options.push(args[i].clone());
+                    }
+                }
+                _ => {
+                    // Unknown long option — pass through.
+                    inv.extra_options.push(arg.clone());
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Short option cluster starting with `-`
+        if arg.starts_with('-') && arg.len() > 1 {
+            // Special-case: `-i` alone means interactive.
+            // In a cluster like `-ei`, treat each char individually.
+            let chars: Vec<char> = arg[1..].chars().collect();
+            let mut handled = true;
+            for ch in &chars {
+                match ch {
+                    'i' => { inv.interactive = true; }
+                    c if SET_OPTION_CHARS.contains(*c) => {
+                        inv.set_options.push(format!("-{}", c));
+                    }
+                    _ => {
+                        // Unknown short option — pass through the whole arg.
+                        inv.extra_options.push(arg.clone());
+                        handled = false;
+                        break;
+                    }
+                }
+            }
+            if !handled {
+                // Already added the whole arg above; skip re-adding.
+            }
+            i += 1;
+            continue;
+        }
+
+        // First non-option argument: script file.
+        inv.script_file = Some(arg.clone());
+        i += 1;
+        inv.positional_args.extend_from_slice(&args[i..]);
+        break;
+    }
+
+    inv
+}
+
+/// Returns true if the arg list contains any sevsh-specific flags, meaning
+/// the invocation should be handled by clap rather than the bash-compat path.
+fn has_sevsh_flags(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--no-proxy" | "--no-sandbox" | "--internal-sandbox"
+                | "--internal-forward-sock" | "--session-id"
+        ) || a.starts_with("--publish")
+            || a == "-p"
+    })
+}
+
 /// Sevorix Watchtower Shell - Secure shell with syscall interception via eBPF
 ///
 /// Syscall interception is handled automatically by the eBPF daemon running
@@ -46,7 +224,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_internal_agent(&raw_args, &sock_path).await;
     }
 
-    // Parse arguments with clap
+    // Bash-compat path: if no sevsh-specific flags are present, treat this
+    // invocation as a bash replacement and parse with parse_bash_invocation()
+    // rather than clap.  This handles -c, -e, -x, --norc, script.sh, etc.
+    let user_args = &raw_args[1..]; // strip argv[0]
+    if !has_sevsh_flags(user_args) {
+        let inv = parse_bash_invocation(user_args);
+        let session_id = format!("sevsh-{}", Uuid::new_v4());
+        env::set_var("SEVORIX_SESSION_ID", &session_id);
+
+        if inv.command.is_none() && inv.script_file.is_none() {
+            let stdin_is_tty = unsafe { libc::isatty(0) != 0 };
+            if stdin_is_tty || inv.interactive {
+                // Real interactive session: intercept typed commands via PTY.
+                let exit_code = run_pty_interactive_shell_code(true, &session_id)?;
+                exit(exit_code);
+            } else {
+                // Non-interactive with no command (e.g. `bash -l` for profile
+                // sourcing): nothing to intercept, pass straight through.
+                let shell = real_shell();
+                let status = Command::new(&shell)
+                    .args(inv.to_bash_args())
+                    .status()?;
+                exit(status.code().unwrap_or(1));
+            }
+        }
+
+        // Non-interactive: validate and execute.
+        let exit_code = handle_bash_invocation(inv, true, &session_id).await?;
+        exit(exit_code);
+    }
+
+    // Parse arguments with clap (sevsh-specific invocation)
     let args = SevshArgs::parse();
 
     // Generate unique session ID for this sevsh session
@@ -596,34 +805,42 @@ async fn run_internal_agent(
     // Call logic (eBPF daemon handles syscall interception)
     // PTY multiplexer is now the default and only interactive mode
     let code = if !real_args.is_empty() {
-        handle_single_command(&real_args, !no_proxy, &session_id).await?
+        let inv = parse_bash_invocation(&real_args);
+        handle_bash_invocation(inv, !no_proxy, &session_id).await?
     } else {
         run_pty_interactive_shell_code(!no_proxy, &session_id)?
     };
     exit(code);
 }
 
+/// Thin wrapper: parse raw args into a BashInvocation and execute.
+/// Used by the clap path (sevsh-specific flags already stripped).
 async fn handle_single_command(
     args: &[String],
     use_proxy: bool,
     session_id: &str,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let inv = parse_bash_invocation(args);
+    handle_bash_invocation(inv, use_proxy, session_id).await
+}
 
-    let (payload, final_cmd_args) = if args[0] == "-c" {
-        // Case: sevsh -c "ls -la"
-        if args.len() > 1 {
-            let cmd = args[1].clone();
-            (cmd.clone(), vec!["-c".to_string(), cmd])
-        } else {
-            eprintln!("Error: -c requires an argument");
-            return Ok(1);
+/// Core execution path for bash-compatible invocations.
+async fn handle_bash_invocation(
+    inv: BashInvocation,
+    use_proxy: bool,
+    session_id: &str,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let shell = real_shell();
+
+    let payload = match inv.payload() {
+        Some(p) => p,
+        None => {
+            // Nothing to execute (e.g. -i with no command)
+            return Ok(0);
         }
-    } else {
-        // Case: sevsh ls -la
-        let cmd = args.join(" ");
-        (cmd.clone(), vec!["-c".to_string(), cmd])
     };
+
+    let final_cmd_args = inv.to_bash_args();
 
     // Validate
     let verdict = validate_command(&payload).await?;
@@ -848,7 +1065,7 @@ async fn handle_single_command(
 /// - Raw mode passthrough for vim/less/etc.
 /// - Command validation via Watchtower before execution
 fn run_pty_interactive_shell_code(use_proxy: bool, session_id: &str) -> Result<i32, Box<dyn std::error::Error>> {
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell = real_shell();
 
     // Set session ID in environment
     env::set_var("SEVORIX_SESSION_ID", session_id);
@@ -899,6 +1116,19 @@ struct Verdict {
     confidence: String,
 }
 
+/// Return the path to the real bash binary to use for executing commands.
+///
+/// Prefers `SEVORIX_REAL_SHELL`, which the sevorix-claude-launcher sets to a
+/// bind-mounted copy of the original /bin/bash captured before sevsh replaces
+/// it.  Falls back to `SHELL`, and finally to `/usr/bin/bash`.  Never falls
+/// back to `/bin/bash` because in the Claude Code integration that path IS
+/// sevsh — using it would recurse infinitely.
+fn real_shell() -> String {
+    env::var("SEVORIX_REAL_SHELL")
+        .or_else(|_| env::var("SHELL"))
+        .unwrap_or_else(|_| "/usr/bin/bash".to_string())
+}
+
 /// Fetch the list of syscall names to deny from Watchtower's /syscall-policy endpoint.
 /// Returns an empty list on any error (non-fatal: enforcement degrades gracefully).
 async fn fetch_syscall_deny_list() -> Vec<String> {
@@ -922,8 +1152,13 @@ async fn fetch_syscall_deny_list() -> Vec<String> {
 }
 
 async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Error>> {
-    // Use the async client explicitly
-    let client = reqwest::Client::new();
+    let timeout_secs = sevorix_watchtower::settings::Settings::load()
+        .sevsh
+        .and_then(|s| s.validation_timeout_secs)
+        .unwrap_or(5);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()?;
     let url = "http://localhost:3000/analyze";
 
     // Fail-safe: if we can't connect, we must fail closed (or exit process),
@@ -985,5 +1220,356 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
                 confidence: "100%".to_string(),
             })
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_bash_invocation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_empty() {
+        let inv = parse_bash_invocation(&[]);
+        assert_eq!(inv, BashInvocation::default());
+        assert!(inv.command.is_none());
+        assert!(inv.script_file.is_none());
+        assert!(inv.positional_args.is_empty());
+        assert!(!inv.interactive);
+    }
+
+    #[test]
+    fn test_parse_c_basic() {
+        let inv = parse_bash_invocation(&args(&["-c", "echo hello"]));
+        assert_eq!(inv.command.as_deref(), Some("echo hello"));
+        assert!(inv.script_file.is_none());
+        assert!(inv.positional_args.is_empty());
+        assert!(inv.set_options.is_empty());
+    }
+
+    #[test]
+    fn test_parse_c_with_positional_args_after_dashdash() {
+        let inv = parse_bash_invocation(&args(&["-c", "echo $0 $1", "--", "arg0", "arg1"]));
+        assert_eq!(inv.command.as_deref(), Some("echo $0 $1"));
+        assert_eq!(inv.positional_args, args(&["arg0", "arg1"]));
+    }
+
+    #[test]
+    fn test_parse_c_with_positional_args_no_dashdash() {
+        // bash -c 'cmd' arg0 arg1  (no explicit --)
+        let inv = parse_bash_invocation(&args(&["-c", "echo $@", "arg0", "arg1"]));
+        assert_eq!(inv.command.as_deref(), Some("echo $@"));
+        assert_eq!(inv.positional_args, args(&["arg0", "arg1"]));
+    }
+
+    #[test]
+    fn test_parse_set_option_e() {
+        let inv = parse_bash_invocation(&args(&["-e", "-c", "cmd"]));
+        assert!(inv.set_options.contains(&"-e".to_string()));
+        assert_eq!(inv.command.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn test_parse_multiple_set_options() {
+        let inv = parse_bash_invocation(&args(&["-e", "-x", "-v", "-c", "cmd"]));
+        assert!(inv.set_options.contains(&"-e".to_string()));
+        assert!(inv.set_options.contains(&"-x".to_string()));
+        assert!(inv.set_options.contains(&"-v".to_string()));
+        assert_eq!(inv.command.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn test_parse_set_option_cluster() {
+        // bash -ex -c 'cmd' is valid — clusters of single-char options
+        let inv = parse_bash_invocation(&args(&["-ex", "-c", "cmd"]));
+        assert!(inv.set_options.contains(&"-e".to_string()));
+        assert!(inv.set_options.contains(&"-x".to_string()));
+        assert_eq!(inv.command.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn test_parse_interactive_flag() {
+        let inv = parse_bash_invocation(&args(&["-i"]));
+        assert!(inv.interactive);
+        assert!(inv.command.is_none());
+        assert!(inv.script_file.is_none());
+    }
+
+    #[test]
+    fn test_parse_interactive_in_cluster() {
+        let inv = parse_bash_invocation(&args(&["-il"]));
+        assert!(inv.interactive);
+        assert!(inv.set_options.contains(&"-l".to_string()));
+    }
+
+    #[test]
+    fn test_parse_long_option_norc() {
+        let inv = parse_bash_invocation(&args(&["--norc", "-c", "cmd"]));
+        assert!(inv.extra_options.contains(&"--norc".to_string()));
+        assert_eq!(inv.command.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn test_parse_long_option_noprofile() {
+        let inv = parse_bash_invocation(&args(&["--noprofile", "-c", "cmd"]));
+        assert!(inv.extra_options.contains(&"--noprofile".to_string()));
+    }
+
+    #[test]
+    fn test_parse_long_option_login() {
+        let inv = parse_bash_invocation(&args(&["--login", "-c", "cmd"]));
+        assert!(inv.extra_options.contains(&"--login".to_string()));
+    }
+
+    #[test]
+    fn test_parse_long_option_rcfile_with_value() {
+        let inv = parse_bash_invocation(&args(&["--rcfile", "/etc/bashrc", "-c", "cmd"]));
+        assert!(inv.extra_options.contains(&"--rcfile".to_string()));
+        assert!(inv.extra_options.contains(&"/etc/bashrc".to_string()));
+        assert_eq!(inv.command.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn test_parse_long_option_init_file_with_value() {
+        let inv = parse_bash_invocation(&args(&["--init-file", "/etc/bashrc", "-c", "cmd"]));
+        assert!(inv.extra_options.contains(&"--init-file".to_string()));
+        assert!(inv.extra_options.contains(&"/etc/bashrc".to_string()));
+    }
+
+    #[test]
+    fn test_parse_script_file_mode() {
+        let inv = parse_bash_invocation(&args(&["script.sh", "arg1", "arg2"]));
+        assert_eq!(inv.script_file.as_deref(), Some("script.sh"));
+        assert_eq!(inv.positional_args, args(&["arg1", "arg2"]));
+        assert!(inv.command.is_none());
+    }
+
+    #[test]
+    fn test_parse_script_file_with_set_options() {
+        let inv = parse_bash_invocation(&args(&["-e", "script.sh", "arg1"]));
+        assert!(inv.set_options.contains(&"-e".to_string()));
+        assert_eq!(inv.script_file.as_deref(), Some("script.sh"));
+        assert_eq!(inv.positional_args, args(&["arg1"]));
+    }
+
+    #[test]
+    fn test_parse_dashdash_stops_option_processing() {
+        // bash -- -c  →  tries to run a file named "-c"
+        let inv = parse_bash_invocation(&args(&["--", "-c"]));
+        assert!(inv.command.is_none());
+        assert_eq!(inv.positional_args, args(&["-c"]));
+    }
+
+    #[test]
+    fn test_parse_dashdash_with_script() {
+        let inv = parse_bash_invocation(&args(&["--", "script.sh", "arg1"]));
+        assert!(inv.command.is_none());
+        assert_eq!(inv.positional_args, args(&["script.sh", "arg1"]));
+    }
+
+    #[test]
+    fn test_parse_combined_full() {
+        // bash -e -x --norc -c 'echo $0' -- myname arg1
+        let inv = parse_bash_invocation(&args(&[
+            "-e", "-x", "--norc", "-c", "echo $0", "--", "myname", "arg1",
+        ]));
+        assert!(inv.set_options.contains(&"-e".to_string()));
+        assert!(inv.set_options.contains(&"-x".to_string()));
+        assert!(inv.extra_options.contains(&"--norc".to_string()));
+        assert_eq!(inv.command.as_deref(), Some("echo $0"));
+        assert_eq!(inv.positional_args, args(&["myname", "arg1"]));
+    }
+
+    #[test]
+    fn test_parse_unknown_long_option_passed_through() {
+        let inv = parse_bash_invocation(&args(&["--some-unknown-flag", "-c", "cmd"]));
+        assert!(inv.extra_options.contains(&"--some-unknown-flag".to_string()));
+        assert_eq!(inv.command.as_deref(), Some("cmd"));
+    }
+
+    #[test]
+    fn test_parse_c_empty_command_string() {
+        let inv = parse_bash_invocation(&args(&["-c", ""]));
+        assert_eq!(inv.command.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_parse_c_no_string_is_silent() {
+        // -c with nothing after it — command stays None
+        let inv = parse_bash_invocation(&args(&["-c"]));
+        assert!(inv.command.is_none());
+    }
+
+    #[test]
+    fn test_parse_dashdash_no_following_args() {
+        let inv = parse_bash_invocation(&args(&["--"]));
+        assert!(inv.positional_args.is_empty());
+        assert!(inv.command.is_none());
+        assert!(inv.script_file.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // BashInvocation::to_bash_args
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_to_bash_args_command_string() {
+        let inv = BashInvocation {
+            command: Some("echo hello".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(inv.to_bash_args(), args(&["-c", "echo hello"]));
+    }
+
+    #[test]
+    fn test_to_bash_args_command_with_positional() {
+        let inv = BashInvocation {
+            command: Some("echo $0 $1".to_string()),
+            positional_args: args(&["myname", "arg1"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            inv.to_bash_args(),
+            args(&["-c", "echo $0 $1", "myname", "arg1"])
+        );
+    }
+
+    #[test]
+    fn test_to_bash_args_set_options_prepended() {
+        let inv = BashInvocation {
+            command: Some("cmd".to_string()),
+            set_options: args(&["-e", "-x"]),
+            ..Default::default()
+        };
+        assert_eq!(inv.to_bash_args(), args(&["-e", "-x", "-c", "cmd"]));
+    }
+
+    #[test]
+    fn test_to_bash_args_extra_options_after_set() {
+        let inv = BashInvocation {
+            command: Some("cmd".to_string()),
+            set_options: args(&["-e"]),
+            extra_options: args(&["--norc"]),
+            ..Default::default()
+        };
+        assert_eq!(inv.to_bash_args(), args(&["-e", "--norc", "-c", "cmd"]));
+    }
+
+    #[test]
+    fn test_to_bash_args_script_file() {
+        let inv = BashInvocation {
+            script_file: Some("script.sh".to_string()),
+            positional_args: args(&["arg1", "arg2"]),
+            ..Default::default()
+        };
+        assert_eq!(
+            inv.to_bash_args(),
+            args(&["script.sh", "arg1", "arg2"])
+        );
+    }
+
+    #[test]
+    fn test_to_bash_args_script_file_with_set_options() {
+        let inv = BashInvocation {
+            script_file: Some("script.sh".to_string()),
+            set_options: args(&["-e"]),
+            ..Default::default()
+        };
+        assert_eq!(inv.to_bash_args(), args(&["-e", "script.sh"]));
+    }
+
+    #[test]
+    fn test_to_bash_args_interactive_empty() {
+        let inv = BashInvocation {
+            interactive: true,
+            ..Default::default()
+        };
+        assert!(inv.to_bash_args().is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // BashInvocation::payload
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_payload_command() {
+        let inv = BashInvocation {
+            command: Some("echo hi".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(inv.payload().as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn test_payload_script_file() {
+        let inv = BashInvocation {
+            script_file: Some("run.sh".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(inv.payload().as_deref(), Some("run.sh"));
+    }
+
+    #[test]
+    fn test_payload_none_when_interactive() {
+        let inv = BashInvocation {
+            interactive: true,
+            ..Default::default()
+        };
+        assert!(inv.payload().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // has_sevsh_flags
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_has_sevsh_flags_no_proxy() {
+        assert!(has_sevsh_flags(&args(&["--no-proxy", "-c", "cmd"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_no_sandbox() {
+        assert!(has_sevsh_flags(&args(&["--no-sandbox"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_internal_sandbox() {
+        assert!(has_sevsh_flags(&args(&["--internal-sandbox", "/tmp/sock"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_publish_long() {
+        assert!(has_sevsh_flags(&args(&["--publish", "8080:80"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_publish_short() {
+        assert!(has_sevsh_flags(&args(&["-p", "8080:80"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_none_for_bash_args() {
+        assert!(!has_sevsh_flags(&args(&["-e", "-c", "echo hello"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_none_for_script() {
+        assert!(!has_sevsh_flags(&args(&["script.sh", "arg1"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_none_for_empty() {
+        assert!(!has_sevsh_flags(&[]));
     }
 }

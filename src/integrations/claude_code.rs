@@ -1,7 +1,9 @@
 //! Claude Code integration for Sevorix.
 //!
-//! This integration configures Claude Code to use sevsh as its shell,
-//! ensuring all Bash commands are validated through Sevorix.
+//! This integration configures Claude Code to route all Bash commands through
+//! sevsh by prepending `~/.sevorix/bin` to PATH in `~/.claude/settings.json`.
+//! That directory contains a `bash` wrapper that invokes sevsh, so Claude
+//! Code's shell resolution picks it up before the system bash.
 
 use super::{InstallResult, Integration, IntegrationStatus};
 use anyhow::{Context, Result};
@@ -10,16 +12,21 @@ use std::path::PathBuf;
 
 /// Claude Code integration.
 ///
-/// Modifies `~/.claude/settings.json` to set the SHELL environment variable
-/// to sevsh, ensuring all Bash commands from Claude Code are validated
-/// through Sevorix.
+/// Modifies `~/.claude/settings.json` to prepend `~/.sevorix/bin` to PATH,
+/// ensuring all Bash commands from Claude Code are validated through Sevorix.
 pub struct ClaudeCodeIntegration {
     /// Path to the sevsh binary.
     sevsh_path: PathBuf,
+    /// Path to `~/.sevorix/bin` (contains the bash wrapper).
+    sevorix_bin_path: PathBuf,
     /// Path to Claude Code settings.
     settings_path: PathBuf,
     /// Path to Sevorix state directory for PID check.
     state_dir: PathBuf,
+    /// User home directory (for locating shell rc files).
+    home_dir: PathBuf,
+    /// Shell alias name to create for `sudo sevorix-claude-launcher` (default: "claude").
+    alias: String,
 }
 
 impl ClaudeCodeIntegration {
@@ -30,6 +37,7 @@ impl ClaudeCodeIntegration {
 
         let home = user_dirs.home_dir();
         let sevsh_path = home.join(".local/bin/sevsh");
+        let sevorix_bin_path = home.join(".sevorix/bin");
         let settings_path = home.join(".claude/settings.json");
 
         // Get Sevorix state directory for daemon check
@@ -42,19 +50,107 @@ impl ClaudeCodeIntegration {
 
         Ok(Self {
             sevsh_path,
+            sevorix_bin_path,
             settings_path,
             state_dir,
+            home_dir: home.to_path_buf(),
+            alias: "claude".to_string(),
         })
     }
 
     /// Create a new instance with custom paths (for testing).
     #[cfg(test)]
-    pub fn new_for_test(sevsh_path: PathBuf, settings_path: PathBuf, state_dir: PathBuf) -> Self {
+    pub fn new_for_test(
+        sevsh_path: PathBuf,
+        sevorix_bin_path: PathBuf,
+        settings_path: PathBuf,
+        state_dir: PathBuf,
+        home_dir: PathBuf,
+    ) -> Self {
         Self {
             sevsh_path,
+            sevorix_bin_path,
             settings_path,
             state_dir,
+            home_dir,
+            alias: "claude".to_string(),
         }
+    }
+
+    /// Set the shell alias name to create during install (builder method).
+    pub fn with_alias(mut self, alias: String) -> Self {
+        self.alias = alias;
+        self
+    }
+
+    /// Write `alias <name>='sudo sevorix-claude-launcher'` to the user's shell rc files.
+    /// Writes to ~/.bashrc and ~/.zshrc if they exist. Non-fatal if neither is present.
+    fn write_shell_alias(&self) -> Result<Vec<String>> {
+        let marker = "# Added by sevorix integrate claude-code";
+        let alias_line = format!("alias {}='sudo sevorix-claude-launcher'", self.alias);
+        let block = format!("\n{}\n{}\n", marker, alias_line);
+
+        let rc_files = [".bashrc", ".zshrc"];
+        let mut modified = Vec::new();
+
+        for rc_name in &rc_files {
+            let rc_path = self.home_dir.join(rc_name);
+            if !rc_path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&rc_path)
+                .context(format!("Failed to read {}", rc_path.display()))?;
+            // Skip if already present (idempotent)
+            if content.contains("sevorix-claude-launcher") {
+                continue;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rc_path)
+                .context(format!("Failed to open {} for writing", rc_path.display()))?;
+            use std::io::Write;
+            file.write_all(block.as_bytes())
+                .context(format!("Failed to write alias to {}", rc_path.display()))?;
+            modified.push(rc_path.display().to_string());
+        }
+
+        Ok(modified)
+    }
+
+    /// Remove any sevorix-claude-launcher alias lines from shell rc files.
+    fn remove_shell_alias(&self) -> Result<()> {
+        let rc_files = [".bashrc", ".zshrc"];
+
+        for rc_name in &rc_files {
+            let rc_path = self.home_dir.join(rc_name);
+            if !rc_path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&rc_path)
+                .context(format!("Failed to read {}", rc_path.display()))?;
+            if !content.contains("sevorix-claude-launcher") {
+                continue;
+            }
+            // Remove the marker line, the alias line, and the blank line before the block
+            let new_content: String = content
+                .lines()
+                .filter(|line| {
+                    !line.contains("sevorix-claude-launcher")
+                        && !line.contains("# Added by sevorix integrate claude-code")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // Preserve trailing newline if original had one
+            let new_content = if content.ends_with('\n') {
+                format!("{}\n", new_content.trim_end_matches('\n'))
+            } else {
+                new_content
+            };
+            std::fs::write(&rc_path, new_content)
+                .context(format!("Failed to write {}", rc_path.display()))?;
+        }
+
+        Ok(())
     }
 
     /// Check if the Sevorix daemon is running.
@@ -75,6 +171,17 @@ impl ClaudeCodeIntegration {
     /// Check if sevsh is installed.
     fn is_sevsh_installed(&self) -> bool {
         self.sevsh_path.exists() && self.sevsh_path.is_file()
+    }
+
+    /// Check if the bash wrapper exists in the sevorix bin directory.
+    fn is_bash_wrapper_installed(&self) -> bool {
+        let wrapper = self.sevorix_bin_path.join("bash");
+        wrapper.exists() && wrapper.is_file()
+    }
+
+    /// Absolute path string for the sevorix bin directory.
+    fn sevorix_bin_path_string(&self) -> String {
+        self.sevorix_bin_path.to_string_lossy().into_owned()
     }
 
     /// Create a backup of the settings file if it exists.
@@ -118,11 +225,6 @@ impl ClaudeCodeIntegration {
         Ok(())
     }
 
-    /// Get the sevsh path as a tilde-expanded string.
-    fn sevsh_path_string(&self) -> String {
-        // Use tilde notation for portability
-        "~/.local/bin/sevsh".to_string()
-    }
 }
 
 impl Integration for ClaudeCodeIntegration {
@@ -139,12 +241,12 @@ impl Integration for ClaudeCodeIntegration {
             return false;
         }
 
-        // Check if settings contain our SHELL configuration
+        // Check if settings contain our PATH configuration
         if let Ok(settings) = self.read_settings() {
             if let Some(env) = settings.get("env") {
-                if let Some(shell) = env.get("SHELL") {
-                    if let Some(shell_str) = shell.as_str() {
-                        return shell_str.contains("sevsh");
+                if let Some(path_val) = env.get("PATH") {
+                    if let Some(path_str) = path_val.as_str() {
+                        return path_str.contains(&self.sevorix_bin_path_string());
                     }
                 }
             }
@@ -172,6 +274,14 @@ impl Integration for ClaudeCodeIntegration {
             );
         }
 
+        // Pre-check: Verify bash wrapper exists
+        if !self.is_bash_wrapper_installed() {
+            anyhow::bail!(
+                "bash wrapper not found at {}/bash. Re-run the Sevorix installer.",
+                self.sevorix_bin_path.display()
+            );
+        }
+
         // Backup existing settings if present
         let backup_path = self.backup_settings()?;
         if backup_path.is_some() {
@@ -184,7 +294,7 @@ impl Integration for ClaudeCodeIntegration {
         // Read existing settings
         let mut settings = self.read_settings()?;
 
-        // Ensure env object exists and add SHELL
+        // Ensure env object exists and update PATH
         let env = settings
             .get("env")
             .cloned()
@@ -194,16 +304,23 @@ impl Integration for ClaudeCodeIntegration {
             .cloned()
             .unwrap_or_default();
 
-        // Check if SHELL is already set
-        let had_existing_shell = env_obj.contains_key("SHELL");
-        if had_existing_shell {
-            let old_shell = env_obj.get("SHELL")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            config_changes.push(format!("Replacing existing SHELL: {}", old_shell));
-        }
+        let sevorix_bin = self.sevorix_bin_path_string();
 
-        env_obj.insert("SHELL".to_string(), json!(self.sevsh_path_string()));
+        // Prepend sevorix bin to PATH (or build a sensible default PATH)
+        let new_path = if let Some(existing_path) = env_obj.get("PATH").and_then(|v| v.as_str()) {
+            if existing_path.contains(&sevorix_bin) {
+                // Already present, no change needed
+                existing_path.to_string()
+            } else {
+                config_changes.push(format!("Prepending {} to existing PATH", sevorix_bin));
+                format!("{}:{}", sevorix_bin, existing_path)
+            }
+        } else {
+            config_changes.push(format!("Setting PATH with {} prepended", sevorix_bin));
+            format!("{}:/usr/local/bin:/usr/bin:/bin", sevorix_bin)
+        };
+
+        env_obj.insert("PATH".to_string(), json!(new_path));
 
         // Update settings
         if let Value::Object(ref mut map) = settings {
@@ -213,22 +330,40 @@ impl Integration for ClaudeCodeIntegration {
         // Write updated settings
         self.write_settings(&settings)?;
         files_modified.push(self.settings_path.display().to_string());
-        config_changes.push(format!(
-            "Set SHELL to {} in ~/.claude/settings.json",
-            self.sevsh_path_string()
-        ));
 
-        let message = if had_existing_shell {
-            "Claude Code integration installed (replaced existing SHELL setting)."
-        } else {
-            "Claude Code integration installed. All Bash commands will now be validated through Sevorix."
-        };
+        // Write shell alias for the launcher
+        match self.write_shell_alias() {
+            Ok(alias_files) if !alias_files.is_empty() => {
+                config_changes.push(format!(
+                    "Added alias {}='sudo sevorix-claude-launcher' to: {}",
+                    self.alias,
+                    alias_files.join(", ")
+                ));
+                files_modified.extend(alias_files);
+            }
+            Ok(_) => {
+                config_changes.push(format!(
+                    "No ~/.bashrc or ~/.zshrc found — add manually: alias {}='sudo sevorix-claude-launcher'",
+                    self.alias
+                ));
+            }
+            Err(e) => {
+                // Non-fatal: alias is a convenience, not required
+                config_changes.push(format!(
+                    "Warning: could not write shell alias ({}). Add manually: alias {}='sudo sevorix-claude-launcher'",
+                    e, self.alias
+                ));
+            }
+        }
 
         Ok(InstallResult {
             files_modified,
             config_changes,
-            restart_required: false,
-            message: message.to_string(),
+            restart_required: true,
+            message: format!(
+                "Claude Code integration installed. Run '{}' (or open a new shell) to start a monitored session.",
+                self.alias
+            ),
         })
     }
 
@@ -240,10 +375,25 @@ impl Integration for ClaudeCodeIntegration {
         // Read current settings
         let mut settings = self.read_settings()?;
 
-        // Remove our SHELL setting from env
+        let sevorix_bin = self.sevorix_bin_path_string();
+
+        // Remove our PATH prefix from env
         if let Some(env) = settings.get_mut("env") {
             if let Value::Object(ref mut env_map) = env {
-                env_map.remove("SHELL");
+                if let Some(path_val) = env_map.get("PATH").and_then(|v| v.as_str()) {
+                    // Strip our prefix (handles "sevorix_bin:" or "sevorix_bin" alone)
+                    let new_path = path_val
+                        .strip_prefix(&format!("{}:", sevorix_bin))
+                        .or_else(|| path_val.strip_prefix(&sevorix_bin))
+                        .unwrap_or(path_val)
+                        .to_string();
+
+                    if new_path.is_empty() {
+                        env_map.remove("PATH");
+                    } else {
+                        env_map.insert("PATH".to_string(), json!(new_path));
+                    }
+                }
 
                 // If env is now empty, remove it entirely
                 if env_map.is_empty() {
@@ -257,8 +407,11 @@ impl Integration for ClaudeCodeIntegration {
         // Write updated settings
         self.write_settings(&settings)?;
 
+        // Remove shell alias
+        self.remove_shell_alias()?;
+
         println!("Claude Code integration uninstalled.");
-        println!("The SHELL setting has been removed from ~/.claude/settings.json");
+        println!("The PATH override has been removed from ~/.claude/settings.json");
 
         // Check for backup and offer to restore
         let backup_path = self.settings_path.with_extension("json.backup");
@@ -287,6 +440,15 @@ impl Integration for ClaudeCodeIntegration {
             };
         }
 
+        if !self.is_bash_wrapper_installed() {
+            return IntegrationStatus::Corrupted {
+                reason: format!(
+                    "bash wrapper not found at {}/bash — re-run the installer",
+                    self.sevorix_bin_path.display()
+                ),
+            };
+        }
+
         // Check installation status
         if self.is_installed() {
             IntegrationStatus::Installed
@@ -303,6 +465,7 @@ mod tests {
 
     fn create_test_integration(temp_dir: &TempDir) -> ClaudeCodeIntegration {
         let sevsh_path = temp_dir.path().join(".local/bin/sevsh");
+        let sevorix_bin_path = temp_dir.path().join(".sevorix/bin");
         let settings_path = temp_dir.path().join(".claude/settings.json");
         let state_dir = temp_dir.path().join(".local/state/sevorix");
 
@@ -312,10 +475,14 @@ mod tests {
         }
         std::fs::write(&sevsh_path, "#!/bin/bash\necho sevsh").unwrap();
 
+        // Create bash wrapper mock
+        std::fs::create_dir_all(&sevorix_bin_path).unwrap();
+        std::fs::write(sevorix_bin_path.join("bash"), "#!/bin/sh\nexec sevsh \"$@\"").unwrap();
+
         // Create state dir
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        ClaudeCodeIntegration::new_for_test(sevsh_path, settings_path, state_dir)
+        ClaudeCodeIntegration::new_for_test(sevsh_path, sevorix_bin_path, settings_path, state_dir, temp_dir.path().to_path_buf())
     }
 
     fn create_running_daemon(state_dir: &PathBuf) {
@@ -328,12 +495,6 @@ mod tests {
     fn test_integration_name() {
         let integration = ClaudeCodeIntegration::new().unwrap();
         assert_eq!(integration.name(), "Claude Code");
-    }
-
-    #[test]
-    fn test_sevsh_path() {
-        let integration = ClaudeCodeIntegration::new().unwrap();
-        assert!(integration.sevsh_path_string().contains("sevsh"));
     }
 
     #[test]
@@ -356,7 +517,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        // Create empty settings file
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -366,30 +526,29 @@ mod tests {
     }
 
     #[test]
-    fn test_is_installed_with_shell_setting() {
+    fn test_is_installed_with_path_containing_sevorix_bin() {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        // Create settings with SHELL set to sevsh
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        let settings = r#"{"env": {"SHELL": "~/.local/bin/sevsh"}}"#;
+        let sevorix_bin = integration.sevorix_bin_path_string();
+        let settings = format!(r#"{{"env": {{"PATH": "{}:/usr/bin:/bin"}}}}"#, sevorix_bin);
         std::fs::write(&integration.settings_path, settings).unwrap();
 
         assert!(integration.is_installed());
     }
 
     #[test]
-    fn test_is_installed_with_different_shell() {
+    fn test_is_installed_without_sevorix_bin_in_path() {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        // Create settings with different SHELL
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        let settings = r#"{"env": {"SHELL": "/bin/bash"}}"#;
+        let settings = r#"{"env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}"#;
         std::fs::write(&integration.settings_path, settings).unwrap();
 
         assert!(!integration.is_installed());
@@ -413,7 +572,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        // Create settings file
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -468,13 +626,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        let settings = json!({"env": {"SHELL": "test"}});
+        let settings = json!({"env": {"PATH": "/test/bin:/usr/bin"}});
         integration.write_settings(&settings).unwrap();
 
         assert!(integration.settings_path.exists());
 
         let content = std::fs::read_to_string(&integration.settings_path).unwrap();
-        assert!(content.contains("SHELL"));
+        assert!(content.contains("PATH"));
     }
 
     #[test]
@@ -517,13 +675,54 @@ mod tests {
     fn test_is_sevsh_installed_false() {
         let temp_dir = TempDir::new().unwrap();
         let sevsh_path = temp_dir.path().join(".local/bin/sevsh");
+        let sevorix_bin_path = temp_dir.path().join(".sevorix/bin");
         let settings_path = temp_dir.path().join(".claude/settings.json");
         let state_dir = temp_dir.path().join(".local/state/sevorix");
 
         std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&sevorix_bin_path).unwrap();
+        std::fs::write(sevorix_bin_path.join("bash"), "#!/bin/sh\nexec sevsh \"$@\"").unwrap();
 
-        let integration = ClaudeCodeIntegration::new_for_test(sevsh_path, settings_path, state_dir);
+        let integration = ClaudeCodeIntegration::new_for_test(
+            sevsh_path,
+            sevorix_bin_path,
+            settings_path,
+            state_dir,
+            temp_dir.path().to_path_buf(),
+        );
         assert!(!integration.is_sevsh_installed());
+    }
+
+    #[test]
+    fn test_is_bash_wrapper_installed_true() {
+        let temp_dir = TempDir::new().unwrap();
+        let integration = create_test_integration(&temp_dir);
+
+        assert!(integration.is_bash_wrapper_installed());
+    }
+
+    #[test]
+    fn test_is_bash_wrapper_installed_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let sevsh_path = temp_dir.path().join(".local/bin/sevsh");
+        let sevorix_bin_path = temp_dir.path().join(".sevorix/bin");
+        let settings_path = temp_dir.path().join(".claude/settings.json");
+        let state_dir = temp_dir.path().join(".local/state/sevorix");
+
+        std::fs::create_dir_all(sevsh_path.parent().unwrap()).unwrap();
+        std::fs::write(&sevsh_path, "#!/bin/bash\necho sevsh").unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // sevorix_bin_path exists but bash wrapper does not
+        std::fs::create_dir_all(&sevorix_bin_path).unwrap();
+
+        let integration = ClaudeCodeIntegration::new_for_test(
+            sevsh_path,
+            sevorix_bin_path,
+            settings_path,
+            state_dir,
+            temp_dir.path().to_path_buf(),
+        );
+        assert!(!integration.is_bash_wrapper_installed());
     }
 
     #[test]
@@ -543,18 +742,57 @@ mod tests {
     fn test_status_corrupted_sevsh_not_installed() {
         let temp_dir = TempDir::new().unwrap();
         let sevsh_path = temp_dir.path().join(".local/bin/sevsh");
+        let sevorix_bin_path = temp_dir.path().join(".sevorix/bin");
         let settings_path = temp_dir.path().join(".claude/settings.json");
         let state_dir = temp_dir.path().join(".local/state/sevorix");
 
         std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&sevorix_bin_path).unwrap();
+        std::fs::write(sevorix_bin_path.join("bash"), "#!/bin/sh\nexec sevsh \"$@\"").unwrap();
         create_running_daemon(&state_dir);
 
-        let integration = ClaudeCodeIntegration::new_for_test(sevsh_path, settings_path, state_dir);
+        let integration = ClaudeCodeIntegration::new_for_test(
+            sevsh_path,
+            sevorix_bin_path,
+            settings_path,
+            state_dir,
+            temp_dir.path().to_path_buf(),
+        );
         let status = integration.status();
 
         assert!(matches!(status, IntegrationStatus::Corrupted { .. }));
         if let IntegrationStatus::Corrupted { reason } = status {
             assert!(reason.contains("sevsh"));
+        }
+    }
+
+    #[test]
+    fn test_status_corrupted_bash_wrapper_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let sevsh_path = temp_dir.path().join(".local/bin/sevsh");
+        let sevorix_bin_path = temp_dir.path().join(".sevorix/bin");
+        let settings_path = temp_dir.path().join(".claude/settings.json");
+        let state_dir = temp_dir.path().join(".local/state/sevorix");
+
+        std::fs::create_dir_all(sevsh_path.parent().unwrap()).unwrap();
+        std::fs::write(&sevsh_path, "#!/bin/bash\necho sevsh").unwrap();
+        std::fs::create_dir_all(&sevorix_bin_path).unwrap();
+        // no bash wrapper
+        std::fs::create_dir_all(&state_dir).unwrap();
+        create_running_daemon(&state_dir);
+
+        let integration = ClaudeCodeIntegration::new_for_test(
+            sevsh_path,
+            sevorix_bin_path,
+            settings_path,
+            state_dir,
+            temp_dir.path().to_path_buf(),
+        );
+        let status = integration.status();
+
+        assert!(matches!(status, IntegrationStatus::Corrupted { .. }));
+        if let IntegrationStatus::Corrupted { reason } = status {
+            assert!(reason.contains("bash wrapper") || reason.contains("installer"));
         }
     }
 
@@ -574,11 +812,11 @@ mod tests {
         let integration = create_test_integration(&temp_dir);
         create_running_daemon(&integration.state_dir);
 
-        // Create settings with SHELL set to sevsh
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        let settings = r#"{"env": {"SHELL": "~/.local/bin/sevsh"}}"#;
+        let sevorix_bin = integration.sevorix_bin_path_string();
+        let settings = format!(r#"{{"env": {{"PATH": "{}:/usr/bin:/bin"}}}}"#, sevorix_bin);
         std::fs::write(&integration.settings_path, settings).unwrap();
 
         let status = integration.status();
@@ -603,33 +841,60 @@ mod tests {
         create_running_daemon(&integration.state_dir);
 
         let result = integration.install().unwrap();
-        assert!(result.files_modified.len() > 0);
+        assert!(!result.files_modified.is_empty());
         assert!(result.message.contains("Claude Code"));
 
-        // Verify settings were written
+        // Verify PATH was written with sevorix bin prepended
         assert!(integration.settings_path.exists());
-        let settings = std::fs::read_to_string(&integration.settings_path).unwrap();
-        assert!(settings.contains("sevsh"));
+        let settings = integration.read_settings().unwrap();
+        let path_val = settings["env"]["PATH"].as_str().unwrap();
+        assert!(path_val.starts_with(&integration.sevorix_bin_path_string()));
     }
 
     #[test]
-    fn test_install_replaces_existing_shell() {
+    fn test_install_prepends_to_existing_path() {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
         create_running_daemon(&integration.state_dir);
 
-        // Create settings with existing SHELL
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&integration.settings_path, r#"{"env": {"SHELL": "/bin/bash"}}"#).unwrap();
+        std::fs::write(
+            &integration.settings_path,
+            r#"{"env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}"#,
+        )
+        .unwrap();
 
         let result = integration.install().unwrap();
-        assert!(result.config_changes.iter().any(|c| c.contains("Replacing")));
+        assert!(result.config_changes.iter().any(|c| c.contains("Prepending")));
 
-        // Verify SHELL was changed
         let settings = integration.read_settings().unwrap();
-        assert_eq!(settings["env"]["SHELL"], "~/.local/bin/sevsh");
+        let path_val = settings["env"]["PATH"].as_str().unwrap();
+        assert!(path_val.starts_with(&integration.sevorix_bin_path_string()));
+        assert!(path_val.contains("/usr/local/bin"));
+    }
+
+    #[test]
+    fn test_install_idempotent_when_path_already_set() {
+        let temp_dir = TempDir::new().unwrap();
+        let integration = create_test_integration(&temp_dir);
+        create_running_daemon(&integration.state_dir);
+
+        if let Some(parent) = integration.settings_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let sevorix_bin = integration.sevorix_bin_path_string();
+        let path = format!("{}:/usr/bin:/bin", sevorix_bin);
+        let settings = format!(r#"{{"env": {{"PATH": "{}"}}}}"#, path);
+        std::fs::write(&integration.settings_path, settings).unwrap();
+
+        integration.install().unwrap();
+
+        // PATH should not be doubled
+        let settings = integration.read_settings().unwrap();
+        let path_val = settings["env"]["PATH"].as_str().unwrap();
+        assert_eq!(path_val.matches(&sevorix_bin).count(), 1);
     }
 
     #[test]
@@ -638,7 +903,6 @@ mod tests {
         let integration = create_test_integration(&temp_dir);
         create_running_daemon(&integration.state_dir);
 
-        // Create existing settings
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -647,26 +911,30 @@ mod tests {
         let result = integration.install().unwrap();
         assert!(result.config_changes.iter().any(|c| c.contains("Backed up")));
 
-        // Verify backup exists
         let backup_path = integration.settings_path.with_extension("json.backup");
         assert!(backup_path.exists());
     }
 
     #[test]
-    fn test_uninstall_removes_shell_setting() {
+    fn test_uninstall_removes_path_prefix() {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        // Create settings with SHELL
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&integration.settings_path, r#"{"env": {"SHELL": "~/.local/bin/sevsh", "OTHER": "value"}}"#).unwrap();
+        let sevorix_bin = integration.sevorix_bin_path_string();
+        let settings = format!(
+            r#"{{"env": {{"PATH": "{}:/usr/bin:/bin", "OTHER": "value"}}}}"#,
+            sevorix_bin
+        );
+        std::fs::write(&integration.settings_path, settings).unwrap();
 
         integration.uninstall().unwrap();
 
         let settings = integration.read_settings().unwrap();
-        assert!(!settings["env"].get("SHELL").is_some());
+        let path_val = settings["env"]["PATH"].as_str().unwrap();
+        assert!(!path_val.contains(&sevorix_bin));
         assert_eq!(settings["env"]["OTHER"], "value");
     }
 
@@ -675,16 +943,17 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        // Create settings with only SHELL in env
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&integration.settings_path, r#"{"env": {"SHELL": "~/.local/bin/sevsh"}}"#).unwrap();
+        let sevorix_bin = integration.sevorix_bin_path_string();
+        let settings = format!(r#"{{"env": {{"PATH": "{}"}}}}"#, sevorix_bin);
+        std::fs::write(&integration.settings_path, settings).unwrap();
 
         integration.uninstall().unwrap();
 
         let settings = integration.read_settings().unwrap();
-        assert!(!settings.get("env").is_some());
+        assert!(settings.get("env").is_none());
     }
 
     #[test]
@@ -692,7 +961,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let integration = create_test_integration(&temp_dir);
 
-        // Should not fail when no settings file exists
         integration.uninstall().unwrap();
     }
 
@@ -702,7 +970,6 @@ mod tests {
         let integration = create_test_integration(&temp_dir);
         create_running_daemon(&integration.state_dir);
 
-        // Create settings with other configuration
         if let Some(parent) = integration.settings_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -713,6 +980,9 @@ mod tests {
         let settings = integration.read_settings().unwrap();
         assert_eq!(settings["api_key"], "secret");
         assert_eq!(settings["theme"], "dark");
-        assert_eq!(settings["env"]["SHELL"], "~/.local/bin/sevsh");
+        assert!(settings["env"]["PATH"]
+            .as_str()
+            .unwrap()
+            .contains(&integration.sevorix_bin_path_string()));
     }
 }

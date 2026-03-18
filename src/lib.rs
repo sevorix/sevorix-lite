@@ -13,7 +13,6 @@ use directories::{ProjectDirs, UserDirs};
 use uuid;
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
     net::SocketAddr,
     process::Command,
     sync::{Arc, RwLock},
@@ -38,7 +37,7 @@ pub mod scanner;
 pub mod settings;
 
 use assets::Assets;
-pub use cli::{Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands};
+pub use cli::{Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands, SessionCommands};
 pub use daemon::{DaemonManager, EbpfDaemonManager, is_ebpf_daemon_running, is_watchtower_running};
 pub use integrations::{IntegrationRegistry, Integration, IntegrationStatus, InstallResult, Manifest, claude_code::ClaudeCodeIntegration, codex::CodexIntegration, openclaw::OpenClawIntegration};
 use policy::{Action, Engine, PolicyContext, PolicyType};
@@ -69,6 +68,10 @@ pub struct AppState {
     pub intervention_timeout_secs: u64,
     /// If true, auto-allow on timeout; if false (default), auto-block.
     pub intervention_timeout_allow: bool,
+    /// The active policy role for this daemon session. Loaded from
+    /// settings.json `default_role` at startup; updated live via
+    /// `POST /api/session/set-role`. Fail-closed if None.
+    pub current_role: Arc<RwLock<Option<String>>>,
 }
 
 pub fn handle_config(cmd: ConfigCommands) {
@@ -112,31 +115,39 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
     }
 
     match cmd {
-        IntegrationsCommands::Install { name } => {
-            match registry.get(&name) {
-                Some(integration) => {
-                    match integration.install() {
-                        Ok(result) => {
-                            println!("Successfully installed '{}'", name);
-                            if !result.files_modified.is_empty() {
-                                println!("Modified files:");
-                                for f in &result.files_modified {
-                                    println!("  - {}", f);
-                                }
-                            }
-                            if result.restart_required {
-                                println!("Note: A restart may be required for changes to take effect.");
-                            }
-                            println!("{}", result.message);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to install '{}': {}", name, e);
+        IntegrationsCommands::Install { name, alias } => {
+            // For claude-code, construct directly so we can pass the alias.
+            let install_result = if name == "Claude Code" || name == "claude-code" {
+                match ClaudeCodeIntegration::new() {
+                    Ok(integration) => Some(integration.with_alias(alias).install()),
+                    Err(e) => {
+                        eprintln!("Failed to initialize claude-code integration: {}", e);
+                        None
+                    }
+                }
+            } else {
+                registry.get(&name).map(|integration| integration.install())
+            };
+
+            match install_result {
+                Some(Ok(result)) => {
+                    println!("Successfully installed '{}'", name);
+                    if !result.files_modified.is_empty() {
+                        println!("Modified files:");
+                        for f in &result.files_modified {
+                            println!("  - {}", f);
                         }
                     }
+                    if result.restart_required {
+                        println!("Note: Open a new shell for the alias to take effect.");
+                    }
+                    println!("{}", result.message);
+                }
+                Some(Err(e)) => {
+                    eprintln!("Failed to install '{}': {}", name, e);
                 }
                 None => {
                     eprintln!("Integration '{}' not found.", name);
-                    println!("Available integrations: (none registered yet)");
                     println!("Use 'sevorix integrations list' to see available integrations.");
                 }
             }
@@ -467,14 +478,15 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
     }
 
     // Load settings from ~/.sevorix/settings.json (optional; missing = all defaults)
-    let intervention_settings = base_dirs
+    let loaded_settings = base_dirs
         .first()
         .map(|d| d.join("settings.json"))
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<settings::Settings>(&s).ok())
-        .and_then(|s| s.intervention)
         .unwrap_or_default();
+    let intervention_settings = loaded_settings.intervention.unwrap_or_default();
+    let default_role = loaded_settings.sevsh.and_then(|s| s.default_role);
 
     let enforcement_tier = detect_enforcement_tier();
 
@@ -499,6 +511,7 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
         pending_decisions: Arc::new(DashMap::new()),
         intervention_timeout_secs: intervention_settings.timeout_secs(),
         intervention_timeout_allow: intervention_settings.timeout_action_allow(),
+        current_role: Arc::new(RwLock::new(default_role)),
     });
 
     // Define the Routes
@@ -521,6 +534,7 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
         .route("/dashboard", get(dashboard_redirect))
         .route("/api/session/register", post(session_register))
         .route("/api/session/unregister", post(session_unregister))
+        .route("/api/session/set-role", post(session_set_role))
         .route("/api/active-sessions", get(active_sessions_handler));
 
 
@@ -602,6 +616,14 @@ async fn active_sessions_handler(State(state): State<Arc<AppState>>) -> impl Int
 async fn session_unregister(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
     if let Some(path) = body["cgroup_path"].as_str() {
         state.active_sessions.lock().await.remove(path);
+    }
+    StatusCode::OK
+}
+
+async fn session_set_role(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
+    if let Some(role) = body["role"].as_str() {
+        *state.current_role.write().unwrap() = Some(role.to_string());
+        tracing::info!("Session role updated to '{}'", role);
     }
     StatusCode::OK
 }
@@ -811,7 +833,17 @@ async fn analyze_intent(
     let start_time = std::time::Instant::now();
     let text = payload["payload"].as_str().unwrap_or("").to_string();
     let agent_id = payload["agent"].as_str().unwrap_or("Unknown-Agent");
-    let role = payload["role"].as_str();
+
+    // Resolve the active role. Fail-closed if no role is configured.
+    let resolved_role: Option<String> = state.current_role.read().unwrap().clone();
+    let Some(ref resolved_role) = resolved_role else {
+        return Json(json!({
+            "status": "BLOCK",
+            "reason": "No role configured for this session. Use `sevorix session set-role <role>` or set default_role in ~/.sevorix/settings.json.",
+            "lane": "RED",
+            "confidence": "100%",
+        })).into_response();
+    };
 
     // Parse context
     let context_str = payload["context"].as_str().unwrap_or("All");
@@ -832,7 +864,7 @@ async fn analyze_intent(
     }
 
     // --- DECISION RULES ---
-    let mut scan = scan_content(&text, role, &state.policy_engine.read().unwrap(), context);
+    let mut scan = scan_content(&text, Some(resolved_role.as_str()), &state.policy_engine.read().unwrap(), context);
 
 
     // --- USER INTERVENTION for FLAG (shell channel) ---
@@ -852,6 +884,7 @@ async fn analyze_intent(
             "timestamp": chrono::Local::now().to_rfc3339(),
             "reason": scan.log_msg,
             "context": context_str,
+            "role": resolved_role,
             "timeout_secs": state.intervention_timeout_secs,
             "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
         });
@@ -889,6 +922,7 @@ async fn analyze_intent(
                 "reason": "Blocked by operator",
                 "confidence": null,
                 "context": context_str,
+                "role": resolved_role,
             });
             let block_str = block_event.to_string();
             log_traffic_event(&state.traffic_log_path, &block_str);
@@ -933,7 +967,8 @@ async fn analyze_intent(
         "latency": elapsed,
         "reason": scan.log_msg,
         "confidence": scan.log_score,
-        "context": context_str
+        "context": context_str,
+        "role": resolved_role,
     });
     let event_str = event.to_string();
     log_traffic_event(&state.traffic_log_path, &event_str);
@@ -1638,6 +1673,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
+            current_role: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1655,6 +1691,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
+            current_role: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1671,6 +1708,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
+            current_role: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1723,7 +1761,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("BLOCKME", None, &engine, PolicyContext::All);
+        let result = scan_content("BLOCKME", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
     }
 
@@ -1804,7 +1842,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("SUSPICIOUS content", None, &engine, PolicyContext::All);
+        let result = scan_content("SUSPICIOUS content", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "FLAG");
         assert_eq!(result.lane, "YELLOW");
         assert_eq!(result.delay, 500);
@@ -1826,7 +1864,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("KILLME now", None, &engine, PolicyContext::All);
+        let result = scan_content("KILLME now", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
         assert!(result.kill);
     }
@@ -1882,7 +1920,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("ECHO HELLO", None, &engine, PolicyContext::All);
+        let result = scan_content("ECHO HELLO", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "ALLOW");
     }
 
@@ -1902,7 +1940,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("DROP TABLE users", None, &engine, PolicyContext::All);
+        let result = scan_content("DROP TABLE users", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
     }
 
@@ -1923,11 +1961,11 @@ mod tests {
         });
 
         // Should block in Shell context
-        let result = scan_content("RM -rf /", None, &engine, PolicyContext::Shell);
+        let result = scan_content("RM -rf /", Some("default"), &engine, PolicyContext::Shell);
         assert_eq!(result.verdict, "BLOCK");
 
         // Should allow in Network context
-        let result = scan_content("RM -rf /", None, &engine, PolicyContext::Network);
+        let result = scan_content("RM -rf /", Some("default"), &engine, PolicyContext::Network);
         assert_eq!(result.verdict, "ALLOW");
     }
 
@@ -2083,6 +2121,7 @@ mod tests {
         // Test that installing a nonexistent integration doesn't panic
         handle_integrations(IntegrationsCommands::Install {
             name: "nonexistent_integration_xyz".to_string(),
+            alias: "claude".to_string(),
         });
     }
 

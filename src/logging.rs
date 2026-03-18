@@ -2,48 +2,34 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-/// Initializes the logging system:
-/// 1. Generates a unique Session ID.
-/// 2. Sets up a file appender to ~/.sevorix/logs/<session_id>.log
-/// 3. Configures tracing-subscriber to log to both stdout and the file.
+/// Initializes the logging system with a pre-existing session ID.
+/// Sets up a file appender to ~/.sevorix/logs/<session_id>.log and
+/// configures tracing-subscriber to log to both stdout and the file.
 ///
-/// Returns a WorkerGuard (must be kept alive in main) and the Session ID.
-pub fn init_logging() -> (tracing_appender::non_blocking::WorkerGuard, Uuid) {
-    let session_id = Uuid::new_v4();
-
-    // Determine log directory: ~/.sevorix/logs/
-    // Priority: ProjectDirs (XDG or Standard) -> then we explicitly append "logs" to config or data dir.
-    // The user requested ~/.sevorix/logs/<session_id>.log specifically.
-    // Let's try to honor ~/.sevorix if we can find the home dir, otherwise fallback to standard state paths.
-
+/// Returns a WorkerGuard (must be kept alive in main).
+pub fn init_logging_with_session(session_id: Uuid) -> tracing_appender::non_blocking::WorkerGuard {
     let log_dir = if let Some(user_dirs) = directories::UserDirs::new() {
         user_dirs.home_dir().join(".sevorix").join("logs")
     } else {
-        // Fallback for systems without "Home" concept (rare) or strict sandboxing
         PathBuf::from(".sevorix/logs")
     };
 
-    // Ensure directory exists
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("Failed to create log directory {:?}: {}", log_dir, e);
     }
 
     let file_name = format!("{}.log", session_id);
     let file_appender = tracing_appender::rolling::never(&log_dir, &file_name);
-
     let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
 
-    // Standard format for logs
     let fmt_file = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(non_blocking_appender);
 
-    // Stdout layer (which daemon redirects to sevorix.log)
     let fmt_stdout = tracing_subscriber::fmt::layer()
-        .with_ansi(true) // Keep colors for the sevorix.log/console
+        .with_ansi(true)
         .with_writer(std::io::stdout);
 
-    // Combine them
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
@@ -55,6 +41,18 @@ pub fn init_logging() -> (tracing_appender::non_blocking::WorkerGuard, Uuid) {
     tracing::info!("Session started with ID: {}", session_id);
     tracing::info!("Logging to file: {}", log_dir.join(&file_name).display());
 
+    guard
+}
+
+/// Initializes the logging system:
+/// 1. Generates a unique Session ID.
+/// 2. Sets up a file appender to ~/.sevorix/logs/<session_id>.log
+/// 3. Configures tracing-subscriber to log to both stdout and the file.
+///
+/// Returns a WorkerGuard (must be kept alive in main) and the Session ID.
+pub fn init_logging() -> (tracing_appender::non_blocking::WorkerGuard, Uuid) {
+    let session_id = Uuid::new_v4();
+    let guard = init_logging_with_session(session_id);
     (guard, session_id)
 }
 

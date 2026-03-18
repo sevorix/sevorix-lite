@@ -1,5 +1,5 @@
 use clap::Parser;
-use sevorix_watchtower::{handle_config, handle_integrations, handle_validate, logging::init_logging, run_server, Cli, Commands, DaemonManager, HubCommands};
+use sevorix_watchtower::{handle_config, handle_integrations, handle_validate, logging::{init_logging, init_logging_with_session}, run_server, Cli, Commands, DaemonManager, HubCommands, SessionCommands};
 use sevorix_watchtower::prime::print_prime;
 use tracing::info;
 
@@ -40,8 +40,9 @@ fn main() -> anyhow::Result<()> {
 
             // Start Watchtower if requested
             if start_watchtower {
-                daemon.start()?;
-                let (_guard, session_id) = init_logging();
+                let session_id = uuid::Uuid::new_v4();
+                daemon.start(session_id, start_ebpf)?;
+                let _guard = init_logging_with_session(session_id);
                 info!("Watchtower daemon initialized. Session ID: {}", session_id);
 
                 // Start eBPF daemon before blocking on the server
@@ -91,8 +92,9 @@ fn main() -> anyhow::Result<()> {
             }
             // Brief pause to ensure OS releases resources
             std::thread::sleep(std::time::Duration::from_millis(500));
-            daemon.start()?;
-            let (_guard, session_id) = init_logging();
+            let session_id = uuid::Uuid::new_v4();
+            daemon.start(session_id, true)?;
+            let _guard = init_logging_with_session(session_id);
             info!("Daemon restarted. Session ID: {}", session_id);
             #[cfg(feature = "ebpf")]
             {
@@ -114,6 +116,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Integrations { subcmd }) => handle_integrations(subcmd),
         Some(Commands::Validate { command, role, context }) => handle_validate(command, role, context),
         Some(Commands::Prime { agent_type }) => print_prime(&agent_type),
+        Some(Commands::Session { subcmd }) => handle_session(subcmd),
         Some(Commands::Run) | None => {
             // Default foreground run
             let (_guard, session_id) = init_logging();
@@ -248,6 +251,37 @@ fn handle_hub(cmd: HubCommands) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
+}
+
+fn handle_session(cmd: SessionCommands) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    rt.block_on(async move {
+        match cmd {
+            SessionCommands::SetRole { role } => {
+                let client = reqwest::Client::new();
+                match client
+                    .post("http://localhost:3000/api/session/set-role")
+                    .json(&serde_json::json!({"role": &role}))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => println!("Session role set to '{}'", role),
+                    Ok(r) => {
+                        eprintln!("Error: server returned {}", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: could not reach Watchtower: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Parse allowed roles from CLI string
@@ -501,7 +535,7 @@ mod tests {
         assert!(cli.is_ok());
         if let Some(Commands::Integrations { subcmd }) = cli.unwrap().command {
             match subcmd {
-                IntegrationsCommands::Install { name } => {
+                IntegrationsCommands::Install { name, .. } => {
                     assert_eq!(name, "claude-code");
                 }
                 _ => panic!("Expected Install subcommand"),

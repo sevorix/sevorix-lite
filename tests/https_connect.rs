@@ -22,6 +22,7 @@ async fn test_real_connect_handshake() {
         pending_decisions: Arc::new(DashMap::new()),
         intervention_timeout_secs: 30,
         intervention_timeout_allow: false,
+        current_role: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
 
     // 2. Setup Router

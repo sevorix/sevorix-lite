@@ -64,7 +64,15 @@ echo "--------------------------------------------------"
 # Create user directories (non-invasive, no prompt needed)
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR/bin"
 mkdir -p "$STATE_DIR"
+
+# Create bash wrapper so integrations can shadow bash via PATH
+cat > "$CONFIG_DIR/bin/bash" << 'EOF'
+#!/bin/sh
+exec "$HOME/.local/bin/sevsh" "$@"
+EOF
+chmod +x "$CONFIG_DIR/bin/bash"
 
 SOURCE_BIN=""
 
@@ -287,6 +295,57 @@ if [ -f "scripts/sevorix-cgroup-helper" ]; then
     fi
 else
     echo "⚠️  scripts/sevorix-cgroup-helper not found — session isolation will be limited."
+fi
+
+# ---------------------------------------------------------------
+# Install Claude Code launcher (mount-namespace /bin/bash interception)
+# ---------------------------------------------------------------
+CLAUDE_LAUNCHER="/usr/local/bin/sevorix-claude-launcher"
+if [ -f "scripts/sevorix-claude-launcher" ]; then
+    if prompt_confirm \
+        "Install Claude Code launcher to /usr/local/bin" \
+        "Installs a privileged launcher that wraps 'claude' in a mount namespace,
+│  binding sevsh over /bin/bash so Claude Code's Bash tool commands are
+│  intercepted and validated by Sevorix — even though Claude Code calls
+│  /bin/bash by absolute path rather than looking it up in PATH.
+│
+│  WHY THIS NEEDS ROOT: bind-mounting over /bin/bash requires CAP_SYS_ADMIN.
+│  The mount namespace scopes the bind mount to just the claude session —
+│  the rest of your system sees the original /bin/bash throughout.
+│
+│  WHEN YOU CAN SKIP THIS: if you don't use Claude Code, or if HTTP proxy
+│  interception alone (network traffic only, no shell command validation)
+│  is sufficient for your use case.
+│
+│  Writes to: $CLAUDE_LAUNCHER"; then
+        if sudo cp "scripts/sevorix-claude-launcher" "$CLAUDE_LAUNCHER" && sudo chmod 755 "$CLAUDE_LAUNCHER"; then
+            echo "   ✅ Claude Code launcher installed"
+            CLAUDE_SUDOERS_FILE="/etc/sudoers.d/sevorix-claude"
+            CLAUDE_SUDOERS_RULE="$USER ALL=(root) NOPASSWD: $CLAUDE_LAUNCHER"
+            if prompt_confirm \
+                "Install passwordless sudoers rule for Claude Code launcher" \
+                "Allows launching claude through Sevorix without a sudo password prompt.
+│  Writes to: $CLAUDE_SUDOERS_FILE
+│  Rule: $CLAUDE_SUDOERS_RULE"; then
+                if echo "$CLAUDE_SUDOERS_RULE" | sudo tee "$CLAUDE_SUDOERS_FILE" > /dev/null && sudo chmod 440 "$CLAUDE_SUDOERS_FILE"; then
+                    echo "   ✅ Claude sudoers rule installed at $CLAUDE_SUDOERS_FILE"
+                    echo "   Launch claude via: sudo sevorix-claude-launcher"
+                else
+                    echo "   ⚠️  Failed to install Claude sudoers rule."
+                    echo "   Add manually via visudo: $CLAUDE_SUDOERS_RULE"
+                fi
+            else
+                echo "   ⚠️  Sudoers rule skipped. Add manually via visudo if needed:"
+                echo "      $CLAUDE_SUDOERS_RULE"
+            fi
+        else
+            echo "   ⚠️  Failed to install Claude Code launcher."
+        fi
+    else
+        echo "ℹ️  Claude Code launcher skipped — shell command interception unavailable."
+    fi
+else
+    echo "ℹ️  scripts/sevorix-claude-launcher not found — skipping."
 fi
 
 # ---------------------------------------------------------------

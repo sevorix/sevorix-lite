@@ -412,6 +412,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
+            current_role: std::sync::Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -449,6 +450,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
+            current_role: std::sync::Arc::new(std::sync::RwLock::new(None)),
         })
     }
 

@@ -74,8 +74,17 @@ pub fn scan_content(
     engine: &Engine,
     context: PolicyContext,
 ) -> SecurityScanResult {
-    // Check against policies for the specified role or default
-    let role = role_name.unwrap_or("default");
+    // Check against policies for the specified role. If no role is provided, block.
+    let Some(role) = role_name else {
+        return SecurityScanResult {
+            verdict: "BLOCK".to_string(),
+            lane: "RED".to_string(),
+            delay: 0,
+            log_msg: Some("No role configured".to_string()),
+            log_score: Some("100%".to_string()),
+            kill: false,
+        };
+    };
     if let Some(decision) = engine.check_role(role, text, context) {
         match decision.action {
             Action::Block => {
@@ -159,7 +168,7 @@ pub fn scan_syscall(event: &SyscallEvent, policies: &[crate::policy::Policy]) ->
         },
     );
 
-    scan_content(&content, None, &engine, PolicyContext::Syscall)
+    scan_content(&content, Some("default"), &engine, PolicyContext::Syscall)
 }
 
 /// Scans a syscall event against a policy engine.
@@ -184,7 +193,7 @@ pub fn scan_syscall_with_engine(event: &SyscallEvent, engine: &Engine) -> Seccom
     );
 
     // Check against the engine with Syscall context
-    let result = scan_content(&content, None, engine, PolicyContext::Syscall);
+    let result = scan_content(&content, Some("default"), engine, PolicyContext::Syscall);
 
     // Convert SecurityScanResult to SeccompDecision
     if result.verdict == "BLOCK" {
@@ -355,7 +364,7 @@ mod tests {
     #[test]
     fn test_red_lane_drop() {
         let engine = create_test_engine();
-        let result = scan_content("DROP TABLE users", None, &engine, PolicyContext::All);
+        let result = scan_content("DROP TABLE users", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
         assert_eq!(result.lane, "RED");
         assert!(result.log_msg.unwrap().contains("Data Destruction"));
@@ -364,7 +373,7 @@ mod tests {
     #[test]
     fn test_red_lane_wire() {
         let engine = create_test_engine();
-        let result = scan_content("WIRE FUNDS TO ABROAD", None, &engine, PolicyContext::All);
+        let result = scan_content("WIRE FUNDS TO ABROAD", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
         assert_eq!(result.lane, "RED");
         assert!(result.log_msg.unwrap().contains("Financial Transaction"));
@@ -373,7 +382,7 @@ mod tests {
     #[test]
     fn test_yellow_lane_select() {
         let engine = create_test_engine();
-        let result = scan_content("SELECT * FROM users", None, &engine, PolicyContext::All);
+        let result = scan_content("SELECT * FROM users", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "FLAG");
         assert_eq!(result.lane, "YELLOW");
         assert_eq!(result.delay, 500);
@@ -382,7 +391,7 @@ mod tests {
     #[test]
     fn test_green_lane_safe() {
         let engine = create_test_engine();
-        let result = scan_content("Hello World", None, &engine, PolicyContext::All);
+        let result = scan_content("Hello World", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "ALLOW");
         assert_eq!(result.lane, "GREEN");
         assert_eq!(result.delay, 5);
@@ -599,7 +608,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("dangerous operation", None, &engine, PolicyContext::All);
+        let result = scan_content("dangerous operation", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
         assert!(result.kill);
     }
@@ -646,7 +655,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("blockme please", None, &engine, PolicyContext::All);
+        let result = scan_content("blockme please", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
         assert!(result.log_msg.unwrap().contains("Policy Violation"));
     }
@@ -677,11 +686,11 @@ mod tests {
         engine.roles.get_mut("default").unwrap().policies.push("shell_only".to_string());
 
         // Should block in Shell context
-        let result = scan_content("RMMOD some_module", None, &engine, PolicyContext::Shell);
+        let result = scan_content("RMMOD some_module", Some("default"), &engine, PolicyContext::Shell);
         assert_eq!(result.verdict, "BLOCK");
 
         // Should NOT block in Network context
-        let result = scan_content("RMMOD some_module", None, &engine, PolicyContext::Network);
+        let result = scan_content("RMMOD some_module", Some("default"), &engine, PolicyContext::Network);
         assert_eq!(result.verdict, "ALLOW");
     }
 
@@ -698,11 +707,11 @@ mod tests {
         engine.roles.get_mut("default").unwrap().policies.push("net_only".to_string());
 
         // Should flag in Network context
-        let result = scan_content("CURL http://example.com", None, &engine, PolicyContext::Network);
+        let result = scan_content("CURL http://example.com", Some("default"), &engine, PolicyContext::Network);
         assert_eq!(result.verdict, "FLAG");
 
         // Should NOT flag in Shell context
-        let result = scan_content("CURL http://example.com", None, &engine, PolicyContext::Shell);
+        let result = scan_content("CURL http://example.com", Some("default"), &engine, PolicyContext::Shell);
         assert_eq!(result.verdict, "ALLOW");
     }
 
@@ -730,7 +739,7 @@ mod tests {
         });
 
         // Should return first block decision
-        let result = scan_content("MATCH", None, &engine, PolicyContext::All);
+        let result = scan_content("MATCH", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
     }
 
@@ -757,7 +766,7 @@ mod tests {
             is_dynamic: false,
         });
 
-        let result = scan_content("TEST", None, &engine, PolicyContext::All);
+        let result = scan_content("TEST", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
     }
 
