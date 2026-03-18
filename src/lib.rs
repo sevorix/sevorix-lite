@@ -93,6 +93,15 @@ pub fn handle_config(cmd: ConfigCommands) {
     }
 }
 
+/// Resolve integration name aliases to canonical names.
+/// Accepts "claude" and "claude-code" as aliases for "Claude Code".
+fn resolve_integration_name(name: &str) -> &str {
+    match name {
+        "claude" | "claude-code" => "Claude Code",
+        other => other,
+    }
+}
+
 /// Handle integration commands
 pub fn handle_integrations(cmd: IntegrationsCommands) {
     let mut registry = match IntegrationRegistry::new() {
@@ -115,37 +124,22 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
     }
 
     match cmd {
-        IntegrationsCommands::Install { name, alias } => {
-            // For claude-code, construct directly so we can pass the alias.
-            let install_result = if name == "Claude Code" || name == "claude-code" {
-                match ClaudeCodeIntegration::new() {
-                    Ok(integration) => Some(integration.with_alias(alias).install()),
-                    Err(e) => {
-                        eprintln!("Failed to initialize claude-code integration: {}", e);
-                        None
-                    }
-                }
-            } else {
-                registry.get(&name).map(|integration| integration.install())
-            };
-
-            match install_result {
-                Some(Ok(result)) => {
-                    println!("Successfully installed '{}'", name);
-                    if !result.files_modified.is_empty() {
-                        println!("Modified files:");
-                        for f in &result.files_modified {
-                            println!("  - {}", f);
+        IntegrationsCommands::Install { name } => {
+            let resolved = resolve_integration_name(&name);
+            match registry.get(resolved) {
+                Some(integration) => match integration.install() {
+                    Ok(result) => {
+                        println!("Successfully installed '{}'", resolved);
+                        if !result.files_modified.is_empty() {
+                            println!("Modified files:");
+                            for f in &result.files_modified {
+                                println!("  - {}", f);
+                            }
                         }
+                        println!("{}", result.message);
                     }
-                    if result.restart_required {
-                        println!("Note: Open a new shell for the alias to take effect.");
-                    }
-                    println!("{}", result.message);
-                }
-                Some(Err(e)) => {
-                    eprintln!("Failed to install '{}': {}", name, e);
-                }
+                    Err(e) => eprintln!("Failed to install '{}': {}", resolved, e),
+                },
                 None => {
                     eprintln!("Integration '{}' not found.", name);
                     println!("Use 'sevorix integrations list' to see available integrations.");
@@ -153,24 +147,39 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
             }
         }
         IntegrationsCommands::Uninstall { name } => {
-            match registry.get(&name) {
+            let resolved = resolve_integration_name(&name);
+            match registry.get(resolved) {
                 Some(integration) => {
                     match integration.uninstall() {
-                        Ok(()) => {
-                            println!("Successfully uninstalled '{}'", name);
-                            if let Ok(Some(manifest)) = registry.load_manifest(&name) {
-                                if let Some(backup_path) = &manifest.backup_path {
-                                    println!("Backup preserved at: {}", backup_path);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to uninstall '{}': {}", name, e);
-                        }
+                        Ok(()) => println!("Successfully uninstalled '{}'", resolved),
+                        Err(e) => eprintln!("Failed to uninstall '{}': {}", resolved, e),
                     }
                 }
                 None => {
                     eprintln!("Integration '{}' not found.", name);
+                }
+            }
+        }
+        IntegrationsCommands::Start { name, args } => {
+            let resolved = resolve_integration_name(&name);
+            match resolved {
+                "Claude Code" => {
+                    // Exec the mount-namespace launcher, replacing the current process.
+                    // sudo is required; the launcher validates $SUDO_USER itself.
+                    let mut cmd = std::process::Command::new("sudo");
+                    cmd.arg("/usr/local/bin/sevorix-claude-launcher");
+                    cmd.args(&args);
+                    let err = {
+                        use std::os::unix::process::CommandExt;
+                        cmd.exec()
+                    };
+                    eprintln!("Failed to exec sevorix-claude-launcher: {}", err);
+                    eprintln!("Is the launcher installed? Re-run the Sevorix installer.");
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("'start' is not supported for integration '{}'.", other);
+                    std::process::exit(1);
                 }
             }
         }
@@ -197,7 +206,8 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
         IntegrationsCommands::Status { name } => {
             match name {
                 Some(n) => {
-                    match registry.get(&n) {
+                    let resolved = resolve_integration_name(&n);
+                    match registry.get(resolved) {
                         Some(integration) => {
                             println!("Integration: {}", integration.name());
                             println!("Description: {}", integration.description());
@@ -2171,7 +2181,6 @@ mod tests {
         // Test that installing a nonexistent integration doesn't panic
         handle_integrations(IntegrationsCommands::Install {
             name: "nonexistent_integration_xyz".to_string(),
-            alias: "claude".to_string(),
         });
     }
 

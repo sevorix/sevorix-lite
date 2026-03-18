@@ -145,6 +145,20 @@ sevorix config check
 ./sevsh -c "rm -rf /"
 ```
 
+### 3. Integrations (`sevorix integrations`)
+**Connect AI Coding Agents to Sevorix.**
+
+Integrations route shell commands from AI tools through sevsh for policy enforcement. The Claude Code integration uses a mount-namespace bind-mount to intercept `/bin/bash` calls even when the agent uses an absolute path.
+
+```bash
+sevorix integrations list
+sevorix integrations status claude
+sevorix integrations start claude       # launch Claude Code under monitoring
+sevorix integrations start claude -- --resume
+```
+
+→ See **[docs/INTEGRATIONS.md](../docs/INTEGRATIONS.md)** for full usage, internals, and per-tool guides.
+
 ---
 
 ## 🛠️ Quick Start

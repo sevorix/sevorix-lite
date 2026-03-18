@@ -1,0 +1,58 @@
+#!/bin/bash
+# Sevorix Claude Code launcher — runs as root to set up a mount namespace,
+# then drops back to the original user and exec's claude.
+#
+# Creates a new mount namespace (scoped to this process tree only) and
+# bind-mounts sevsh over /bin/bash inside it. This ensures Claude Code's
+# Bash tool — which calls /bin/bash by absolute path — is intercepted by
+# sevsh and validated through Sevorix Watchtower.
+#
+# The bind mount is invisible to the rest of the system and is torn down
+# automatically when the claude session exits.
+#
+# Must be invoked via: sudo sevorix-claude-launcher [claude-args...]
+
+set -e
+
+ORIGINAL_USER="${SUDO_USER:-}"
+if [ -z "$ORIGINAL_USER" ]; then
+    echo "sevorix-claude-launcher: must be invoked via sudo" >&2
+    exit 1
+fi
+
+# Resolve home directory from passwd rather than assuming /home/$USER
+USER_HOME="$(getent passwd "$ORIGINAL_USER" | cut -d: -f6)"
+SEVSH="$USER_HOME/.local/bin/sevsh"
+
+if [ ! -x "$SEVSH" ]; then
+    echo "sevorix-claude-launcher: sevsh not found at $SEVSH" >&2
+    echo "  Run the Sevorix installer first, or check that sevsh is installed." >&2
+    exit 1
+fi
+
+# Resolve claude's path and full PATH using a login shell so that ~/.bashrc,
+# ~/.profile, nvm, and other user-level PATH customisations are active.
+CLAUDE_BIN=$(su -l "$ORIGINAL_USER" -s /bin/bash -c 'command -v claude 2>/dev/null' 2>/dev/null)
+if [ -z "$CLAUDE_BIN" ]; then
+    echo "sevorix-claude-launcher: claude not found in $ORIGINAL_USER's PATH" >&2
+    echo "  Is Claude Code installed? Try: npm install -g @anthropic-ai/claude-code" >&2
+    exit 1
+fi
+
+# Capture the user's full PATH so runuser inherits it (needed for node, git, etc.).
+USER_PATH=$(su -l "$ORIGINAL_USER" -s /bin/bash -c 'echo $PATH' 2>/dev/null)
+
+# Create a new mount namespace and bind-mount sevsh over /bin/bash inside it.
+# ${@:1} forwards any claude arguments (e.g. --resume, project path, etc.).
+#
+# IMPORTANT: before replacing /bin/bash we bind-mount the real bash to a temp
+# file and pass that path as SHELL. Without this, sevsh would use /bin/bash to
+# execute validated commands, hit the bind mount, and recurse infinitely.
+exec unshare --mount -- \
+    bash -c '
+        REAL_BASH=$(mktemp)
+        chmod +x "$REAL_BASH"
+        mount --bind /bin/bash "$REAL_BASH"
+        mount --bind "$1" /bin/bash
+        exec runuser -u "$2" -- env HOME="$4" SHELL="$REAL_BASH" SEVORIX_REAL_SHELL="$REAL_BASH" PATH="$5" "$3" "${@:6}"
+    ' _ "$SEVSH" "$ORIGINAL_USER" "$CLAUDE_BIN" "$USER_HOME" "$USER_PATH" "$@"

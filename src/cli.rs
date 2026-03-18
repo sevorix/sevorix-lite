@@ -204,13 +204,10 @@ pub enum HubCommands {
 
 #[derive(Subcommand)]
 pub enum IntegrationsCommands {
-    /// Install an integration
+    /// Install an integration (verifies prerequisites are met)
     Install {
-        /// Name of the integration to install
+        /// Name of the integration to install (e.g. "Claude Code" or "claude")
         name: String,
-        /// Shell alias to create for the launcher (Claude Code only, default: claude)
-        #[arg(long, default_value = "claude")]
-        alias: String,
     },
     /// Uninstall an integration
     Uninstall {
@@ -223,5 +220,13 @@ pub enum IntegrationsCommands {
     Status {
         /// Name of the integration (optional, shows all if not specified)
         name: Option<String>,
+    },
+    /// Start an integration session (e.g. launch Claude Code under Sevorix monitoring)
+    Start {
+        /// Name of the integration to start (e.g. "Claude Code" or "claude")
+        name: String,
+        /// Arguments forwarded to the underlying tool
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
