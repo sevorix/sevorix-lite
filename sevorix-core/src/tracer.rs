@@ -56,27 +56,14 @@ mod reg_offset {
 }
 
 /// x86_64 syscall numbers for argument-specific handling.
-#[allow(dead_code)]
 mod syscall_nr {
-    pub const READ: i64 = 0;
-    pub const WRITE: i64 = 1;
-    pub const OPEN: i64 = 2;
-    pub const CLOSE: i64 = 3;
-    pub const STAT: i64 = 4;
-    pub const FSTAT: i64 = 5;
-    pub const OPENAT: i64 = 257;
     pub const EXECVE: i64 = 59;
     pub const SOCKET: i64 = 41;
     pub const CONNECT: i64 = 42;
     pub const ACCEPT: i64 = 43;
     pub const SENDTO: i64 = 44;
     pub const RECVFROM: i64 = 45;
-    pub const SHUTDOWN: i64 = 48;
     pub const BIND: i64 = 49;
-    pub const LISTEN: i64 = 50;
-    pub const GETSOCKNAME: i64 = 51;
-    pub const GETPEERNAME: i64 = 52;
-    pub const SOCKETPAIR: i64 = 53;
     pub const ACCEPT4: i64 = 288;
 }
 

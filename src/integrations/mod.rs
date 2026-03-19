@@ -34,8 +34,6 @@ pub struct InstallResult {
 pub enum IntegrationStatus {
     /// Integration is installed and active.
     Installed,
-    /// Integration is installed but inactive.
-    Inactive,
     /// Integration is not installed.
     NotInstalled,
     /// Installation is corrupted or partial.

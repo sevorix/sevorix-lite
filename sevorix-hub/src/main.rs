@@ -14,18 +14,6 @@ use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Storage backend configuration.
-/// Note: This enum is used for documentation/type safety purposes and in tests.
-/// The actual storage selection uses string matching for CLI simplicity.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-enum StorageBackend {
-    /// Local filesystem storage (for development).
-    Filesystem { base_dir: String },
-    /// Google Cloud Storage (for production).
-    Gcs { bucket: String },
-}
-
 #[derive(Parser)]
 #[command(name = "sevorix-hub", about = "Sevorix policy hub service")]
 struct Cli {
@@ -244,6 +232,17 @@ fn expand_home(path: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Storage backend configuration.
+    /// Used only in tests to verify backend selection logic is documented correctly.
+    /// The actual storage selection in production uses string matching for CLI simplicity.
+    #[derive(Debug, Clone)]
+    enum StorageBackend {
+        /// Local filesystem storage (for development).
+        Filesystem { base_dir: String },
+        /// Google Cloud Storage (for production).
+        Gcs { bucket: String },
+    }
 
     #[test]
     fn test_expand_home_with_tilde() {

@@ -213,21 +213,18 @@ impl Drop for PtyMaster {
 struct PtyPair {
     master: PtyMaster,
     slave_fd: RawFd,
-    #[allow(dead_code)]
-    slave_name: String,
 }
 
 /// Create a PTY pair using POSIX openpty.
 fn openpty() -> Result<PtyPair, io::Error> {
     let mut master_fd: libc::c_int = -1;
     let mut slave_fd: libc::c_int = -1;
-    let mut slave_name: [libc::c_char; 256] = [0; 256];
 
     let result = unsafe {
         libc::openpty(
             &mut master_fd,
             &mut slave_fd,
-            slave_name.as_mut_ptr(),
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -237,16 +234,9 @@ fn openpty() -> Result<PtyPair, io::Error> {
         return Err(io::Error::last_os_error());
     }
 
-    let slave_name_str = unsafe {
-        std::ffi::CStr::from_ptr(slave_name.as_ptr())
-            .to_string_lossy()
-            .into_owned()
-    };
-
     Ok(PtyPair {
         master: PtyMaster::from_raw_fd(master_fd),
         slave_fd,
-        slave_name: slave_name_str,
     })
 }
 
@@ -423,9 +413,6 @@ pub struct PtyMultiplexer {
     watchtower_url: String,
     /// HTTP client for validation.
     client: reqwest::blocking::Client,
-    /// Validation timeout in milliseconds.
-    #[allow(dead_code)]
-    validation_timeout_ms: u64,
 }
 
 impl PtyMultiplexer {
@@ -458,7 +445,6 @@ impl PtyMultiplexer {
             mode: MultiplexerMode::Validation,
             watchtower_url: config.watchtower_url,
             client,
-            validation_timeout_ms: config.validation_timeout_ms,
         })
     }
 
@@ -810,5 +796,157 @@ mod tests {
         assert_eq!(MultiplexerMode::Validation, MultiplexerMode::Validation);
         assert_eq!(MultiplexerMode::Passthrough, MultiplexerMode::Passthrough);
         assert_ne!(MultiplexerMode::Validation, MultiplexerMode::Passthrough);
+    }
+
+    #[test]
+    fn test_verdict_creation() {
+        let verdict = Verdict {
+            allowed: false,
+            status: "BLOCK".to_string(),
+            reason: "Policy violation".to_string(),
+            confidence: "99.5%".to_string(),
+        };
+        assert!(!verdict.allowed);
+        assert_eq!(verdict.status, "BLOCK");
+        assert_eq!(verdict.reason, "Policy violation");
+        assert_eq!(verdict.confidence, "99.5%");
+    }
+
+    #[test]
+    fn test_verdict_clone() {
+        let v = Verdict {
+            allowed: true,
+            status: "ALLOW".to_string(),
+            reason: "Safe".to_string(),
+            confidence: "100%".to_string(),
+        };
+        let cloned = v.clone();
+        assert_eq!(cloned.allowed, v.allowed);
+        assert_eq!(cloned.status, v.status);
+    }
+
+    #[test]
+    fn test_pty_multiplexer_config_creation() {
+        let config = PtyMultiplexerConfig {
+            shell: "/bin/zsh".to_string(),
+            env_vars: vec![("PATH".to_string(), "/usr/bin".to_string())],
+            passthrough_commands: vec!["vim".to_string()],
+            watchtower_url: "http://localhost:9000".to_string(),
+            validation_timeout_ms: 5000,
+        };
+
+        assert_eq!(config.shell, "/bin/zsh");
+        assert_eq!(config.env_vars.len(), 1);
+        assert_eq!(config.passthrough_commands.len(), 1);
+        assert_eq!(config.watchtower_url, "http://localhost:9000");
+        assert_eq!(config.validation_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn test_pty_multiplexer_config_default_passthrough_commands() {
+        let config = PtyMultiplexerConfig::default();
+        // Should include common interactive commands
+        assert!(config.passthrough_commands.contains(&"vim".to_string()));
+        assert!(config.passthrough_commands.contains(&"less".to_string()));
+        assert!(config.passthrough_commands.contains(&"top".to_string()));
+        assert!(config.passthrough_commands.contains(&"man".to_string()));
+    }
+
+    #[test]
+    fn test_pty_multiplexer_config_default_timeout() {
+        let config = PtyMultiplexerConfig::default();
+        assert_eq!(config.validation_timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn test_passthrough_detector_empty_command() {
+        let detector = PassthroughDetector::default();
+        // Empty string should not trigger passthrough
+        assert!(!detector.should_enter_passthrough(""));
+    }
+
+    #[test]
+    fn test_passthrough_detector_full_path_not_supported() {
+        let detector = PassthroughDetector::default();
+        // Full paths like /usr/bin/vim do NOT trigger passthrough
+        // Only bare command names match
+        assert!(!detector.should_enter_passthrough("/usr/bin/vim"));
+    }
+
+    #[test]
+    fn test_passthrough_detector_with_args() {
+        let detector = PassthroughDetector::default();
+        // Commands with arguments
+        assert!(detector.should_enter_passthrough("vim -R file.txt"));
+        assert!(detector.should_enter_passthrough("less -N /etc/passwd"));
+    }
+
+    #[test]
+    fn test_multiplexer_error_display() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let err = PtyMultiplexerError::Io(io_err);
+        let display = format!("{}", err);
+        assert!(display.contains("IO error"));
+    }
+
+    #[test]
+    fn test_multiplexer_error_channel_display() {
+        let err = PtyMultiplexerError::ChannelError("channel closed".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("Channel error"));
+    }
+
+    #[test]
+    fn test_multiplexer_error_validation_display() {
+        let err = PtyMultiplexerError::ValidationError("timeout".to_string());
+        let display = format!("{}", err);
+        assert!(display.contains("Validation error"));
+    }
+
+    #[test]
+    fn test_multiplexer_error_pty_creation_display() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let err = PtyMultiplexerError::PtyCreation(io_err);
+        let display = format!("{}", err);
+        assert!(display.contains("PTY creation failed"));
+    }
+
+    #[test]
+    fn test_multiplexer_error_terminal_attrs_display() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "tcsetattr failed");
+        let err = PtyMultiplexerError::TerminalAttrs(io_err);
+        let display = format!("{}", err);
+        assert!(display.contains("Terminal attributes error"));
+    }
+
+    #[test]
+    fn test_multiplexer_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block");
+        let err: PtyMultiplexerError = io_err.into();
+        assert!(matches!(err, PtyMultiplexerError::Io(_)));
+    }
+
+    #[test]
+    fn test_multiplexer_error_from_input_buffer_error() {
+        use crate::input_buffer::InputBufferError;
+        let buf_err = InputBufferError::InvalidUtf8;
+        let err: PtyMultiplexerError = buf_err.into();
+        assert!(matches!(err, PtyMultiplexerError::BufferError(_)));
+    }
+
+    #[test]
+    fn test_passthrough_detector_custom_commands() {
+        let config = PtyMultiplexerConfig {
+            shell: "/bin/bash".to_string(),
+            env_vars: vec![],
+            passthrough_commands: vec!["myapp".to_string(), "custom-tui".to_string()],
+            watchtower_url: "http://localhost:3000".to_string(),
+            validation_timeout_ms: 5000,
+        };
+
+        let detector = PassthroughDetector::new(config.passthrough_commands);
+        assert!(detector.should_enter_passthrough("myapp"));
+        assert!(detector.should_enter_passthrough("custom-tui"));
+        assert!(!detector.should_enter_passthrough("vim")); // not in custom list
     }
 }

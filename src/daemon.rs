@@ -406,4 +406,134 @@ mod tests {
         };
         assert!(!manager.is_running());
     }
+
+    #[test]
+    fn test_daemon_read_pid_returns_none_when_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = DaemonManager {
+            pid_path: dir.path().join("sevorix.pid"),
+            log_path: dir.path().join("sevorix.log"),
+        };
+        assert!(manager.read_pid().is_none());
+    }
+
+    #[test]
+    fn test_daemon_read_pid_returns_value_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("sevorix.pid");
+        fs::write(&pid_path, "99999").unwrap();
+        let manager = DaemonManager {
+            pid_path,
+            log_path: dir.path().join("sevorix.log"),
+        };
+        assert_eq!(manager.read_pid(), Some(99999));
+    }
+
+    #[test]
+    fn test_daemon_read_pid_returns_none_for_invalid_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("sevorix.pid");
+        fs::write(&pid_path, "not-a-pid").unwrap();
+        let manager = DaemonManager {
+            pid_path,
+            log_path: dir.path().join("sevorix.log"),
+        };
+        assert!(manager.read_pid().is_none());
+    }
+
+    #[test]
+    fn test_daemon_stop_no_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = DaemonManager {
+            pid_path: dir.path().join("sevorix.pid"),
+            log_path: dir.path().join("sevorix.log"),
+        };
+        // Should not error when there's no PID file
+        let result = manager.stop();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_daemon_status_no_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = DaemonManager {
+            pid_path: dir.path().join("sevorix.pid"),
+            log_path: dir.path().join("sevorix.log"),
+        };
+        // Should not panic when there's no PID file
+        manager.status();
+    }
+
+    #[test]
+    fn test_ebpf_daemon_read_pid_returns_none_when_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = EbpfDaemonManager {
+            pid_path: dir.path().join("sevorix-ebpf.pid"),
+            log_path: dir.path().join("sevorix-ebpf.log"),
+        };
+        assert!(manager.read_pid().is_none());
+    }
+
+    #[test]
+    fn test_ebpf_daemon_read_pid_returns_value_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("sevorix-ebpf.pid");
+        fs::write(&pid_path, "88888").unwrap();
+        let manager = EbpfDaemonManager {
+            pid_path,
+            log_path: dir.path().join("sevorix-ebpf.log"),
+        };
+        assert_eq!(manager.read_pid(), Some(88888));
+    }
+
+    #[test]
+    fn test_ebpf_daemon_stop_no_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = EbpfDaemonManager {
+            pid_path: dir.path().join("sevorix-ebpf.pid"),
+            log_path: dir.path().join("sevorix-ebpf.log"),
+        };
+        let result = manager.stop();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ebpf_daemon_status_no_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = EbpfDaemonManager {
+            pid_path: dir.path().join("sevorix-ebpf.pid"),
+            log_path: dir.path().join("sevorix-ebpf.log"),
+        };
+        // Should not panic
+        manager.status();
+    }
+
+    #[test]
+    fn test_poll_pid_file_returns_none_when_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.pid");
+        let result = poll_pid_file(&path, 1, 1);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_poll_pid_file_returns_pid_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.pid");
+        fs::write(&path, "12345").unwrap();
+        let result = poll_pid_file(&path, 3, 1);
+        assert_eq!(result, Some(12345));
+    }
+
+    #[test]
+    fn test_is_watchtower_running_returns_bool() {
+        // is_watchtower_running should return a bool without panicking
+        let _result = is_watchtower_running();
+    }
+
+    #[test]
+    fn test_is_ebpf_daemon_running_returns_bool() {
+        // is_ebpf_daemon_running should return a bool without panicking
+        let _result = is_ebpf_daemon_running();
+    }
 }

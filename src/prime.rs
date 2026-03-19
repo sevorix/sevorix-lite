@@ -279,4 +279,89 @@ mod tests {
         assert!(normalized != "guarded-agent");
         assert!(normalized != "guard");
     }
+
+    #[test]
+    fn test_policy_manager_prime_contains_json_schema() {
+        assert!(POLICY_MANAGER_PRIME.contains("\"type\""));
+        assert!(POLICY_MANAGER_PRIME.contains("\"action\""));
+        assert!(POLICY_MANAGER_PRIME.contains("\"context\""));
+    }
+
+    #[test]
+    fn test_policy_manager_prime_contains_match_types() {
+        assert!(POLICY_MANAGER_PRIME.contains("Simple"));
+        assert!(POLICY_MANAGER_PRIME.contains("Regex"));
+        assert!(POLICY_MANAGER_PRIME.contains("Executable"));
+    }
+
+    #[test]
+    fn test_policy_manager_prime_contains_actions() {
+        assert!(POLICY_MANAGER_PRIME.contains("Block"));
+        assert!(POLICY_MANAGER_PRIME.contains("Flag"));
+        assert!(POLICY_MANAGER_PRIME.contains("Allow"));
+    }
+
+    #[test]
+    fn test_policy_manager_prime_contains_contexts() {
+        assert!(POLICY_MANAGER_PRIME.contains("Shell"));
+        assert!(POLICY_MANAGER_PRIME.contains("Network"));
+        assert!(POLICY_MANAGER_PRIME.contains("Syscall"));
+    }
+
+    #[test]
+    fn test_policy_manager_prime_contains_workflow() {
+        assert!(POLICY_MANAGER_PRIME.contains("Workflow"));
+        assert!(POLICY_MANAGER_PRIME.contains("hub login"));
+        assert!(POLICY_MANAGER_PRIME.contains("hub pull"));
+    }
+
+    #[test]
+    fn test_guarded_agent_prime_contains_verdicts() {
+        assert!(GUARDED_AGENT_PRIME.contains("BLOCK"));
+        assert!(GUARDED_AGENT_PRIME.contains("ALLOW"));
+        assert!(GUARDED_AGENT_PRIME.contains("FLAG"));
+    }
+
+    #[test]
+    fn test_guarded_agent_prime_contains_proxy_info() {
+        assert!(GUARDED_AGENT_PRIME.contains("403"));
+        assert!(GUARDED_AGENT_PRIME.contains("proxy"));
+    }
+
+    #[test]
+    fn test_guarded_agent_prime_contains_session_commands() {
+        assert!(GUARDED_AGENT_PRIME.contains("sevorix status"));
+        assert!(GUARDED_AGENT_PRIME.contains("sevorix validate"));
+    }
+
+    #[test]
+    fn test_policy_manager_prime_is_nonempty() {
+        assert!(!POLICY_MANAGER_PRIME.is_empty());
+        assert!(POLICY_MANAGER_PRIME.len() > 100);
+    }
+
+    #[test]
+    fn test_guarded_agent_prime_is_nonempty() {
+        assert!(!GUARDED_AGENT_PRIME.is_empty());
+        assert!(GUARDED_AGENT_PRIME.len() > 100);
+    }
+
+    #[test]
+    fn test_print_prime_normalization() {
+        // Test the normalization logic used internally
+        // "PM" (uppercase) should normalize to "pm" which matches the alias
+        let input = "PM";
+        let normalized = input.to_lowercase();
+        let normalized = normalized.trim();
+        assert_eq!(normalized, "pm");
+    }
+
+    #[test]
+    fn test_print_prime_whitespace_trim() {
+        // Leading/trailing whitespace should be trimmed
+        let input = "  policy-manager  ";
+        let normalized = input.to_lowercase();
+        let normalized_trimmed = normalized.trim();
+        assert_eq!(normalized_trimmed, "policy-manager");
+    }
 }

@@ -324,16 +324,6 @@ fn handle_session(cmd: SessionCommands) {
     });
 }
 
-/// Parse allowed roles from CLI string
-#[allow(dead_code)]
-fn parse_allowed_roles(roles_str: Option<&str>) -> Option<Vec<String>> {
-    roles_str.map(|s| {
-        s.split(',')
-            .map(|r| r.trim().to_string())
-            .collect::<Vec<String>>()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,50 +678,6 @@ mod tests {
         } else {
             panic!("Expected Integrations command");
         }
-    }
-
-    #[test]
-    fn test_parse_allowed_roles_single() {
-        let roles = parse_allowed_roles(Some("admin"));
-        assert_eq!(roles, Some(vec!["admin".to_string()]));
-    }
-
-    #[test]
-    fn test_parse_allowed_roles_multiple() {
-        let roles = parse_allowed_roles(Some("admin,dev,user"));
-        assert_eq!(
-            roles,
-            Some(vec![
-                "admin".to_string(),
-                "dev".to_string(),
-                "user".to_string()
-            ])
-        );
-    }
-
-    #[test]
-    fn test_parse_allowed_roles_with_spaces() {
-        let roles = parse_allowed_roles(Some("admin , dev , user"));
-        assert_eq!(
-            roles,
-            Some(vec![
-                "admin".to_string(),
-                "dev".to_string(),
-                "user".to_string()
-            ])
-        );
-    }
-
-    #[test]
-    fn test_parse_allowed_roles_none() {
-        let roles = parse_allowed_roles(None);
-        assert!(roles.is_none());
-    }
-
-    #[test]
-    fn test_parse_allowed_roles_empty() {
-        let roles = parse_allowed_roles(Some(""));
-        assert_eq!(roles, Some(vec!["".to_string()]));
     }
 
     #[test]

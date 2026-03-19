@@ -154,8 +154,6 @@ impl Drop for PtyMaster {
 struct PtyPair {
     master: PtyMaster,
     slave_fd: RawFd,
-    #[allow(dead_code)]
-    slave_name: String,
 }
 
 /// Create a PTY pair using POSIX openpty.
@@ -165,13 +163,12 @@ struct PtyPair {
 fn openpty() -> Result<PtyPair, std::io::Error> {
     let mut master_fd: libc::c_int = -1;
     let mut slave_fd: libc::c_int = -1;
-    let mut slave_name: [libc::c_char; 256] = [0; 256];
 
     let result = unsafe {
         libc::openpty(
             &mut master_fd,
             &mut slave_fd,
-            slave_name.as_mut_ptr(),
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -181,17 +178,9 @@ fn openpty() -> Result<PtyPair, std::io::Error> {
         return Err(std::io::Error::last_os_error());
     }
 
-    // Convert slave name to string
-    let slave_name_str = unsafe {
-        std::ffi::CStr::from_ptr(slave_name.as_ptr())
-            .to_string_lossy()
-            .into_owned()
-    };
-
     Ok(PtyPair {
         master: PtyMaster::from_raw_fd(master_fd),
         slave_fd,
-        slave_name: slave_name_str,
     })
 }
 

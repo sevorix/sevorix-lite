@@ -1867,7 +1867,6 @@ mod tests {
         })
     }
 
-    #[allow(dead_code)]
     fn create_test_app_state_with_path(path: PathBuf) -> Arc<AppState> {
         let (tx, _) = broadcast::channel(100);
         Arc::new(AppState {
