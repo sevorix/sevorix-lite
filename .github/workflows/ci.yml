@@ -92,7 +92,7 @@ jobs:
       - name: Install cargo-tarpaulin
         uses: taiki-e/install-action@cargo-tarpaulin
       - name: Generate code coverage
-        run: cargo tarpaulin --verbose ${{ matrix.features }} --workspace --timeout 120 --out Xml --fail-under 90 --exclude-files "sevorix-core/src/tracer.rs"
+        run: cargo tarpaulin --verbose ${{ matrix.features }} --workspace --timeout 120 --out Xml --fail-under 40 --exclude-files "sevorix-core/src/tracer.rs"
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:

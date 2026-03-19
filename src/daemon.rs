@@ -306,7 +306,11 @@ mod tests {
 
     #[test]
     fn test_is_running_no_pid_file() {
-        let manager = DaemonManager::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let manager = DaemonManager {
+            pid_path: dir.path().join("sevorix.pid"),
+            log_path: dir.path().join("sevorix.log"),
+        };
         // When no PID file exists, is_running should return false
         assert!(!manager.is_running());
     }
@@ -395,7 +399,11 @@ mod tests {
 
     #[test]
     fn test_ebpf_daemon_is_running_no_pid_file() {
-        let manager = EbpfDaemonManager::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let manager = EbpfDaemonManager {
+            pid_path: dir.path().join("sevorix-ebpf.pid"),
+            log_path: dir.path().join("sevorix-ebpf.log"),
+        };
         assert!(!manager.is_running());
     }
 }
