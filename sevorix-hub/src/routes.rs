@@ -432,7 +432,7 @@ pub async fn push_artifact(
     // Resolve artifact type and enforce set rules.
     let artifact_type_str = match req.artifact_type.as_deref().unwrap_or("artifact") {
         "set" => {
-            if req.dependencies.as_ref().map_or(true, |d| d.is_empty()) {
+            if req.dependencies.as_ref().is_none_or(|d| d.is_empty()) {
                 return Err(AppError::BadRequest(
                     "artifact sets must declare at least one member dependency".to_string(),
                 ));

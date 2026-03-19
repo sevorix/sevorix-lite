@@ -7,18 +7,13 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// Visibility levels for artifacts
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
+    #[default]
     Public,
     Private,
     Draft,
-}
-
-impl Default for Visibility {
-    fn default() -> Self {
-        Self::Public
-    }
 }
 
 impl std::fmt::Display for Visibility {
@@ -45,17 +40,12 @@ impl FromStr for Visibility {
 }
 
 /// Type of artifact: regular artifact or a set (collection of member artifacts).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ArtifactType {
+    #[default]
     Artifact,
     Set,
-}
-
-impl Default for ArtifactType {
-    fn default() -> Self {
-        Self::Artifact
-    }
 }
 
 impl std::fmt::Display for ArtifactType {
@@ -79,18 +69,13 @@ impl FromStr for ArtifactType {
 }
 
 /// Endorsement levels for artifacts
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EndorsementLevel {
+    #[default]
     Verified,
     TrustedAuthor,
     Official,
-}
-
-impl Default for EndorsementLevel {
-    fn default() -> Self {
-        Self::Verified
-    }
 }
 
 impl std::fmt::Display for EndorsementLevel {

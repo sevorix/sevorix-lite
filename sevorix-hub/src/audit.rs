@@ -87,7 +87,7 @@ impl AuditEvent {
     pub fn log(&self) {
         let json = serde_json::to_string(self).unwrap_or_else(|e| {
             tracing::error!("failed to serialize audit event: {}", e);
-            format!("{{\"error\": \"serialization failed\"}}")
+            "{\"error\": \"serialization failed\"}".to_string()
         });
         tracing::info!(target: "audit", "{}", json);
     }

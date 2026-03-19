@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
             tracing::info!("using GCS storage backend: {}", bucket);
             Store::gcs(bucket)
         }
-        "filesystem" | _ => {
+        _ => {
             let artifacts_dir = expand_home(&cli.artifacts_dir)?;
             tokio::fs::create_dir_all(&artifacts_dir).await?;
             tracing::info!("using filesystem storage: {:?}", artifacts_dir);
