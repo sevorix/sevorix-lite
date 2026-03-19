@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn test_real_connect_handshake() {
     // 1. Setup App State
     let (tx, _rx) = tokio::sync::broadcast::channel(1);

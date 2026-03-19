@@ -28,6 +28,7 @@ async fn setup_harness() -> TestHarness {
 
 /// 14.1 — GREEN lane latency: safe payloads should have average round-trip < 50ms.
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn test_14_1_green_lane_latency() {
     let h = setup_harness().await;
     let n = 20; // Reduced from 100 for test speed
@@ -54,6 +55,7 @@ async fn test_14_1_green_lane_latency() {
 
 /// 14.2 — RED lane latency: blocked payloads should be rejected immediately, average < 20ms.
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn test_14_2_red_lane_latency() {
     let h = setup_harness().await;
     let n = 20;
@@ -81,6 +83,7 @@ async fn test_14_2_red_lane_latency() {
 /// 14.3 — YELLOW lane: a flagged request is held until an operator decision is made;
 /// total elapsed time reflects the deliberate hold period.
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn test_14_3_yellow_lane_holds_until_decision() {
     let h = TestHarness::with_role(Some("test".to_string())).await;
     h.add_policy_direct(Policy {
@@ -138,6 +141,7 @@ async fn test_14_3_yellow_lane_holds_until_decision() {
 
 /// 14.4 — Concurrent GREEN lane requests are all handled and each stays under 50ms on average.
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn test_14_4_concurrent_green_lane_latency() {
     let h = std::sync::Arc::new(setup_harness().await);
     let n = 10;
