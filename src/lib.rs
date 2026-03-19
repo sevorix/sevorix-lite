@@ -441,6 +441,38 @@ pub fn validate_startup_config() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the Axum router with all routes and the provided shared state.
+/// Extracted from `run_server` so tests can spin up an in-process server.
+pub fn build_router(state: Arc<AppState>) -> Router {
+    let app = Router::new()
+        .route("/analyze", post(analyze_intent))
+        .route("/analyze-syscall", post(analyze_syscall))
+        .route("/syscall-policy", get(syscall_policy_handler))
+        .route("/policies/ebpf", get(ebpf_policies_handler))
+        .route("/api/ebpf-event", post(ebpf_event_handler))
+        .route("/api/policies/reload", post(reload_policies_handler))
+        .route("/ws", get(ws_handler))
+        .route("/api/events", get(get_recent_events))
+        .route("/api/decide", post(decide_handler))
+        .route("/api/pause", post(pause_handler))
+        .route("/api/stats", get(get_stats_handler))
+        .route("/api/sessions", get(get_sessions_handler))
+        .route("/dashboard/*file", get(static_handler))
+        // also redirect /dashboard to /dashboard/index.html
+        .route("/dashboard", get(dashboard_redirect))
+        .route("/api/session/register", post(session_register))
+        .route("/api/session/unregister", post(session_unregister))
+        .route("/api/session/set-role", post(session_set_role))
+        .route("/api/active-sessions", get(active_sessions_handler));
+
+
+    app
+        .route("/health", get(health_handler))
+        .route("/api/version", get(get_version))
+        .fallback(proxy_handler)
+        .with_state(state)
+}
+
 pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uuid) -> anyhow::Result<()> {
     // Setup paths
     let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
@@ -563,33 +595,7 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
     });
 
     // Define the Routes
-    let app = Router::new()
-        .route("/analyze", post(analyze_intent))
-        .route("/analyze-syscall", post(analyze_syscall))
-        .route("/syscall-policy", get(syscall_policy_handler))
-        .route("/policies/ebpf", get(ebpf_policies_handler))
-        .route("/api/ebpf-event", post(ebpf_event_handler))
-        .route("/api/policies/reload", post(reload_policies_handler))
-        .route("/ws", get(ws_handler))
-        .route("/api/events", get(get_recent_events))
-        .route("/api/decide", post(decide_handler))
-        .route("/api/pause", post(pause_handler))
-        .route("/api/stats", get(get_stats_handler))
-        .route("/api/sessions", get(get_sessions_handler))
-        .route("/dashboard/*file", get(static_handler))
-        // also redirect /dashboard to /dashboard/index.html
-        .route("/dashboard", get(dashboard_redirect))
-        .route("/api/session/register", post(session_register))
-        .route("/api/session/unregister", post(session_unregister))
-        .route("/api/session/set-role", post(session_set_role))
-        .route("/api/active-sessions", get(active_sessions_handler));
-
-
-    let app = app
-        .route("/health", get(health_handler))
-        .route("/api/version", get(get_version))
-        .fallback(proxy_handler)
-        .with_state(app_state);
+    let app = build_router(app_state.clone());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
 

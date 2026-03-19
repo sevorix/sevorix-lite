@@ -1,0 +1,40 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: E2E (${{ matrix.edition }} edition)
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        include:
+          - edition: lite
+            features: ''
+          - edition: pro
+            features: '--features pro'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Build the sevorix binary so e2e_cli and e2e_integrations can find it
+      - name: Build binary
+        run: cargo build ${{ matrix.features }}
+
+      - name: Run e2e tests
+        run: cargo test --test 'e2e_*' ${{ matrix.features }}

@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use sevorix_watchtower::{handle_config, handle_integrations, handle_validate, logging::{init_logging, init_logging_with_session}, run_server, validate_startup_config, Cli, Commands, DaemonManager, HubCommands, SessionCommands};
 use sevorix_watchtower::prime::print_prime;
 use tracing::info;
@@ -128,11 +128,15 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Validate { command, role, context }) => handle_validate(command, role, context),
         Some(Commands::Prime { agent_type }) => print_prime(&agent_type),
         Some(Commands::Session { subcmd }) => handle_session(subcmd),
-        Some(Commands::Run) | None => {
-            // Default foreground run
+        Some(Commands::Run) => {
+            // Explicit foreground run
             let (_guard, session_id) = init_logging();
             info!("Running in foreground. Session ID: {}", session_id);
             start_runtime(allowed_roles, session_id)?;
+        }
+        None => {
+            Cli::command().print_help()?;
+            println!();
         }
     }
     Ok(())
