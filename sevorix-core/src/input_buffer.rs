@@ -318,7 +318,10 @@ impl InputBuffer {
             // Check for arrow keys and home/end
             match &self.escape_buffer[..] {
                 // Arrow keys: ESC [ A/B/C/D
-                [0x1b, b'[', b'A'] | [0x1b, b'[', b'B'] | [0x1b, b'[', b'C'] | [0x1b, b'[', b'D'] => {
+                [0x1b, b'[', b'A']
+                | [0x1b, b'[', b'B']
+                | [0x1b, b'[', b'C']
+                | [0x1b, b'[', b'D'] => {
                     output.write_all(&seq)?;
                     output.flush()?;
                     Ok(InputAction::ForwardToBash(seq))
@@ -352,7 +355,11 @@ impl InputBuffer {
     }
 
     /// Process a character in passthrough mode.
-    fn handle_passthrough_char<W: Write>(&mut self, c: char, output: &mut W) -> Result<InputAction> {
+    fn handle_passthrough_char<W: Write>(
+        &mut self,
+        c: char,
+        output: &mut W,
+    ) -> Result<InputAction> {
         // In passthrough mode, forward everything directly to bash
         let mut buf = [0u8; 4];
         let bytes = c.encode_utf8(&mut buf);
@@ -615,7 +622,10 @@ mod tests {
 
         // Try to add more - should fail
         let result = buf.handle_char('!', &mut output);
-        assert!(matches!(result, Err(InputBufferError::BufferOverflow { .. })));
+        assert!(matches!(
+            result,
+            Err(InputBufferError::BufferOverflow { .. })
+        ));
     }
 
     #[test]

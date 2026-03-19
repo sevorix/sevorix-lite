@@ -1,10 +1,10 @@
 mod common;
 use common::harness::TestHarness;
 use common::ws_client::WsClient;
-use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 use serde_json::json;
-use tokio::time::Instant;
+use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 use std::time::Duration;
+use tokio::time::Instant;
 
 async fn setup_harness() -> TestHarness {
     let h = TestHarness::with_role(Some("test".to_string())).await;
@@ -42,7 +42,11 @@ async fn test_14_1_green_lane_latency() {
     let avg_ms = total_ms / n as u128;
     println!("GREEN lane avg latency: {}ms", avg_ms);
     // Should be under 50ms average on localhost
-    assert!(avg_ms < 50, "GREEN lane avg latency {}ms exceeds 50ms threshold", avg_ms);
+    assert!(
+        avg_ms < 50,
+        "GREEN lane avg latency {}ms exceeds 50ms threshold",
+        avg_ms
+    );
 }
 
 /// 14.2 — RED lane latency: blocked payloads should be rejected immediately, average < 20ms.
@@ -64,7 +68,11 @@ async fn test_14_2_red_lane_latency() {
     let avg_ms = total_ms / n as u128;
     println!("RED lane avg latency: {}ms", avg_ms);
     // Immediate block should be very fast
-    assert!(avg_ms < 20, "RED lane avg latency {}ms exceeds 20ms threshold", avg_ms);
+    assert!(
+        avg_ms < 20,
+        "RED lane avg latency {}ms exceeds 20ms threshold",
+        avg_ms
+    );
 }
 
 /// 14.3 — YELLOW lane: a flagged request is held until an operator decision is made;

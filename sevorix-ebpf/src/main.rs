@@ -142,7 +142,11 @@ pub fn sys_enter(ctx: TracePointContext) -> u32 {
         }
 
         // Check per-process denylist — log the attempt for audit, but cannot block.
-        let policy_key = PolicyKey { pid, _padding: 0, id: syscall_nr };
+        let policy_key = PolicyKey {
+            pid,
+            _padding: 0,
+            id: syscall_nr,
+        };
         if SYSCALL_DENYLIST.get(&policy_key).is_some() {
             let event = SyscallEvent {
                 event_type: SyscallEvent::EVENT_TYPE,
@@ -280,7 +284,11 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> i32 {
     }
 
     // Check per-process denylist.
-    let key = PolicyKey { pid, _padding: 0, id: execve_nr };
+    let key = PolicyKey {
+        pid,
+        _padding: 0,
+        id: execve_nr,
+    };
     if let Some(&errno) = SYSCALL_DENYLIST.get(&key) {
         return -errno;
     }
@@ -383,10 +391,23 @@ unsafe fn try_lsm_socket_connect(ctx: LsmContext) -> i32 {
     let dst_port = u16::from_be(dst_port_be);
 
     // Check NET_DENYLIST (protocol=0 for any, protocol=6 for TCP).
-    let key_any = NetworkKey { dst_ip, dst_port, protocol: 0, _padding: 0 };
-    let key_tcp = NetworkKey { dst_ip, dst_port, protocol: 6, _padding: 0 };
+    let key_any = NetworkKey {
+        dst_ip,
+        dst_port,
+        protocol: 0,
+        _padding: 0,
+    };
+    let key_tcp = NetworkKey {
+        dst_ip,
+        dst_port,
+        protocol: 6,
+        _padding: 0,
+    };
 
-    if let Some(&errno) = NET_DENYLIST.get(&key_any).or_else(|| NET_DENYLIST.get(&key_tcp)) {
+    if let Some(&errno) = NET_DENYLIST
+        .get(&key_any)
+        .or_else(|| NET_DENYLIST.get(&key_tcp))
+    {
         // Log the blocked connection event
         let event = NetworkEvent {
             event_type: NetworkEvent::EVENT_TYPE,
@@ -484,7 +505,10 @@ unsafe fn try_sock_ops(ctx: SockOpsContext) -> u32 {
     }
 
     // Check global denylist
-    if let Some(&_err) = NET_DENYLIST.get(&key_any).or_else(|| NET_DENYLIST.get(&key_tcp)) {
+    if let Some(&_err) = NET_DENYLIST
+        .get(&key_any)
+        .or_else(|| NET_DENYLIST.get(&key_tcp))
+    {
         // Log the denial event
         let event = NetworkEvent {
             event_type: NetworkEvent::EVENT_TYPE,
@@ -508,7 +532,8 @@ unsafe fn try_sock_ops(ctx: SockOpsContext) -> u32 {
     }
 
     // Check per-process denylist
-    if let Some(&_err) = PROCESS_NET_DENYLIST.get(&proc_key_any)
+    if let Some(&_err) = PROCESS_NET_DENYLIST
+        .get(&proc_key_any)
         .or_else(|| PROCESS_NET_DENYLIST.get(&proc_key_tcp))
     {
         let event = NetworkEvent {

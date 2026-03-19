@@ -278,8 +278,7 @@ mod tests {
     #[test]
     fn test_audit_event_partial_fields() {
         // Only username
-        let event = AuditEvent::new(AuditEventType::LoginFailure)
-            .username("partial_user");
+        let event = AuditEvent::new(AuditEventType::LoginFailure).username("partial_user");
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"username\":\"partial_user\""));
         assert!(!json.contains("\"ip\""));

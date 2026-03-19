@@ -4,10 +4,7 @@
 //! via seccomp-unotify. Unlike single-command execution, PTY-backed shells
 //! provide proper terminal handling for interactive use.
 
-use crate::seccomp::{
-    SeccompDecision, SeccompNotifier, SeccompNotifierError,
-    SyscallCategory,
-};
+use crate::seccomp::{SeccompDecision, SeccompNotifier, SeccompNotifierError, SyscallCategory};
 use crate::SyscallEvent;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{close, dup2, fork, setsid, ForkResult, Pid};
@@ -524,8 +521,7 @@ fn run_pty_notification_loop(
     event_tx: Sender<PtySyscallEvent>,
 ) -> Result<(), SeccompNotifierError> {
     use crate::seccomp::{
-        build_syscall_event, raw_recv_notification, raw_respond_allow,
-        syscall_name,
+        build_syscall_event, raw_recv_notification, raw_respond_allow, syscall_name,
     };
 
     // Clone/fork syscall numbers on x86_64
@@ -550,7 +546,11 @@ fn run_pty_notification_loop(
 
         // Poll with timeout so we can periodically check if the child exited.
         let poll_ret = unsafe {
-            let mut pfd = libc::pollfd { fd: notifier_fd, events: libc::POLLIN, revents: 0 };
+            let mut pfd = libc::pollfd {
+                fd: notifier_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             libc::poll(&mut pfd as *mut libc::pollfd, 1, 200)
         };
         if poll_ret < 0 {
@@ -579,7 +579,11 @@ fn run_pty_notification_loop(
         // These syscalls must complete immediately for process management to work.
         // Blocking them causes deadlock because the parent may be waiting for the
         // child to start, but the child can't start if its fork/exec is blocked.
-        if syscall_nr == SYS_CLONE || syscall_nr == SYS_FORK || syscall_nr == SYS_VFORK || syscall_nr == SYS_EXECVE {
+        if syscall_nr == SYS_CLONE
+            || syscall_nr == SYS_FORK
+            || syscall_nr == SYS_VFORK
+            || syscall_nr == SYS_EXECVE
+        {
             raw_respond_allow(notifier_fd, req.id);
             continue;
         }

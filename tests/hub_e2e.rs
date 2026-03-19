@@ -98,7 +98,8 @@ async fn test_hub_e2e_basic_push_and_pull() {
     assert!(pull_resp.dependencies.is_empty());
 
     // Verify content round-trips correctly
-    let content_val: serde_json::Value = serde_json::from_str(&policy_content("e2e-basic")).unwrap();
+    let content_val: serde_json::Value =
+        serde_json::from_str(&policy_content("e2e-basic")).unwrap();
     assert_eq!(pull_resp.content, content_val);
 }
 
@@ -311,7 +312,11 @@ async fn test_hub_e2e_artifact_set_push_and_pull() {
     assert_eq!(push_resp.artifact_type, "set");
     assert_eq!(push_resp.dependencies.len(), 2);
 
-    let dep_names: Vec<&str> = push_resp.dependencies.iter().map(|d| d.name.as_str()).collect();
+    let dep_names: Vec<&str> = push_resp
+        .dependencies
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
     assert!(dep_names.contains(&member_a.as_str()));
     assert!(dep_names.contains(&member_b.as_str()));
 

@@ -226,14 +226,26 @@ fn test_9_5_status_all_shows_all_integrations() {
     let (stdout, stderr, code) = run(&["integrations", "status"]);
     println!("stdout:\n{}\nstderr:\n{}", stdout, stderr);
 
-    assert_eq!(code, 0, "status with no args should exit 0; code={code}, stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "status with no args should exit 0; code={code}, stderr={stderr}"
+    );
     assert!(
         stdout.contains("Integration Status:"),
         "expected 'Integration Status:' header; got: {stdout}"
     );
-    assert!(stdout.contains("Claude Code"), "expected 'Claude Code' in all-status; got: {stdout}");
-    assert!(stdout.contains("Codex"), "expected 'Codex' in all-status; got: {stdout}");
-    assert!(stdout.contains("OpenClaw"), "expected 'OpenClaw' in all-status; got: {stdout}");
+    assert!(
+        stdout.contains("Claude Code"),
+        "expected 'Claude Code' in all-status; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Codex"),
+        "expected 'Codex' in all-status; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("OpenClaw"),
+        "expected 'OpenClaw' in all-status; got: {stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------

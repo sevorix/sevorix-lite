@@ -1,6 +1,6 @@
 use crate::error::{AppError, AppResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 /// Compute the SHA-256 hash of `data` and return it as a 64-char lowercase hex string.
@@ -32,11 +32,7 @@ pub fn parse_public_key(b64: &str) -> AppResult<VerifyingKey> {
 /// `sig_b64` is the base64-encoded 64-byte Ed25519 signature.
 ///
 /// Returns `Ok(true)` if the signature is valid, `Ok(false)` if it is not.
-pub fn verify_signature(
-    key: &VerifyingKey,
-    hash_hex: &str,
-    sig_b64: &str,
-) -> AppResult<bool> {
+pub fn verify_signature(key: &VerifyingKey, hash_hex: &str, sig_b64: &str) -> AppResult<bool> {
     let sig_bytes = STANDARD
         .decode(sig_b64)
         .map_err(|e| AppError::BadRequest(format!("invalid signature encoding: {e}")))?;
@@ -231,7 +227,10 @@ mod tests {
 
         let result = verify_signature(&verifying_key, &hash_hex, &sig_b64);
         assert!(result.is_ok());
-        assert!(!result.unwrap(), "expected corrupted signature to be invalid");
+        assert!(
+            !result.unwrap(),
+            "expected corrupted signature to be invalid"
+        );
     }
 
     #[test]
@@ -247,7 +246,10 @@ mod tests {
 
         let result = verify_signature(&wrong_verifying_key, &hash_hex, &sig_b64);
         assert!(result.is_ok());
-        assert!(!result.unwrap(), "expected verification with wrong key to fail");
+        assert!(
+            !result.unwrap(),
+            "expected verification with wrong key to fail"
+        );
     }
 
     #[test]

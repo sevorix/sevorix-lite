@@ -1,7 +1,7 @@
 mod common;
 use common::harness::TestHarness;
-use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 use serde_json::json;
+use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -203,7 +203,10 @@ async fn test_2_8_missing_payload_field() {
         .unwrap();
 
     let status = resp.status().as_u16();
-    assert_ne!(status, 500, "missing payload should not cause a 500 error; got {status}");
+    assert_ne!(
+        status, 500,
+        "missing payload should not cause a 500 error; got {status}"
+    );
 }
 
 // ── 2.9 – agent_id field is accepted ─────────────────────────────────────────

@@ -134,8 +134,9 @@ impl Default for PtyMultiplexerConfig {
         Self {
             shell: "/bin/bash".to_string(),
             env_vars: Vec::new(),
-            passthrough_commands: ["vim", "vi", "nvim", "less", "more", "man",
-                "top", "htop", "btop", "screen", "tmux"]
+            passthrough_commands: [
+                "vim", "vi", "nvim", "less", "more", "man", "top", "htop", "btop", "screen", "tmux",
+            ]
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -274,10 +275,7 @@ impl SavedTerminal {
         // Leak the file to prevent it from being closed (we don't own stdin)
         let _ = file.into_raw_fd();
 
-        Ok(Self {
-            fd,
-            original_attrs,
-        })
+        Ok(Self { fd, original_attrs })
     }
 
     /// Restore original terminal state.
@@ -393,9 +391,10 @@ impl PassthroughDetector {
         let cmd_lower = command.to_lowercase();
         let first_word = cmd_lower.split_whitespace().next().unwrap_or("");
 
-        self.passthrough_commands
-            .iter()
-            .any(|pc| first_word == pc.to_lowercase() || first_word.starts_with(&format!("{} ", pc.to_lowercase())))
+        self.passthrough_commands.iter().any(|pc| {
+            first_word == pc.to_lowercase()
+                || first_word.starts_with(&format!("{} ", pc.to_lowercase()))
+        })
     }
 }
 
@@ -440,9 +439,13 @@ impl PtyMultiplexer {
 
         // Create HTTP client for validation
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(config.validation_timeout_ms))
+            .timeout(std::time::Duration::from_millis(
+                config.validation_timeout_ms,
+            ))
             .build()
-            .map_err(|e| PtyMultiplexerError::ValidationError(format!("HTTP client error: {}", e)))?;
+            .map_err(|e| {
+                PtyMultiplexerError::ValidationError(format!("HTTP client error: {}", e))
+            })?;
 
         Ok(Self {
             user_term,
@@ -480,8 +483,7 @@ impl PtyMultiplexer {
                 },
             ];
 
-            let poll_result =
-                unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
+            let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
 
             if poll_result < 0 {
                 let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -578,7 +580,11 @@ impl PtyMultiplexer {
     }
 
     /// Handle input in validation mode.
-    fn handle_validation_input(&mut self, byte: u8, output: &mut Vec<u8>) -> Result<(), PtyMultiplexerError> {
+    fn handle_validation_input(
+        &mut self,
+        byte: u8,
+        output: &mut Vec<u8>,
+    ) -> Result<(), PtyMultiplexerError> {
         output.clear();
 
         // Convert byte to char for InputBuffer
@@ -603,7 +609,10 @@ impl PtyMultiplexer {
             }
             InputAction::SendSigint => {
                 // Ctrl+C: send SIGINT to bash
-                let _ = nix::sys::signal::kill(self.bash_pty.child_pid, nix::sys::signal::Signal::SIGINT);
+                let _ = nix::sys::signal::kill(
+                    self.bash_pty.child_pid,
+                    nix::sys::signal::Signal::SIGINT,
+                );
             }
             InputAction::SendEof => {
                 // Ctrl+D: send EOF to bash
@@ -653,7 +662,10 @@ impl PtyMultiplexer {
             }
             "FLAG" => {
                 // Show warning, then forward
-                eprintln!("\r\n[SEVSH] WARNING: {} (Confidence: {})\r", verdict.reason, verdict.confidence);
+                eprintln!(
+                    "\r\n[SEVSH] WARNING: {} (Confidence: {})\r",
+                    verdict.reason, verdict.confidence
+                );
                 self.bash_pty.write_all(line.as_bytes())?;
                 self.bash_pty.write_all(b"\n")?;
             }
@@ -676,14 +688,9 @@ impl PtyMultiplexer {
             "context": "Shell"
         });
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .map_err(|e| {
-                PtyMultiplexerError::ValidationError(format!("Watchtower request failed: {}", e))
-            })?;
+        let response = self.client.post(&url).json(&body).send().map_err(|e| {
+            PtyMultiplexerError::ValidationError(format!("Watchtower request failed: {}", e))
+        })?;
 
         if !response.status().is_success() {
             // Fail closed on HTTP errors
@@ -699,18 +706,12 @@ impl PtyMultiplexer {
             PtyMultiplexerError::ValidationError(format!("Failed to parse response: {}", e))
         })?;
 
-        let status = json["status"]
-            .as_str()
-            .unwrap_or("UNKNOWN")
-            .to_string();
+        let status = json["status"].as_str().unwrap_or("UNKNOWN").to_string();
         let reason = json["reason"]
             .as_str()
             .unwrap_or("Policy violation")
             .to_string();
-        let confidence = json["confidence"]
-            .as_str()
-            .unwrap_or("Unknown")
-            .to_string();
+        let confidence = json["confidence"].as_str().unwrap_or("Unknown").to_string();
 
         let allowed = status == "ALLOW" || status == "FLAG";
 
@@ -745,10 +746,8 @@ impl Drop for PtyMultiplexer {
 
         // Kill bash if still running
         if self.bash_pty.is_running() {
-            let _ = nix::sys::signal::kill(
-                self.bash_pty.child_pid,
-                nix::sys::signal::Signal::SIGTERM,
-            );
+            let _ =
+                nix::sys::signal::kill(self.bash_pty.child_pid, nix::sys::signal::Signal::SIGTERM);
             std::thread::sleep(std::time::Duration::from_millis(100));
             if self.bash_pty.is_running() {
                 let _ = nix::sys::signal::kill(

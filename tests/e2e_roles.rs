@@ -1,7 +1,7 @@
 mod common;
 use common::harness::TestHarness;
-use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 use serde_json::json;
+use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -54,10 +54,16 @@ async fn test_5_1_role_with_subset_of_policies() {
     });
 
     let resp_a = analyze(&h, "AAA").await;
-    assert_eq!(resp_a["status"], "BLOCK", "block-a is in role, expected BLOCK; got: {resp_a}");
+    assert_eq!(
+        resp_a["status"], "BLOCK",
+        "block-a is in role, expected BLOCK; got: {resp_a}"
+    );
 
     let resp_b = analyze(&h, "BBB").await;
-    assert_eq!(resp_b["status"], "BLOCK", "block-b is in role, expected BLOCK; got: {resp_b}");
+    assert_eq!(
+        resp_b["status"], "BLOCK",
+        "block-b is in role, expected BLOCK; got: {resp_b}"
+    );
 
     let resp_c = analyze(&h, "CCC").await;
     assert_eq!(

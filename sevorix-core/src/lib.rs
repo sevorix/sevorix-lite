@@ -6,6 +6,7 @@ pub mod seccomp;
 pub mod tracer;
 
 // Re-export key types for convenience
+pub use enforcement::{detect_enforcement_tier, EnforcementTier};
 pub use input_buffer::{InputAction, InputBuffer, InputBufferError, InputMode};
 pub use pty::{
     run_pty_shell_with_callback, spawn_pty_shell_with_seccomp, PtyError, PtyShellHandle,
@@ -15,7 +16,6 @@ pub use pty_multiplexer::{
     MultiplexerMode, PassthroughDetector, PtyMultiplexer, PtyMultiplexerConfig,
     PtyMultiplexerError, Verdict,
 };
-pub use enforcement::{detect_enforcement_tier, EnforcementTier};
 pub use seccomp::{
     apply_syscall_deny_filter, apply_syscall_notify_filter, extract_args_from_seccomp,
     kernel_supports_seccomp_notify, run_seccomp_notify_supervisor, spawn_seccomp_shell,

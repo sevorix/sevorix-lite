@@ -47,12 +47,19 @@ impl MockUpstream {
     /// Assert that at least one request was received.
     pub async fn assert_called(&self) {
         let reqs = self.server.received_requests().await.unwrap();
-        assert!(!reqs.is_empty(), "MockUpstream: expected at least 1 request, got 0");
+        assert!(
+            !reqs.is_empty(),
+            "MockUpstream: expected at least 1 request, got 0"
+        );
     }
 
     /// Assert that no requests were received (request was blocked before upstream).
     pub async fn assert_not_called(&self) {
         let reqs = self.server.received_requests().await.unwrap();
-        assert!(reqs.is_empty(), "MockUpstream: expected 0 requests, got {}", reqs.len());
+        assert!(
+            reqs.is_empty(),
+            "MockUpstream: expected 0 requests, got {}",
+            reqs.len()
+        );
     }
 }

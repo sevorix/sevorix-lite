@@ -1,11 +1,11 @@
 use clap::Parser;
+use serde_json::json;
 use sevorix_core::{
     apply_syscall_deny_filter, apply_syscall_notify_filter, run_seccomp_notify_supervisor,
     PtyMultiplexer, PtyMultiplexerConfig, SyscallInfo,
 };
-use std::os::unix::process::CommandExt;
-use serde_json::json;
 use std::env;
+use std::os::unix::process::CommandExt;
 use std::process::{exit, Command, Stdio};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use uuid::Uuid;
@@ -119,8 +119,8 @@ pub fn parse_bash_invocation(args: &[String]) -> BashInvocation {
         // Long options
         if arg.starts_with("--") {
             match arg.as_str() {
-                "--login" | "--restricted" | "--norc" | "--noprofile"
-                | "--noediting" | "--posix" | "--debugger" => {
+                "--login" | "--restricted" | "--norc" | "--noprofile" | "--noediting"
+                | "--posix" | "--debugger" => {
                     inv.extra_options.push(arg.clone());
                 }
                 "--rcfile" | "--init-file" => {
@@ -147,7 +147,9 @@ pub fn parse_bash_invocation(args: &[String]) -> BashInvocation {
             let mut handled = true;
             for ch in &chars {
                 match ch {
-                    'i' => { inv.interactive = true; }
+                    'i' => {
+                        inv.interactive = true;
+                    }
                     c if SET_OPTION_CHARS.contains(*c) => {
                         inv.set_options.push(format!("-{}", c));
                     }
@@ -182,8 +184,11 @@ fn has_sevsh_flags(args: &[String]) -> bool {
     args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "--no-proxy" | "--no-sandbox" | "--internal-sandbox"
-                | "--internal-forward-sock" | "--session-id"
+            "--no-proxy"
+                | "--no-sandbox"
+                | "--internal-sandbox"
+                | "--internal-forward-sock"
+                | "--session-id"
         ) || a.starts_with("--publish")
             || a == "-p"
     })
@@ -243,9 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Non-interactive with no command (e.g. `bash -l` for profile
                 // sourcing): nothing to intercept, pass straight through.
                 let shell = real_shell();
-                let status = Command::new(&shell)
-                    .args(inv.to_bash_args())
-                    .status()?;
+                let status = Command::new(&shell).args(inv.to_bash_args()).status()?;
                 exit(status.code().unwrap_or(1));
             }
         }
@@ -265,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.no_sandbox {
         // Check if Watchtower is reachable
         match check_watchtower_reachable().await {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) => {
                 eprintln!("[SEVSH] Error: Watchtower not reachable: {}", e);
                 eprintln!("[SEVSH] Fail-closed: Cannot proceed without Watchtower.");
@@ -297,7 +300,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Non-fatal: cgroup creation may fail if we don't have permissions
             // or cgroup v2 is not available
             if !args.command.is_empty() {
-                eprintln!("[SEVSH] Warning: Could not create cgroup: {}. Process isolation limited.", e);
+                eprintln!(
+                    "[SEVSH] Warning: Could not create cgroup: {}. Process isolation limited.",
+                    e
+                );
             }
             false
         }
@@ -349,7 +355,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Fall through to handle_single_command below
                     -1 // sentinel: indicates fallthrough
                 } else {
-                    if cgroup_created { cleanup_session_cgroup(&session_id); }
+                    if cgroup_created {
+                        cleanup_session_cgroup(&session_id);
+                    }
                     return Err(e);
                 }
             }
@@ -485,7 +493,8 @@ fn create_session_cgroup(session_id: &str) -> Result<bool, Box<dyn std::error::E
         return Err(format!(
             "cgroup helper 'add-pid' failed (exit {})",
             add_status.code().unwrap_or(-1)
-        ).into());
+        )
+        .into());
     }
 
     Ok(true)
@@ -503,7 +512,8 @@ fn add_process_to_cgroup(session_id: &str) -> Result<(), Box<dyn std::error::Err
         return Err(format!(
             "cgroup helper 'add-pid' failed (exit {})",
             status.code().unwrap_or(-1)
-        ).into());
+        )
+        .into());
     }
     Ok(())
 }
@@ -584,12 +594,9 @@ async fn run_parent_bridge(
                         match UnixStream::connect(&p).await {
                             Ok(mut unix_stream) => {
                                 let mut tcp = tcp_stream;
-                                if tokio::io::copy_bidirectional(
-                                    &mut tcp,
-                                    &mut unix_stream,
-                                )
-                                .await
-                                .is_err()
+                                if tokio::io::copy_bidirectional(&mut tcp, &mut unix_stream)
+                                    .await
+                                    .is_err()
                                 {
                                     // Ignore
                                 }
@@ -600,8 +607,7 @@ async fn run_parent_bridge(
                                 if attempts > 5 {
                                     break;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(100))
-                                    .await;
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         }
                     }
@@ -755,10 +761,8 @@ async fn run_internal_agent(
                                     // Connect to INTERNAL service
                                     if let Ok(mut tcp) = TcpStream::connect(&addr).await {
                                         let mut unix = unix_stream;
-                                        let _ = tokio::io::copy_bidirectional(
-                                            &mut tcp, &mut unix,
-                                        )
-                                        .await;
+                                        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut unix)
+                                            .await;
                                     }
                                 });
                             }
@@ -781,7 +785,8 @@ async fn run_internal_agent(
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--internal-sandbox" || arg == "--internal-forward-sock" || arg == "--session-id" {
+        if arg == "--internal-sandbox" || arg == "--internal-forward-sock" || arg == "--session-id"
+        {
             i += 2;
         } else if arg == "--no-proxy" {
             // Filter out this flag as it's handled via bool param
@@ -796,8 +801,8 @@ async fn run_internal_agent(
     let no_proxy = args.iter().any(|arg| arg == "--no-proxy");
 
     // Extract session ID from args
-    let session_id = get_arg_value(args, "--session-id")
-        .unwrap_or_else(|| format!("sevsh-{}", Uuid::new_v4()));
+    let session_id =
+        get_arg_value(args, "--session-id").unwrap_or_else(|| format!("sevsh-{}", Uuid::new_v4()));
 
     // Set session ID in environment
     env::set_var("SEVORIX_SESSION_ID", &session_id);
@@ -862,8 +867,14 @@ async fn handle_bash_invocation(
                 ("https_proxy".to_string(), PROXY_URL.to_string()),
                 ("ALL_PROXY".to_string(), PROXY_URL.to_string()),
                 ("all_proxy".to_string(), PROXY_URL.to_string()),
-                ("NO_PROXY".to_string(), "localhost,127.0.0.1,::1".to_string()),
-                ("no_proxy".to_string(), "localhost,127.0.0.1,::1".to_string()),
+                (
+                    "NO_PROXY".to_string(),
+                    "localhost,127.0.0.1,::1".to_string(),
+                ),
+                (
+                    "no_proxy".to_string(),
+                    "localhost,127.0.0.1,::1".to_string(),
+                ),
             ]
         } else {
             vec![]
@@ -903,11 +914,7 @@ async fn handle_bash_invocation(
                         match apply_syscall_notify_filter(&deny_names) {
                             Ok(notify_fd) => {
                                 let bytes = notify_fd.to_ne_bytes();
-                                libc::write(
-                                    pipe_write,
-                                    bytes.as_ptr() as *const libc::c_void,
-                                    4,
-                                );
+                                libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
                                 libc::close(pipe_write);
                                 Ok(())
                             }
@@ -915,16 +922,10 @@ async fn handle_bash_invocation(
                                 // Notify filter unavailable — signal -1 to parent and
                                 // fall back to the deny filter so syscalls still get EPERM.
                                 let bytes = (-1i32).to_ne_bytes();
-                                libc::write(
-                                    pipe_write,
-                                    bytes.as_ptr() as *const libc::c_void,
-                                    4,
-                                );
+                                libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
                                 libc::close(pipe_write);
                                 apply_syscall_deny_filter(&deny_names).map_err(|e| {
-                                    std::io::Error::other(
-                                        format!("seccomp fallback: {}", e),
-                                    )
+                                    std::io::Error::other(format!("seccomp fallback: {}", e))
                                 })
                             }
                         }
@@ -1036,9 +1037,7 @@ async fn handle_bash_invocation(
                 unsafe {
                     command.pre_exec(move || {
                         apply_syscall_deny_filter(&deny_names).map_err(|e| {
-                            std::io::Error::other(
-                                format!("seccomp filter failed: {}", e),
-                            )
+                            std::io::Error::other(format!("seccomp filter failed: {}", e))
                         })
                     });
                 }
@@ -1062,7 +1061,10 @@ async fn handle_bash_invocation(
 /// - Arrow key history (forwarded to bash)
 /// - Raw mode passthrough for vim/less/etc.
 /// - Command validation via Watchtower before execution
-fn run_pty_interactive_shell_code(use_proxy: bool, session_id: &str) -> Result<i32, Box<dyn std::error::Error>> {
+fn run_pty_interactive_shell_code(
+    use_proxy: bool,
+    session_id: &str,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let shell = real_shell();
 
     // Set session ID in environment
@@ -1084,8 +1086,14 @@ fn run_pty_interactive_shell_code(use_proxy: bool, session_id: &str) -> Result<i
             ("https_proxy".to_string(), PROXY_URL.to_string()),
             ("ALL_PROXY".to_string(), PROXY_URL.to_string()),
             ("all_proxy".to_string(), PROXY_URL.to_string()),
-            ("NO_PROXY".to_string(), "localhost,127.0.0.1,::1".to_string()),
-            ("no_proxy".to_string(), "localhost,127.0.0.1,::1".to_string()),
+            (
+                "NO_PROXY".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            ),
+            (
+                "no_proxy".to_string(),
+                "localhost,127.0.0.1,::1".to_string(),
+            ),
         ]
     } else {
         vec![]
@@ -1143,7 +1151,10 @@ async fn fetch_syscall_deny_list() -> Vec<String> {
             .filter_map(|n| n.as_str().map(str::to_string))
             .collect(),
         Err(e) => {
-            eprintln!("[SEVSH] Warning: Could not fetch syscall policy: {}. Seccomp filter not applied.", e);
+            eprintln!(
+                "[SEVSH] Warning: Could not fetch syscall policy: {}. Seccomp filter not applied.",
+                e
+            );
             vec![]
         }
     }
@@ -1155,11 +1166,13 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
     // commands can wait for an operator decision without sevsh timing out first.
     // Use explicit validation_timeout_secs if set; otherwise derive from the
     // intervention timeout (default 30s) plus a 10s buffer.
-    let timeout_secs = settings.sevsh
+    let timeout_secs = settings
+        .sevsh
         .as_ref()
         .and_then(|s| s.validation_timeout_secs)
         .unwrap_or_else(|| {
-            let intervention_secs = settings.intervention
+            let intervention_secs = settings
+                .intervention
                 .as_ref()
                 .map(|i| i.timeout_secs())
                 .unwrap_or(30);
@@ -1403,7 +1416,9 @@ mod tests {
     #[test]
     fn test_parse_unknown_long_option_passed_through() {
         let inv = parse_bash_invocation(&args(&["--some-unknown-flag", "-c", "cmd"]));
-        assert!(inv.extra_options.contains(&"--some-unknown-flag".to_string()));
+        assert!(inv
+            .extra_options
+            .contains(&"--some-unknown-flag".to_string()));
         assert_eq!(inv.command.as_deref(), Some("cmd"));
     }
 
@@ -1482,10 +1497,7 @@ mod tests {
             positional_args: args(&["arg1", "arg2"]),
             ..Default::default()
         };
-        assert_eq!(
-            inv.to_bash_args(),
-            args(&["script.sh", "arg1", "arg2"])
-        );
+        assert_eq!(inv.to_bash_args(), args(&["script.sh", "arg1", "arg2"]));
     }
 
     #[test]

@@ -44,8 +44,8 @@ mod ebpf_impl {
 
     use anyhow::{Context, Result};
     use aya::maps::RingBuf;
-    use aya::programs::{CgroupAttachMode, Lsm, SockOps, TracePoint};
     use aya::programs::lsm::LsmLink;
+    use aya::programs::{CgroupAttachMode, Lsm, SockOps, TracePoint};
     use aya::{Btf, Ebpf};
     use directories::ProjectDirs;
     use sevorix_core::{detect_enforcement_tier, EnforcementTier};
@@ -74,28 +74,86 @@ mod ebpf_impl {
 
     fn syscall_name(nr: u64) -> String {
         match nr {
-            0 => "read", 1 => "write", 2 => "open", 3 => "close",
-            4 => "stat", 5 => "fstat", 6 => "lstat", 7 => "poll",
-            8 => "lseek", 9 => "mmap", 10 => "mprotect", 11 => "munmap",
-            12 => "brk", 20 => "writev", 21 => "access", 22 => "pipe",
-            32 => "dup", 33 => "dup2", 39 => "getpid", 41 => "socket",
-            42 => "connect", 43 => "accept", 44 => "sendto", 45 => "recvfrom",
-            49 => "bind", 50 => "listen", 56 => "clone", 57 => "fork",
-            58 => "vfork", 59 => "execve", 60 => "exit", 61 => "wait4",
-            62 => "kill", 63 => "uname", 72 => "fcntl", 79 => "getcwd",
-            80 => "chdir", 81 => "fchdir", 82 => "rename", 83 => "mkdir",
-            84 => "rmdir", 85 => "creat", 86 => "link", 87 => "unlink",
-            88 => "symlink", 89 => "readlink", 90 => "chmod", 92 => "chown",
-            99 => "sysinfo", 102 => "getuid", 104 => "getgid", 105 => "setuid",
-            106 => "setgid", 186 => "gettid", 202 => "futex", 218 => "set_tid_address",
-            231 => "exit_group", 257 => "openat", 258 => "mkdirat", 261 => "futimesat",
-            263 => "unlinkat", 264 => "renameat", 265 => "linkat", 266 => "symlinkat",
-            267 => "readlinkat", 268 => "fchmodat", 269 => "faccessat",
-            316 => "renameat2", 318 => "getrandom", 322 => "execveat",
+            0 => "read",
+            1 => "write",
+            2 => "open",
+            3 => "close",
+            4 => "stat",
+            5 => "fstat",
+            6 => "lstat",
+            7 => "poll",
+            8 => "lseek",
+            9 => "mmap",
+            10 => "mprotect",
+            11 => "munmap",
+            12 => "brk",
+            20 => "writev",
+            21 => "access",
+            22 => "pipe",
+            32 => "dup",
+            33 => "dup2",
+            39 => "getpid",
+            41 => "socket",
+            42 => "connect",
+            43 => "accept",
+            44 => "sendto",
+            45 => "recvfrom",
+            49 => "bind",
+            50 => "listen",
+            56 => "clone",
+            57 => "fork",
+            58 => "vfork",
+            59 => "execve",
+            60 => "exit",
+            61 => "wait4",
+            62 => "kill",
+            63 => "uname",
+            72 => "fcntl",
+            79 => "getcwd",
+            80 => "chdir",
+            81 => "fchdir",
+            82 => "rename",
+            83 => "mkdir",
+            84 => "rmdir",
+            85 => "creat",
+            86 => "link",
+            87 => "unlink",
+            88 => "symlink",
+            89 => "readlink",
+            90 => "chmod",
+            92 => "chown",
+            99 => "sysinfo",
+            102 => "getuid",
+            104 => "getgid",
+            105 => "setuid",
+            106 => "setgid",
+            186 => "gettid",
+            202 => "futex",
+            218 => "set_tid_address",
+            231 => "exit_group",
+            257 => "openat",
+            258 => "mkdirat",
+            261 => "futimesat",
+            263 => "unlinkat",
+            264 => "renameat",
+            265 => "linkat",
+            266 => "symlinkat",
+            267 => "readlinkat",
+            268 => "fchmodat",
+            269 => "faccessat",
+            316 => "renameat2",
+            318 => "getrandom",
+            322 => "execveat",
             _ => "",
         }
         .to_string()
-        .pipe(|s| if s.is_empty() { format!("syscall_{}", nr) } else { s })
+        .pipe(|s| {
+            if s.is_empty() {
+                format!("syscall_{}", nr)
+            } else {
+                s
+            }
+        })
     }
 
     /// Shared HTTP client — created once, reused for all policy query calls.
@@ -119,7 +177,9 @@ mod ebpf_impl {
     }
 
     trait Pipe: Sized {
-        fn pipe<F: FnOnce(Self) -> T, T>(self, f: F) -> T { f(self) }
+        fn pipe<F: FnOnce(Self) -> T, T>(self, f: F) -> T {
+            f(self)
+        }
     }
     impl<T> Pipe for T {}
 
@@ -165,11 +225,18 @@ mod ebpf_impl {
         /// Uses PolicyKey (repr(C) with explicit padding) as the map key — this has the same
         /// byte layout as the kernel-side (u32, u64) key and implements aya::Pod.
         async fn deny_syscall(&self, pid: u32, syscall_nr: u64, errno: i32) {
-            let key = PolicyKey { pid, _padding: 0, id: syscall_nr };
+            let key = PolicyKey {
+                pid,
+                _padding: 0,
+                id: syscall_nr,
+            };
             let mut guard = self.syscall_denylist.lock().await;
             match aya::maps::HashMap::<_, PolicyKey, i32>::try_from(&mut *guard) {
                 Ok(mut map) => match map.insert(key, errno, 0) {
-                    Ok(_) => info!("eBPF: denied pid={} syscall={} errno={}", pid, syscall_nr, errno),
+                    Ok(_) => info!(
+                        "eBPF: denied pid={} syscall={} errno={}",
+                        pid, syscall_nr, errno
+                    ),
                     Err(e) => warn!("eBPF: SYSCALL_DENYLIST insert failed: {}", e),
                 },
                 Err(e) => warn!("eBPF: failed to access SYSCALL_DENYLIST: {}", e),
@@ -182,9 +249,17 @@ mod ebpf_impl {
             let mut guard = self.net_denylist.lock().await;
             match aya::maps::HashMap::<_, NetworkKey, i32>::try_from(&mut *guard) {
                 Ok(mut map) => {
-                    let key = NetworkKey { dst_ip, dst_port, protocol: 6, _padding: 0 };
+                    let key = NetworkKey {
+                        dst_ip,
+                        dst_port,
+                        protocol: 6,
+                        _padding: 0,
+                    };
                     match map.insert(key, errno, 0) {
-                        Ok(_) => info!("eBPF: denied network dst_ip={} dst_port={}", dst_ip, dst_port),
+                        Ok(_) => info!(
+                            "eBPF: denied network dst_ip={} dst_port={}",
+                            dst_ip, dst_port
+                        ),
                         Err(e) => warn!("eBPF: NET_DENYLIST insert failed: {}", e),
                     }
                 }
@@ -259,7 +334,10 @@ mod ebpf_impl {
                 // fast-path entries causing missed logs after PID reuse.
             }
             other => {
-                warn!("Unknown Watchtower action '{}' for syscall; defaulting to allow", other);
+                warn!(
+                    "Unknown Watchtower action '{}' for syscall; defaulting to allow",
+                    other
+                );
             }
         }
     }
@@ -422,7 +500,10 @@ mod ebpf_impl {
         let policies: EbpfPolicies = match resp.json().await {
             Ok(p) => p,
             Err(e) => {
-                warn!("Policy prefill: failed to parse /policies/ebpf response: {}", e);
+                warn!(
+                    "Policy prefill: failed to parse /policies/ebpf response: {}",
+                    e
+                );
                 return;
             }
         };
@@ -459,7 +540,9 @@ mod ebpf_impl {
     fn write_pid_file() -> Result<()> {
         let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
             .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
-        let state_dir = proj_dirs.state_dir().unwrap_or_else(|| proj_dirs.cache_dir());
+        let state_dir = proj_dirs
+            .state_dir()
+            .unwrap_or_else(|| proj_dirs.cache_dir());
         std::fs::create_dir_all(state_dir)?;
         let pid_path = state_dir.join("sevorix-ebpf.pid");
         std::fs::write(&pid_path, std::process::id().to_string())?;
@@ -624,7 +707,13 @@ mod ebpf_impl {
                     return Ok(());
                 }
                 let event = parse_syscall_event(data)?;
-                handle_syscall_event(event, event_tx, EventType::SyscallEntry, watchtower_url, maps)?;
+                handle_syscall_event(
+                    event,
+                    event_tx,
+                    EventType::SyscallEntry,
+                    watchtower_url,
+                    maps,
+                )?;
             }
             SyscallEvent::EVENT_TYPE_EXIT => {
                 if data.len() < std::mem::size_of::<SyscallEvent>() {
@@ -632,7 +721,13 @@ mod ebpf_impl {
                     return Ok(());
                 }
                 let event = parse_syscall_event(data)?;
-                handle_syscall_event(event, event_tx, EventType::SyscallExit, watchtower_url, maps)?;
+                handle_syscall_event(
+                    event,
+                    event_tx,
+                    EventType::SyscallExit,
+                    watchtower_url,
+                    maps,
+                )?;
             }
             NetworkEvent::EVENT_TYPE => {
                 if data.len() < std::mem::size_of::<NetworkEvent>() {
@@ -683,8 +778,7 @@ mod ebpf_impl {
             }),
         };
 
-        if event_type == EventType::SyscallEntry
-            && INTERESTING_SYSCALLS.contains(&event.syscall_nr)
+        if event_type == EventType::SyscallEntry && INTERESTING_SYSCALLS.contains(&event.syscall_nr)
         {
             info!(
                 "Syscall entry: pid={}, syscall={}",
@@ -696,11 +790,21 @@ mod ebpf_impl {
                 let maps = maps.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    evaluate_and_enforce_syscall(url, event.pid, event.syscall_nr, event.args, maps)
-                        .await;
+                    evaluate_and_enforce_syscall(
+                        url,
+                        event.pid,
+                        event.syscall_nr,
+                        event.args,
+                        maps,
+                    )
+                    .await;
                 });
             } else {
-                tracing::trace!("eval semaphore full — dropping syscall event pid={} nr={}", event.pid, event.syscall_nr);
+                tracing::trace!(
+                    "eval semaphore full — dropping syscall event pid={} nr={}",
+                    event.pid,
+                    event.syscall_nr
+                );
             }
         }
 
@@ -800,11 +904,23 @@ mod ebpf_impl {
             let dst_ip_str = dst_ip_addr.to_string();
             tokio::spawn(async move {
                 let _permit = permit;
-                evaluate_and_enforce_network(url, event.pid, dst_ip_str, event.dst_ip, dst_port, maps)
-                    .await;
+                evaluate_and_enforce_network(
+                    url,
+                    event.pid,
+                    dst_ip_str,
+                    event.dst_ip,
+                    dst_port,
+                    maps,
+                )
+                .await;
             });
         } else {
-            tracing::trace!("eval semaphore full — dropping network event pid={} dst={}:{}", event.pid, dst_ip_addr, dst_port);
+            tracing::trace!(
+                "eval semaphore full — dropping network event pid={} dst={}:{}",
+                event.pid,
+                dst_ip_addr,
+                dst_port
+            );
         }
 
         let _ = event_tx.send(ebpf_event);

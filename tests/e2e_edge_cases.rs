@@ -1,7 +1,7 @@
 mod common;
 use common::harness::TestHarness;
-use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 use serde_json::json;
+use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 
 // ── 13.1a – No policies with role → ALLOW (GREEN) ────────────────────────────
 
@@ -55,8 +55,8 @@ async fn test_13_1_no_role_blocks() {
 
 #[test]
 fn test_13_2_malformed_policy_file_skipped() {
-    use tempfile::TempDir;
     use sevorix_watchtower::policy::Engine;
+    use tempfile::TempDir;
 
     let dir = TempDir::new().unwrap();
     let policy_dir = dir.path().join("policies");

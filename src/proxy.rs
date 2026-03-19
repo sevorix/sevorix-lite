@@ -1,7 +1,7 @@
 use crate::log_traffic_event;
 use crate::policy::PolicyContext;
 use crate::scanner::{log_threat, scan_content, scan_for_poison, PoisonPill};
-use crate::{AppState, PendingEntry, await_decision_with_pause};
+use crate::{await_decision_with_pause, AppState, PendingEntry};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -165,8 +165,10 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     let Some(ref role) = resolved_role else {
         return (
             StatusCode::FORBIDDEN,
-            "SEVORIX: No role configured for this session. Use `sevorix session set-role`.".to_string(),
-        ).into_response();
+            "SEVORIX: No role configured for this session. Use `sevorix session set-role`."
+                .to_string(),
+        )
+            .into_response();
     };
 
     // Include the request line (method + URL) in the scanned content so URL-based policies match.
@@ -232,13 +234,24 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         let display_payload_flag = if body_str.is_empty() {
             format!("{} {}", method, uri)
         } else {
-            format!("{} {}\n\n{}", method, uri, body_str.chars().take(2000).collect::<String>())
+            format!(
+                "{} {}\n\n{}",
+                method,
+                uri,
+                body_str.chars().take(2000).collect::<String>()
+            )
         };
 
         let event_id = uuid::Uuid::new_v4().to_string();
         let (decision_tx, decision_rx) = oneshot::channel::<bool>();
         let (pause_tx, pause_rx) = watch::channel(false);
-        state.pending_decisions.insert(event_id.clone(), PendingEntry { decision_tx, pause_tx });
+        state.pending_decisions.insert(
+            event_id.clone(),
+            PendingEntry {
+                decision_tx,
+                pause_tx,
+            },
+        );
 
         let pending_event = json!({
             "type": "PENDING",
@@ -261,7 +274,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             pause_rx,
             state.intervention_timeout_secs,
             state.intervention_timeout_allow,
-        ).await;
+        )
+        .await;
 
         // Still in map → timeout fired (not resolved by decide_handler)
         if state.pending_decisions.remove(&event_id).is_some() {
@@ -388,7 +402,8 @@ async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
 
     tracing::debug!(
         "[PROXY] Tunnel closed. Bytes: {} up, {} down",
-        from_client, from_server
+        from_client,
+        from_server
     );
     Ok(())
 }
@@ -406,11 +421,14 @@ mod tests {
     fn create_test_state() -> Arc<AppState> {
         let (tx, _) = tokio::sync::broadcast::channel(1);
         let mut engine = Engine::new();
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec![],
-            is_dynamic: false,
-        });
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec![],
+                is_dynamic: false,
+            },
+        );
         Arc::new(AppState {
             tx,
             policy_engine: Arc::new(RwLock::new(engine)),
@@ -418,7 +436,9 @@ mod tests {
             log_dir: std::path::PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
             enforcement_tier: sevorix_core::EnforcementTier::Standard,
-            active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
@@ -456,7 +476,9 @@ mod tests {
             log_dir: std::path::PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
             enforcement_tier: sevorix_core::EnforcementTier::Standard,
-            active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,

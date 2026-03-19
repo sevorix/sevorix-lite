@@ -10,19 +10,19 @@ use uuid::Uuid;
 use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
+use crate::validation;
 use crate::{
     audit,
     auth::{create_token, hash_password, verify_password, verify_token},
     error::{map_db_err, AppError, AppResult},
     models::{
         Artifact, ArtifactRow, ArtifactSummary, ArtifactWithOwner, ArtifactWithOwnerRow,
-        EndorsementLevel, EndorsementRow, EndorsementWithUser, EndorsementWithUserRow,
-        User, UserProfile, Visibility,
+        EndorsementLevel, EndorsementRow, EndorsementWithUser, EndorsementWithUserRow, User,
+        UserProfile, Visibility,
     },
     store::ArtifactStore,
     AppState,
 };
-use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Register
@@ -226,20 +226,23 @@ pub async fn update_email(
 
     let new_email = req.email.trim().to_lowercase();
     if new_email.is_empty() || !new_email.contains('@') {
-        return Err(AppError::BadRequest("a valid email address is required".into()));
+        return Err(AppError::BadRequest(
+            "a valid email address is required".into(),
+        ));
     }
     if is_placeholder_email(&new_email) {
-        return Err(AppError::BadRequest("cannot set a placeholder email address".into()));
+        return Err(AppError::BadRequest(
+            "cannot set a placeholder email address".into(),
+        ));
     }
 
     // Check the new email isn't already taken by another account.
-    let existing = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM users WHERE email = $1 AND id != $2",
-    )
-    .bind(&new_email)
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await?;
+    let existing =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = $1 AND id != $2")
+            .bind(&new_email)
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?;
 
     if existing > 0 {
         return Err(AppError::Conflict("email already in use".into()));
@@ -257,7 +260,10 @@ pub async fn update_email(
 
     audit::log_login_success(&new_email, Some(&ip_str));
 
-    Ok(Json(UpdateEmailResponse { email: new_email, token }))
+    Ok(Json(UpdateEmailResponse {
+        email: new_email,
+        token,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +451,9 @@ pub async fn push_artifact(
     // tags already bound above via validation
     let visibility_str = visibility.to_string();
 
-    let content_schema_str: Option<String> = req.schema.as_ref()
+    let content_schema_str: Option<String> = req
+        .schema
+        .as_ref()
         .map(|s| serde_json::to_string(s).unwrap_or_default());
 
     let artifact_row = sqlx::query_as::<_, ArtifactRow>(
@@ -472,9 +480,7 @@ pub async fn push_artifact(
             format!("artifact '{}@{}' already exists", req.name, req.version),
         )
     })?;
-    let artifact = artifact_row
-        .into_artifact()
-        .map_err(AppError::BadRequest)?;
+    let artifact = artifact_row.into_artifact().map_err(AppError::BadRequest)?;
 
     let owner: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
         .bind(owner_id)
@@ -489,9 +495,7 @@ pub async fn push_artifact(
     }
 
     // Optional: verify Ed25519 signature if provided.
-    if let (Some(ref sig_b64), Some(ref fingerprint)) =
-        (&req.signature, &req.key_fingerprint)
-    {
+    if let (Some(ref sig_b64), Some(ref fingerprint)) = (&req.signature, &req.key_fingerprint) {
         let key_row = sqlx::query_as::<_, crate::models::SigningKeyRow>(
             "SELECT * FROM user_signing_keys
              WHERE fingerprint = $1 AND user_id = $2 AND revoked_at IS NULL",
@@ -501,9 +505,7 @@ pub async fn push_artifact(
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| {
-            AppError::BadRequest(
-                "signing key not found or does not belong to you".to_string(),
-            )
+            AppError::BadRequest("signing key not found or does not belong to you".to_string())
         })?;
 
         let verifying_key = crate::signing::parse_public_key(&key_row.public_key)?;
@@ -615,7 +617,9 @@ pub async fn push_artifact(
             downloads: artifact.downloads,
             created_at: artifact.created_at,
             content_hash: artifact.content_hash,
-            content_schema: artifact.content_schema.as_ref()
+            content_schema: artifact
+                .content_schema
+                .as_ref()
                 .and_then(|s| serde_json::from_str(s).ok()),
             signed: req.signature.is_some(),
             key_fingerprint: req.key_fingerprint.clone(),
@@ -710,7 +714,8 @@ pub async fn pull_artifact(
         if &actual_hash != stored_hash {
             return Err(AppError::Internal(anyhow::anyhow!(
                 "content integrity check failed for artifact '{}@{}'",
-                artifact.name, artifact.version
+                artifact.name,
+                artifact.version
             )));
         }
     }
@@ -722,45 +727,44 @@ pub async fn pull_artifact(
         .fetch_one(&state.db)
         .await?;
 
-    let owner_is_endorsed: bool =
-        sqlx::query_scalar("SELECT is_endorsed FROM users WHERE id = $1")
-            .bind(artifact.owner_id)
-            .fetch_one(&state.db)
-            .await?;
+    let owner_is_endorsed: bool = sqlx::query_scalar("SELECT is_endorsed FROM users WHERE id = $1")
+        .bind(artifact.owner_id)
+        .fetch_one(&state.db)
+        .await?;
 
     // Verify signature if present.
-    let signature_valid: Option<bool> = if artifact.signature.is_some() && artifact.key_fingerprint.is_some() {
-        let fingerprint = artifact.key_fingerprint.as_deref().unwrap();
-        let sig_b64 = artifact.signature.as_deref().unwrap();
-        match sqlx::query_as::<_, crate::models::SigningKeyRow>(
-            "SELECT * FROM user_signing_keys WHERE fingerprint = $1",
-        )
-        .bind(fingerprint)
-        .fetch_optional(&state.db)
-        .await?
-        {
-            Some(key_row) => {
-                let verifying_key = crate::signing::parse_public_key(&key_row.public_key)
-                    .ok();
-                if let Some(vk) = verifying_key {
-                    if let Some(ref stored_hash) = artifact.content_hash {
-                        let valid = crate::signing::verify_signature(&vk, stored_hash, sig_b64)
-                            .unwrap_or(false);
-                        // If key is revoked, signature_valid = false
-                        let revoked = key_row.revoked_at.is_some();
-                        Some(valid && !revoked)
+    let signature_valid: Option<bool> =
+        if artifact.signature.is_some() && artifact.key_fingerprint.is_some() {
+            let fingerprint = artifact.key_fingerprint.as_deref().unwrap();
+            let sig_b64 = artifact.signature.as_deref().unwrap();
+            match sqlx::query_as::<_, crate::models::SigningKeyRow>(
+                "SELECT * FROM user_signing_keys WHERE fingerprint = $1",
+            )
+            .bind(fingerprint)
+            .fetch_optional(&state.db)
+            .await?
+            {
+                Some(key_row) => {
+                    let verifying_key = crate::signing::parse_public_key(&key_row.public_key).ok();
+                    if let Some(vk) = verifying_key {
+                        if let Some(ref stored_hash) = artifact.content_hash {
+                            let valid = crate::signing::verify_signature(&vk, stored_hash, sig_b64)
+                                .unwrap_or(false);
+                            // If key is revoked, signature_valid = false
+                            let revoked = key_row.revoked_at.is_some();
+                            Some(valid && !revoked)
+                        } else {
+                            None
+                        }
                     } else {
-                        None
+                        Some(false)
                     }
-                } else {
-                    Some(false)
                 }
+                None => Some(false),
             }
-            None => Some(false),
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Load declared dependencies.
     let dep_rows = sqlx::query_as::<_, crate::models::ArtifactDependency>(
@@ -769,8 +773,10 @@ pub async fn pull_artifact(
     .bind(artifact.id)
     .fetch_all(&state.db)
     .await?;
-    let dependencies: Vec<crate::models::DependencyRef> =
-        dep_rows.into_iter().map(crate::models::DependencyRef::from).collect();
+    let dependencies: Vec<crate::models::DependencyRef> = dep_rows
+        .into_iter()
+        .map(crate::models::DependencyRef::from)
+        .collect();
 
     Ok(Json(PullResponse {
         id: artifact.id,
@@ -785,7 +791,9 @@ pub async fn pull_artifact(
         created_at: artifact.created_at,
         content: Some(content),
         content_hash: artifact.content_hash,
-        content_schema: artifact.content_schema.as_ref()
+        content_schema: artifact
+            .content_schema
+            .as_ref()
             .and_then(|s| serde_json::from_str(s).ok()),
         signed: artifact.signature.is_some(),
         key_fingerprint: artifact.key_fingerprint,
@@ -855,9 +863,17 @@ pub async fn search_artifacts(
 
     let show_yanked = params.include_yanked.unwrap_or(false) && is_admin;
     // Used in JOIN queries where artifacts is aliased as "a"
-    let yanked_filter = if show_yanked { "" } else { " AND a.yanked = false" };
+    let yanked_filter = if show_yanked {
+        ""
+    } else {
+        " AND a.yanked = false"
+    };
     // Used in COUNT queries where artifacts has no alias
-    let yanked_filter_count = if show_yanked { "" } else { " AND yanked = false" };
+    let yanked_filter_count = if show_yanked {
+        ""
+    } else {
+        " AND yanked = false"
+    };
 
     let rows: Vec<ArtifactWithOwnerRow> = if let Some(ref tag) = params.tag {
         let query = format!(
@@ -947,7 +963,10 @@ pub async fn search_artifacts(
 
     // Count total (only public for anonymous, all for admin, public+own for authenticated)
     let total: i64 = if is_admin {
-        let count_query = format!("SELECT COUNT(*) FROM artifacts WHERE 1=1{}", yanked_filter_count);
+        let count_query = format!(
+            "SELECT COUNT(*) FROM artifacts WHERE 1=1{}",
+            yanked_filter_count
+        );
         sqlx::query_scalar(&count_query)
             .fetch_one(&state.db)
             .await?
@@ -1010,11 +1029,10 @@ pub async fn create_endorsement(
     let (user_id, email) = extract_user_from_headers(&headers, &state, Some(&ip_str))?;
 
     // Check if artifact exists
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1)")
-            .bind(artifact_id)
-            .fetch_one(&state.db)
-            .await?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1)")
+        .bind(artifact_id)
+        .fetch_one(&state.db)
+        .await?;
 
     if !exists {
         return Err(AppError::NotFound("artifact not found".into()));
@@ -1040,9 +1058,9 @@ pub async fn create_endorsement(
         Some("official") => EndorsementLevel::Official,
         Some(v) => {
             return Err(AppError::BadRequest(format!(
-                "invalid endorsement level '{}': must be 'verified', 'trusted_author', or 'official'",
-                v
-            )))
+            "invalid endorsement level '{}': must be 'verified', 'trusted_author', or 'official'",
+            v
+        )))
         }
     };
 
@@ -1084,11 +1102,10 @@ pub async fn list_endorsements(
     Path(artifact_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<EndorsementWithUser>>> {
     // Check if artifact exists
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1)")
-            .bind(artifact_id)
-            .fetch_one(&state.db)
-            .await?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1)")
+        .bind(artifact_id)
+        .fetch_one(&state.db)
+        .await?;
 
     if !exists {
         return Err(AppError::NotFound("artifact not found".into()));
@@ -1187,13 +1204,12 @@ pub async fn approve_user(
     }
 
     // Approve the user
-    let user = sqlx::query_as::<_, User>(
-        "UPDATE users SET is_approved = true WHERE id = $1 RETURNING *",
-    )
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("user not found".into()))?;
+    let user =
+        sqlx::query_as::<_, User>("UPDATE users SET is_approved = true WHERE id = $1 RETURNING *")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("user not found".into()))?;
 
     // Audit log the user approval
     audit::log_user_approved(&user.email, &admin_id.to_string());
@@ -1276,7 +1292,11 @@ pub async fn list_signing_keys(
     .fetch_all(&state.db)
     .await?;
 
-    Ok(Json(rows.into_iter().map(crate::models::SigningKey::from).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(crate::models::SigningKey::from)
+            .collect(),
+    ))
 }
 
 pub async fn revoke_signing_key(
@@ -1341,8 +1361,10 @@ pub async fn get_set_members(
     .fetch_all(&state.db)
     .await?;
 
-    let members: Vec<crate::models::DependencyRef> =
-        dep_rows.into_iter().map(crate::models::DependencyRef::from).collect();
+    let members: Vec<crate::models::DependencyRef> = dep_rows
+        .into_iter()
+        .map(crate::models::DependencyRef::from)
+        .collect();
 
     Ok(Json(serde_json::json!({
         "set_name": artifact.name,
@@ -1376,13 +1398,12 @@ pub async fn yank_artifact(
         .await?
         .unwrap_or(false);
 
-    let artifact_row = sqlx::query_as::<_, crate::models::ArtifactRow>(
-        "SELECT * FROM artifacts WHERE id = $1",
-    )
-    .bind(artifact_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("artifact not found".to_string()))?;
+    let artifact_row =
+        sqlx::query_as::<_, crate::models::ArtifactRow>("SELECT * FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("artifact not found".to_string()))?;
 
     if !is_admin && artifact_row.owner_id != user_id {
         return Err(AppError::Forbidden(
@@ -1390,13 +1411,11 @@ pub async fn yank_artifact(
         ));
     }
 
-    sqlx::query(
-        "UPDATE artifacts SET yanked = true, yanked_reason = $1 WHERE id = $2",
-    )
-    .bind(&req.reason)
-    .bind(artifact_id)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("UPDATE artifacts SET yanked = true, yanked_reason = $1 WHERE id = $2")
+        .bind(&req.reason)
+        .bind(artifact_id)
+        .execute(&state.db)
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1416,13 +1435,12 @@ pub async fn unyank_artifact(
         .await?
         .unwrap_or(false);
 
-    let artifact_row = sqlx::query_as::<_, crate::models::ArtifactRow>(
-        "SELECT * FROM artifacts WHERE id = $1",
-    )
-    .bind(artifact_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("artifact not found".to_string()))?;
+    let artifact_row =
+        sqlx::query_as::<_, crate::models::ArtifactRow>("SELECT * FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("artifact not found".to_string()))?;
 
     if !is_admin && artifact_row.owner_id != user_id {
         return Err(AppError::Forbidden(
@@ -1430,12 +1448,10 @@ pub async fn unyank_artifact(
         ));
     }
 
-    sqlx::query(
-        "UPDATE artifacts SET yanked = false, yanked_reason = NULL WHERE id = $1",
-    )
-    .bind(artifact_id)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("UPDATE artifacts SET yanked = false, yanked_reason = NULL WHERE id = $1")
+        .bind(artifact_id)
+        .execute(&state.db)
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1588,8 +1604,8 @@ pub async fn resolve_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{header, HeaderMap};
     use crate::auth::create_token;
+    use axum::http::{header, HeaderMap};
     use uuid::Uuid;
 
     // =========================================================================
@@ -1617,10 +1633,7 @@ mod tests {
     #[test]
     fn test_bearer_token_wrong_prefix() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Basic my-token-123".parse().unwrap(),
-        );
+        headers.insert(header::AUTHORIZATION, "Basic my-token-123".parse().unwrap());
         let token = bearer_token(&headers);
         assert!(token.is_none());
     }
@@ -1628,10 +1641,7 @@ mod tests {
     #[test]
     fn test_bearer_token_no_space_after_prefix() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Bearertoken".parse().unwrap(),
-        );
+        headers.insert(header::AUTHORIZATION, "Bearertoken".parse().unwrap());
         let token = bearer_token(&headers);
         assert!(token.is_none());
     }
@@ -1819,7 +1829,10 @@ mod tests {
     #[tokio::test]
     async fn test_extract_user_invalid_token() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer invalid-token".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer invalid-token".parse().unwrap(),
+        );
         let state = create_test_state("test-secret");
 
         let result = extract_user_from_headers(&headers, &state, None);
@@ -1839,7 +1852,10 @@ mod tests {
         let token = create_token(user_id, email, secret).unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let state = create_test_state(secret);
 
         let result = extract_user_from_headers(&headers, &state, None);
@@ -1860,7 +1876,10 @@ mod tests {
         let token = create_token(user_id, email, secret).unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let state = create_test_state(wrong_secret);
 
         let result = extract_user_from_headers(&headers, &state, None);
@@ -1883,7 +1902,10 @@ mod tests {
     #[tokio::test]
     async fn test_extract_user_optional_invalid_token() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer invalid-token".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer invalid-token".parse().unwrap(),
+        );
         let state = create_test_state("test-secret");
 
         let result = extract_user_optional(&headers, &state);
@@ -1899,7 +1921,10 @@ mod tests {
         let token = create_token(user_id, email, secret).unwrap();
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         let state = create_test_state(secret);
 
         let result = extract_user_optional(&headers, &state);
@@ -2374,7 +2399,10 @@ mod tests {
     #[test]
     fn test_validate_version_with_spaces_returns_error() {
         let result = crate::validation::validate_version("1.0 bad");
-        assert!(result.is_err(), "version containing a space must be rejected");
+        assert!(
+            result.is_err(),
+            "version containing a space must be rejected"
+        );
     }
 
     #[test]
@@ -2396,7 +2424,10 @@ mod tests {
         // Exactly 256 KB should be accepted.
         let content = "x".repeat(262144);
         let result = crate::validation::validate_content_size(&content, 262144);
-        assert!(result.is_ok(), "content exactly at the 256KB limit must be accepted");
+        assert!(
+            result.is_ok(),
+            "content exactly at the 256KB limit must be accepted"
+        );
     }
 
     #[test]
@@ -2404,7 +2435,10 @@ mod tests {
         // 256 KB + 1 byte must be rejected.
         let content = "x".repeat(262145);
         let result = crate::validation::validate_content_size(&content, 262144);
-        assert!(result.is_err(), "content one byte over the limit must be rejected");
+        assert!(
+            result.is_err(),
+            "content one byte over the limit must be rejected"
+        );
     }
 
     // =========================================================================
@@ -2625,7 +2659,10 @@ mod tests {
         // testing the same predicate the handler uses.
         let deps: Option<Vec<crate::models::DependencyRef>> = None;
         let is_empty = deps.as_ref().map_or(true, |d| d.is_empty());
-        assert!(is_empty, "None deps must be treated as empty for set validation");
+        assert!(
+            is_empty,
+            "None deps must be treated as empty for set validation"
+        );
 
         let empty_deps: Option<Vec<crate::models::DependencyRef>> = Some(vec![]);
         let also_empty = empty_deps.as_ref().map_or(true, |d| d.is_empty());
@@ -2636,8 +2673,16 @@ mod tests {
     fn test_get_set_members_response_structure() {
         // Simulate what get_set_members returns for a valid set.
         let members = vec![
-            crate::models::DependencyRef { name: "role-a".to_string(), version: "1.0".to_string(), required: true },
-            crate::models::DependencyRef { name: "policy-b".to_string(), version: "2.0".to_string(), required: false },
+            crate::models::DependencyRef {
+                name: "role-a".to_string(),
+                version: "1.0".to_string(),
+                required: true,
+            },
+            crate::models::DependencyRef {
+                name: "policy-b".to_string(),
+                version: "2.0".to_string(),
+                required: false,
+            },
         ];
         let resp = serde_json::json!({
             "set_name": "my-set",
@@ -2671,9 +2716,11 @@ mod tests {
             artifact_type: "set".to_string(),
             yanked: false,
             yanked_reason: None,
-            dependencies: vec![
-                crate::models::DependencyRef { name: "member-a".to_string(), version: "1.0".to_string(), required: true },
-            ],
+            dependencies: vec![crate::models::DependencyRef {
+                name: "member-a".to_string(),
+                version: "1.0".to_string(),
+                required: true,
+            }],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"artifact_type\":\"set\""));
@@ -2689,7 +2736,10 @@ mod tests {
     fn test_yank_request_deserialization_with_reason() {
         let json = r#"{"reason": "security vulnerability discovered"}"#;
         let req: YankRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.reason, Some("security vulnerability discovered".to_string()));
+        assert_eq!(
+            req.reason,
+            Some("security vulnerability discovered".to_string())
+        );
     }
 
     #[test]
@@ -2774,7 +2824,10 @@ mod tests {
     fn test_push_request_without_schema() {
         let json = r#"{"name": "artifact", "version": "1.0.0", "content": "{}"}"#;
         let req: PushRequest = serde_json::from_str(json).unwrap();
-        assert!(req.schema.is_none(), "schema should be None when not provided");
+        assert!(
+            req.schema.is_none(),
+            "schema should be None when not provided"
+        );
     }
 
     #[test]
@@ -2799,7 +2852,10 @@ mod tests {
         });
         let content = serde_json::json!({"other_field": "value"});
         let result = crate::validation::validate_json_schema(&schema, &content);
-        assert!(result.is_err(), "content missing required field must fail validation");
+        assert!(
+            result.is_err(),
+            "content missing required field must fail validation"
+        );
     }
 
     #[test]

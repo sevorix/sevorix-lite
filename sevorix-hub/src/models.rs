@@ -477,7 +477,10 @@ mod tests {
     #[test]
     fn test_visibility_from_str_valid() {
         assert_eq!(Visibility::from_str("public").unwrap(), Visibility::Public);
-        assert_eq!(Visibility::from_str("private").unwrap(), Visibility::Private);
+        assert_eq!(
+            Visibility::from_str("private").unwrap(),
+            Visibility::Private
+        );
         assert_eq!(Visibility::from_str("draft").unwrap(), Visibility::Draft);
     }
 
@@ -564,7 +567,10 @@ mod tests {
     #[test]
     fn test_endorsement_level_display() {
         assert_eq!(EndorsementLevel::Verified.to_string(), "verified");
-        assert_eq!(EndorsementLevel::TrustedAuthor.to_string(), "trusted_author");
+        assert_eq!(
+            EndorsementLevel::TrustedAuthor.to_string(),
+            "trusted_author"
+        );
         assert_eq!(EndorsementLevel::Official.to_string(), "official");
     }
 
@@ -719,7 +725,9 @@ mod tests {
             denied_pulls: 0,
         };
 
-        let artifact = row.into_artifact_with_owner().expect("conversion should succeed");
+        let artifact = row
+            .into_artifact_with_owner()
+            .expect("conversion should succeed");
         assert_eq!(artifact.visibility, Visibility::Private);
         assert_eq!(artifact.email, "owner@example.com");
         assert!(artifact.owner_is_endorsed);
@@ -742,7 +750,9 @@ mod tests {
             created_at: Utc::now(),
         };
 
-        let endorsement = row.into_endorsement_with_user().expect("conversion should succeed");
+        let endorsement = row
+            .into_endorsement_with_user()
+            .expect("conversion should succeed");
         assert_eq!(endorsement.level, EndorsementLevel::Official);
         assert_eq!(endorsement.email, "endorser@example.com");
     }

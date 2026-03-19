@@ -101,7 +101,8 @@ impl IntegrationRegistry {
 
     /// Register a new integration.
     pub fn register(&mut self, integration: Arc<dyn Integration>) {
-        self.integrations.insert(integration.name().to_string(), integration);
+        self.integrations
+            .insert(integration.name().to_string(), integration);
     }
 
     /// Get an integration by name.
@@ -116,9 +117,7 @@ impl IntegrationRegistry {
 
     /// Get the backup directory for an integration.
     pub fn backup_dir(&self, integration_name: &str) -> PathBuf {
-        self.base_path
-            .join("backups")
-            .join(integration_name)
+        self.base_path.join("backups").join(integration_name)
     }
 
     /// Get the manifest path for an integration.
@@ -132,12 +131,15 @@ impl IntegrationRegistry {
     /// Create a backup of files before modification.
     pub fn create_backup(&self, integration_name: &str, files: &[PathBuf]) -> Result<PathBuf> {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let backup_dir = self.backup_dir(integration_name).join(timestamp.to_string());
+        let backup_dir = self
+            .backup_dir(integration_name)
+            .join(timestamp.to_string());
         std::fs::create_dir_all(&backup_dir)?;
 
         for file in files {
             if file.exists() {
-                let file_name = file.file_name()
+                let file_name = file
+                    .file_name()
                     .ok_or_else(|| anyhow::anyhow!("Invalid file path"))?;
                 let dest = backup_dir.join(file_name);
                 std::fs::copy(file, dest)?;
@@ -320,7 +322,9 @@ mod tests {
         let mut registry = IntegrationRegistry::new().unwrap();
         registry.base_path = temp_dir.path().to_path_buf();
 
-        let backup_path = registry.create_backup("test", &[test_file.clone()]).unwrap();
+        let backup_path = registry
+            .create_backup("test", &[test_file.clone()])
+            .unwrap();
         assert!(backup_path.exists());
 
         // Verify backup contains the file
@@ -410,7 +414,11 @@ mod tests {
         std::fs::write(&original_path, r#"{"original": true}"#).unwrap();
 
         // Create backup directory with backup file
-        let backup_dir = temp_dir.path().join("backups").join("test").join("20240101_000000");
+        let backup_dir = temp_dir
+            .path()
+            .join("backups")
+            .join("test")
+            .join("20240101_000000");
         std::fs::create_dir_all(&backup_dir).unwrap();
         let backup_file = backup_dir.join("original.json");
         std::fs::write(&backup_file, r#"{"original": true}"#).unwrap();
@@ -460,11 +468,21 @@ mod tests {
     #[test]
     fn test_integration_status_equality() {
         assert_eq!(IntegrationStatus::Installed, IntegrationStatus::Installed);
-        assert_eq!(IntegrationStatus::NotInstalled, IntegrationStatus::NotInstalled);
-        assert_ne!(IntegrationStatus::Installed, IntegrationStatus::NotInstalled);
+        assert_eq!(
+            IntegrationStatus::NotInstalled,
+            IntegrationStatus::NotInstalled
+        );
+        assert_ne!(
+            IntegrationStatus::Installed,
+            IntegrationStatus::NotInstalled
+        );
 
-        let corrupted1 = IntegrationStatus::Corrupted { reason: "test".to_string() };
-        let corrupted2 = IntegrationStatus::Corrupted { reason: "test".to_string() };
+        let corrupted1 = IntegrationStatus::Corrupted {
+            reason: "test".to_string(),
+        };
+        let corrupted2 = IntegrationStatus::Corrupted {
+            reason: "test".to_string(),
+        };
         assert_eq!(corrupted1, corrupted2);
     }
 

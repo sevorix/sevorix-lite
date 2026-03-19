@@ -13,8 +13,12 @@ pub fn print_prime(agent_type: &str) {
         other => {
             eprintln!("Unknown agent type: '{}'\n", other);
             eprintln!("Available types:");
-            eprintln!("  policy-manager  (alias: pm)    — Policy authoring and hub management agent");
-            eprintln!("  guarded-agent   (alias: guard) — Agent operating inside a sevorix session");
+            eprintln!(
+                "  policy-manager  (alias: pm)    — Policy authoring and hub management agent"
+            );
+            eprintln!(
+                "  guarded-agent   (alias: guard) — Agent operating inside a sevorix session"
+            );
             std::process::exit(1);
         }
     }

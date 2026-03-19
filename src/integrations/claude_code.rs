@@ -26,8 +26,8 @@ pub struct ClaudeCodeIntegration {
 
 impl ClaudeCodeIntegration {
     pub fn new() -> Result<Self> {
-        let user_dirs = directories::UserDirs::new()
-            .context("Could not determine user directories")?;
+        let user_dirs =
+            directories::UserDirs::new().context("Could not determine user directories")?;
         let home = user_dirs.home_dir();
 
         let proj_dirs = directories::ProjectDirs::from("com", "sevorix", "sevorix")
@@ -45,12 +45,12 @@ impl ClaudeCodeIntegration {
     }
 
     #[cfg(test)]
-    pub fn new_for_test(
-        sevsh_path: PathBuf,
-        launcher_path: PathBuf,
-        state_dir: PathBuf,
-    ) -> Self {
-        Self { sevsh_path, launcher_path, state_dir }
+    pub fn new_for_test(sevsh_path: PathBuf, launcher_path: PathBuf, state_dir: PathBuf) -> Self {
+        Self {
+            sevsh_path,
+            launcher_path,
+            state_dir,
+        }
     }
 
     fn is_daemon_running(&self) -> bool {
@@ -156,7 +156,9 @@ mod tests {
 
     fn create_test_integration(temp_dir: &TempDir) -> ClaudeCodeIntegration {
         let sevsh_path = temp_dir.path().join(".local/bin/sevsh");
-        let launcher_path = temp_dir.path().join("usr/local/bin/sevorix-claude-launcher");
+        let launcher_path = temp_dir
+            .path()
+            .join("usr/local/bin/sevorix-claude-launcher");
         let state_dir = temp_dir.path().join(".local/state/sevorix");
 
         std::fs::create_dir_all(sevsh_path.parent().unwrap()).unwrap();

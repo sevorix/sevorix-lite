@@ -1,10 +1,6 @@
 use dashmap::DashMap;
 use sevorix_core::EnforcementTier;
-use sevorix_watchtower::{
-    build_router,
-    policy::Engine,
-    AppState,
-};
+use sevorix_watchtower::{build_router, policy::Engine, AppState};
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -41,7 +37,9 @@ impl TestHarness {
 
         let engine = Engine::new();
         let session_id = uuid::Uuid::new_v4().to_string();
-        let traffic_log_path = config_dir.join("logs").join(format!("{}-traffic.jsonl", session_id));
+        let traffic_log_path = config_dir
+            .join("logs")
+            .join(format!("{}-traffic.jsonl", session_id));
 
         let (tx, _rx) = broadcast::channel(8192);
 
@@ -67,12 +65,15 @@ impl TestHarness {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
-        TestHarness { addr, client, _dir: dir, config_dir, state }
+        TestHarness {
+            addr,
+            client,
+            _dir: dir,
+            config_dir,
+            state,
+        }
     }
 
     pub fn base_url(&self) -> String {
@@ -81,7 +82,10 @@ impl TestHarness {
 
     /// Write a single policy JSON object into the policies dir.
     pub fn add_policy(&self, id: &str, policy_json: serde_json::Value) {
-        let path = self.config_dir.join("policies").join(format!("{}.json", id));
+        let path = self
+            .config_dir
+            .join("policies")
+            .join(format!("{}.json", id));
         std::fs::write(path, serde_json::to_string_pretty(&policy_json).unwrap()).unwrap();
     }
 
@@ -120,7 +124,9 @@ impl TestHarness {
         std::fs::create_dir_all(config_dir.join("logs")).unwrap();
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let traffic_log_path = config_dir.join("logs").join(format!("{}-traffic.jsonl", session_id));
+        let traffic_log_path = config_dir
+            .join("logs")
+            .join(format!("{}-traffic.jsonl", session_id));
         let (tx, _rx) = broadcast::channel(8192);
 
         let state = Arc::new(AppState {
@@ -140,9 +146,17 @@ impl TestHarness {
         let app = build_router(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        TestHarness { addr, client, _dir: dir, config_dir, state }
+        TestHarness {
+            addr,
+            client,
+            _dir: dir,
+            config_dir,
+            state,
+        }
     }
 }

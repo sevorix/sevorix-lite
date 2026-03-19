@@ -1,8 +1,8 @@
 mod common;
 use common::harness::TestHarness;
 use common::upstream::MockUpstream;
-use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 use serde_json::json;
+use sevorix_watchtower::policy::{Action, Policy, PolicyContext, PolicyType, Role};
 use std::time::Duration;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -58,7 +58,11 @@ async fn test_15_2_shell_layer_events() {
 #[tokio::test]
 async fn test_15_1_network_layer_events() {
     let upstream = MockUpstream::start_any().await;
-    let _upstream_addr = upstream.server.uri().trim_start_matches("http://").to_string();
+    let _upstream_addr = upstream
+        .server
+        .uri()
+        .trim_start_matches("http://")
+        .to_string();
     let h = harness_with_empty_role().await;
 
     let proxied_client = reqwest::Client::builder()

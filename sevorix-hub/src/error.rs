@@ -148,7 +148,10 @@ mod tests {
     #[test]
     fn test_map_db_err_connection_error() {
         // Connection errors should map to Internal
-        let err = sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"));
+        let err = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
         let result = map_db_err(err, "conflict message");
         match result {
             AppError::Internal(_) => (),

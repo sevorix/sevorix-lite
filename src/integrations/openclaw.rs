@@ -25,8 +25,8 @@ pub struct OpenClawIntegration {
 impl OpenClawIntegration {
     /// Create a new OpenClaw integration instance.
     pub fn new() -> Result<Self> {
-        let user_dirs = directories::UserDirs::new()
-            .context("Could not determine user directories")?;
+        let user_dirs =
+            directories::UserDirs::new().context("Could not determine user directories")?;
 
         let home = user_dirs.home_dir();
         let sevsh_path = home.join(".local/bin/sevsh");
@@ -84,8 +84,7 @@ impl OpenClawIntegration {
         }
 
         let backup_path = self.config_path.with_extension("json.backup");
-        std::fs::copy(&self.config_path, &backup_path)
-            .context("Failed to create config backup")?;
+        std::fs::copy(&self.config_path, &backup_path).context("Failed to create config backup")?;
 
         Ok(Some(backup_path))
     }
@@ -93,13 +92,12 @@ impl OpenClawIntegration {
     /// Read existing config or create new empty config.
     fn read_config(&self) -> Result<Value> {
         if self.config_path.exists() {
-            let content = std::fs::read_to_string(&self.config_path)
-                .context("Failed to read config file")?;
+            let content =
+                std::fs::read_to_string(&self.config_path).context("Failed to read config file")?;
             // OpenClaw uses JSON5, but we parse as JSON (basic support)
             // JSON5 features like comments will be stripped
             let content = Self::strip_json5_extras(&content);
-            serde_json::from_str(&content)
-                .context("Failed to parse config JSON")
+            serde_json::from_str(&content).context("Failed to parse config JSON")
         } else {
             Ok(json!({}))
         }
@@ -130,14 +128,11 @@ impl OpenClawIntegration {
     fn write_config(&self, config: &Value) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create .openclaw directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create .openclaw directory")?;
         }
 
-        let content = serde_json::to_string_pretty(config)
-            .context("Failed to serialize config")?;
-        std::fs::write(&self.config_path, content)
-            .context("Failed to write config file")?;
+        let content = serde_json::to_string_pretty(config).context("Failed to serialize config")?;
+        std::fs::write(&self.config_path, content).context("Failed to write config file")?;
 
         Ok(())
     }
@@ -201,9 +196,7 @@ impl Integration for OpenClawIntegration {
 
         // Pre-check: Verify daemon is running
         if !self.is_daemon_running() {
-            anyhow::bail!(
-                "Sevorix daemon is not running. Start it with 'sevorix start' first."
-            );
+            anyhow::bail!("Sevorix daemon is not running. Start it with 'sevorix start' first.");
         }
 
         // Pre-check: Verify sevsh is installed
@@ -217,29 +210,22 @@ impl Integration for OpenClawIntegration {
         // Backup existing config if present
         let backup_path = self.backup_config()?;
         if let Some(ref path) = backup_path {
-            config_changes.push(format!(
-                "Backed up existing config to {:?}",
-                path
-            ));
+            config_changes.push(format!("Backed up existing config to {:?}", path));
         }
 
         // Read existing config
         let mut config = self.read_config()?;
 
         // Get or create env object
-        let env = config
-            .get("env")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let env = config.get("env").cloned().unwrap_or_else(|| json!({}));
 
-        let mut env_obj = env.as_object()
-            .cloned()
-            .unwrap_or_default();
+        let mut env_obj = env.as_object().cloned().unwrap_or_default();
 
         // Check if SHELL is already set
         let had_existing_shell = env_obj.contains_key("SHELL");
         if had_existing_shell {
-            let old_shell = env_obj.get("SHELL")
+            let old_shell = env_obj
+                .get("SHELL")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             config_changes.push(format!("Replacing existing SHELL: {}", old_shell));
@@ -305,7 +291,8 @@ impl Integration for OpenClawIntegration {
         let backup_path = self.config_path.with_extension("json.backup");
         if backup_path.exists() {
             println!("Backup exists at: {}", backup_path.display());
-            println!("To restore original config: mv {} {}",
+            println!(
+                "To restore original config: mv {} {}",
                 backup_path.display(),
                 self.config_path.display()
             );
@@ -714,10 +701,17 @@ mod tests {
         if let Some(parent) = integration.config_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&integration.config_path, r#"{"env": {"SHELL": "/bin/csh"}}"#).unwrap();
+        std::fs::write(
+            &integration.config_path,
+            r#"{"env": {"SHELL": "/bin/csh"}}"#,
+        )
+        .unwrap();
 
         let result = integration.install().unwrap();
-        assert!(result.config_changes.iter().any(|c| c.contains("Replacing")));
+        assert!(result
+            .config_changes
+            .iter()
+            .any(|c| c.contains("Replacing")));
 
         let config = integration.read_config().unwrap();
         assert_eq!(config["env"]["SHELL"], "~/.local/bin/sevsh");
@@ -735,7 +729,10 @@ mod tests {
         std::fs::write(&integration.config_path, r#"{"existing": true}"#).unwrap();
 
         let result = integration.install().unwrap();
-        assert!(result.config_changes.iter().any(|c| c.contains("Backed up")));
+        assert!(result
+            .config_changes
+            .iter()
+            .any(|c| c.contains("Backed up")));
 
         let backup_path = integration.config_path.with_extension("json.backup");
         assert!(backup_path.exists());
@@ -749,7 +746,11 @@ mod tests {
         if let Some(parent) = integration.config_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&integration.config_path, r#"{"env": {"SHELL": "~/.local/bin/sevsh", "DEBUG": "1"}}"#).unwrap();
+        std::fs::write(
+            &integration.config_path,
+            r#"{"env": {"SHELL": "~/.local/bin/sevsh", "DEBUG": "1"}}"#,
+        )
+        .unwrap();
 
         integration.uninstall().unwrap();
 
@@ -766,7 +767,11 @@ mod tests {
         if let Some(parent) = integration.config_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&integration.config_path, r#"{"env": {"SHELL": "~/.local/bin/sevsh"}}"#).unwrap();
+        std::fs::write(
+            &integration.config_path,
+            r#"{"env": {"SHELL": "~/.local/bin/sevsh"}}"#,
+        )
+        .unwrap();
 
         integration.uninstall().unwrap();
 
@@ -791,7 +796,11 @@ mod tests {
         if let Some(parent) = integration.config_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&integration.config_path, r#"{"providers": ["openai", "anthropic"], "default": "claude"}"#).unwrap();
+        std::fs::write(
+            &integration.config_path,
+            r#"{"providers": ["openai", "anthropic"], "default": "claude"}"#,
+        )
+        .unwrap();
 
         integration.install().unwrap();
 

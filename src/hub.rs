@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use reqwest::{Client, header::AUTHORIZATION};
+use reqwest::{header::AUTHORIZATION, Client};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 const DEFAULT_HUB_URL: &str = "https://sevorix-hub-668536931811.us-central1.run.app";
 
@@ -12,8 +12,7 @@ const DEFAULT_HUB_URL: &str = "https://sevorix-hub-668536931811.us-central1.run.
 // ---------------------------------------------------------------------------
 
 fn token_path() -> Result<PathBuf> {
-    let home = directories::UserDirs::new()
-        .context("Could not determine home directory")?;
+    let home = directories::UserDirs::new().context("Could not determine home directory")?;
     let sevorix_dir = home.home_dir().join(".sevorix");
     fs::create_dir_all(&sevorix_dir).context("Failed to create ~/.sevorix directory")?;
     Ok(sevorix_dir.join("hub_token"))
@@ -24,7 +23,11 @@ fn token_path() -> Result<PathBuf> {
 fn legacy_token_path() -> Option<PathBuf> {
     let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")?;
     let path = proj_dirs.config_dir().join("hub_token");
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 pub fn save_token(token: &str) -> Result<()> {
@@ -55,7 +58,9 @@ pub fn load_token() -> Result<String> {
         let _ = fs::remove_file(&legacy);
         return Ok(token);
     }
-    Err(anyhow::anyhow!("No hub token found. Run 'sevorix hub login' first."))
+    Err(anyhow::anyhow!(
+        "No hub token found. Run 'sevorix hub login' first."
+    ))
 }
 
 pub fn clear_token() -> Result<()> {
@@ -91,9 +96,7 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     let payload_padded = format!("{}{}", payload, "=".repeat(padding));
 
     // Replace URL-safe characters with standard base64 characters
-    let payload_std = payload_padded
-        .replace('-', "+")
-        .replace('_', "/");
+    let payload_std = payload_padded.replace('-', "+").replace('_', "/");
 
     // Decode base64
     let decoded = base64_decode(&payload_std).ok()?;
@@ -185,10 +188,14 @@ pub fn check_auth_status(hub_url: Option<&str>) -> AuthStatus {
 
     // Decode JWT to extract claims
     let (email, expires_at) = if let Some(payload) = decode_jwt_payload(&token) {
-        let email = payload.get("email").and_then(|e| e.as_str()).map(|s| s.to_string());
+        let email = payload
+            .get("email")
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string());
 
         // Try common expiration claim names
-        let expires_at = payload.get("exp")
+        let expires_at = payload
+            .get("exp")
             .or_else(|| payload.get("expires_at"))
             .and_then(|e| {
                 if let Some(exp_str) = e.as_str() {
@@ -196,7 +203,9 @@ pub fn check_auth_status(hub_url: Option<&str>) -> AuthStatus {
                 } else if let Some(exp_num) = e.as_i64() {
                     // Convert Unix timestamp to readable format
                     use chrono::{TimeZone, Utc};
-                    Utc.timestamp_opt(exp_num, 0).single().map(|dt| dt.to_rfc3339())
+                    Utc.timestamp_opt(exp_num, 0)
+                        .single()
+                        .map(|dt| dt.to_rfc3339())
                 } else {
                     None
                 }
@@ -344,7 +353,11 @@ impl HubClient {
         let client = Client::new();
         let token = load_token().ok();
 
-        Ok(Self { client, base_url, token })
+        Ok(Self {
+            client,
+            base_url,
+            token,
+        })
     }
 
     pub async fn login(&self, email: &str, password: &str) -> Result<LoginResponse> {
@@ -354,7 +367,8 @@ impl HubClient {
             password: password.to_string(),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&req)
             .send()
@@ -367,7 +381,8 @@ impl HubClient {
             anyhow::bail!("Login failed ({}): {}", status, body);
         }
 
-        response.json::<LoginResponse>()
+        response
+            .json::<LoginResponse>()
             .await
             .context("Failed to parse login response")
     }
@@ -379,7 +394,8 @@ impl HubClient {
             password: password.to_string(),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&req)
             .send()
@@ -392,18 +408,22 @@ impl HubClient {
             anyhow::bail!("Registration failed ({}): {}", status, body);
         }
 
-        response.json::<RegisterResponse>()
+        response
+            .json::<RegisterResponse>()
             .await
             .context("Failed to parse registration response")
     }
 
     pub async fn push(&self, req: PushRequest) -> Result<PushResponse> {
-        let token = self.token.as_ref()
+        let token = self
+            .token
+            .as_ref()
             .context("Not authenticated. Run 'sevorix hub login' first.")?;
 
         let url = format!("{}/api/v1/artifacts", self.base_url);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .json(&req)
@@ -417,7 +437,8 @@ impl HubClient {
             anyhow::bail!("Push failed ({}): {}", status, body);
         }
 
-        response.json::<PushResponse>()
+        response
+            .json::<PushResponse>()
             .await
             .context("Failed to parse push response")
     }
@@ -425,7 +446,8 @@ impl HubClient {
     pub async fn pull(&self, name: &str, version: &str) -> Result<PullResponse> {
         let url = format!("{}/api/v1/artifacts/{}/{}", self.base_url, name, version);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -437,20 +459,24 @@ impl HubClient {
             anyhow::bail!("Pull failed ({}): {}", status, body);
         }
 
-        response.json::<PullResponse>()
+        response
+            .json::<PullResponse>()
             .await
             .context("Failed to parse pull response")
     }
 
     /// Yank an artifact by UUID. Pass `reason` to record why it was yanked.
     pub async fn yank(&self, artifact_id: &str, reason: Option<&str>) -> Result<()> {
-        let token = self.token.as_ref()
+        let token = self
+            .token
+            .as_ref()
             .context("Not authenticated. Run 'sevorix hub login' first.")?;
 
         let url = format!("{}/api/v1/artifacts/{}/yank", self.base_url, artifact_id);
         let body = serde_json::json!({ "reason": reason });
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .json(&body)
@@ -469,12 +495,15 @@ impl HubClient {
 
     /// Unyank an artifact by UUID.
     pub async fn unyank(&self, artifact_id: &str) -> Result<()> {
-        let token = self.token.as_ref()
+        let token = self
+            .token
+            .as_ref()
             .context("Not authenticated. Run 'sevorix hub login' first.")?;
 
         let url = format!("{}/api/v1/artifacts/{}/yank", self.base_url, artifact_id);
 
-        let response = self.client
+        let response = self
+            .client
             .delete(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .send()
@@ -503,7 +532,8 @@ impl HubClient {
 
         url.push_str(&params.join("&"));
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -515,7 +545,8 @@ impl HubClient {
             anyhow::bail!("Search failed ({}): {}", status, body);
         }
 
-        response.json::<SearchResponse>()
+        response
+            .json::<SearchResponse>()
             .await
             .context("Failed to parse search response")
     }
@@ -566,8 +597,8 @@ mod tests {
         let input = "hello world&key=value";
         let encoded = encode_query(input);
         assert!(encoded.contains("%")); // // space
-        // // &
-        // // =
+                                        // // &
+                                        // // =
     }
 
     #[test]
@@ -791,7 +822,10 @@ mod tests {
         assert!(client.is_ok());
 
         let client = client.unwrap();
-        assert_eq!(client.base_url, "https://sevorix-hub-668536931811.us-central1.run.app");
+        assert_eq!(
+            client.base_url,
+            "https://sevorix-hub-668536931811.us-central1.run.app"
+        );
     }
 
     #[test]
@@ -988,7 +1022,10 @@ mod tests {
         let result = decode_jwt_payload(token);
         assert!(result.is_some());
         let payload = result.unwrap();
-        assert_eq!(payload.get("email").and_then(|e| e.as_str()), Some("test@example.com"));
+        assert_eq!(
+            payload.get("email").and_then(|e| e.as_str()),
+            Some("test@example.com")
+        );
     }
 
     #[test]
@@ -1122,7 +1159,11 @@ mod tests {
             content: r#"{"rules": []}"#.to_string(),
             visibility: Some("public".to_string()),
             artifact_type: Some("artifact".to_string()),
-            dependencies: Some(vec![DependencyRef { name: "dep-a".to_string(), version: "1.0.0".to_string(), required: true }]),
+            dependencies: Some(vec![DependencyRef {
+                name: "dep-a".to_string(),
+                version: "1.0.0".to_string(),
+                required: true,
+            }]),
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -1167,5 +1208,4 @@ mod tests {
         let summary: ArtifactSummary = serde_json::from_str(json).unwrap();
         assert!(summary.description.is_none());
     }
-
 }

@@ -491,21 +491,30 @@ mod tests {
     #[test]
     fn test_retain_roles() {
         let mut engine = Engine::new();
-        engine.roles.insert("admin".to_string(), Role {
-            name: "admin".to_string(),
-            policies: vec![],
-            is_dynamic: false,
-        });
-        engine.roles.insert("user".to_string(), Role {
-            name: "user".to_string(),
-            policies: vec![],
-            is_dynamic: false,
-        });
-        engine.roles.insert("guest".to_string(), Role {
-            name: "guest".to_string(),
-            policies: vec![],
-            is_dynamic: false,
-        });
+        engine.roles.insert(
+            "admin".to_string(),
+            Role {
+                name: "admin".to_string(),
+                policies: vec![],
+                is_dynamic: false,
+            },
+        );
+        engine.roles.insert(
+            "user".to_string(),
+            Role {
+                name: "user".to_string(),
+                policies: vec![],
+                is_dynamic: false,
+            },
+        );
+        engine.roles.insert(
+            "guest".to_string(),
+            Role {
+                name: "guest".to_string(),
+                policies: vec![],
+                is_dynamic: false,
+            },
+        );
 
         engine.retain_roles(&["admin".to_string(), "user".to_string()]);
 
@@ -517,32 +526,44 @@ mod tests {
     #[test]
     fn test_merge_engines() {
         let mut engine1 = Engine::new();
-        engine1.policies.insert("p1".to_string(), Policy {
-            id: "p1".to_string(),
-            match_type: PolicyType::Simple("bad".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine1.roles.insert("r1".to_string(), Role {
-            name: "r1".to_string(),
-            policies: vec!["p1".to_string()],
-            is_dynamic: false,
-        });
+        engine1.policies.insert(
+            "p1".to_string(),
+            Policy {
+                id: "p1".to_string(),
+                match_type: PolicyType::Simple("bad".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine1.roles.insert(
+            "r1".to_string(),
+            Role {
+                name: "r1".to_string(),
+                policies: vec!["p1".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let mut engine2 = Engine::new();
-        engine2.policies.insert("p2".to_string(), Policy {
-            id: "p2".to_string(),
-            match_type: PolicyType::Simple("worse".to_string()),
-            action: Action::Flag,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine2.roles.insert("r2".to_string(), Role {
-            name: "r2".to_string(),
-            policies: vec!["p2".to_string()],
-            is_dynamic: false,
-        });
+        engine2.policies.insert(
+            "p2".to_string(),
+            Policy {
+                id: "p2".to_string(),
+                match_type: PolicyType::Simple("worse".to_string()),
+                action: Action::Flag,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine2.roles.insert(
+            "r2".to_string(),
+            Role {
+                name: "r2".to_string(),
+                policies: vec!["p2".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         engine1.merge(engine2);
 
@@ -555,20 +576,26 @@ mod tests {
     #[test]
     fn test_check_returns_first_block() {
         let mut engine = Engine::new();
-        engine.policies.insert("flag1".to_string(), Policy {
-            id: "flag1".to_string(),
-            match_type: PolicyType::Simple("test".to_string()),
-            action: Action::Flag,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.policies.insert("block1".to_string(), Policy {
-            id: "block1".to_string(),
-            match_type: PolicyType::Simple("test".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
+        engine.policies.insert(
+            "flag1".to_string(),
+            Policy {
+                id: "flag1".to_string(),
+                match_type: PolicyType::Simple("test".to_string()),
+                action: Action::Flag,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.policies.insert(
+            "block1".to_string(),
+            Policy {
+                id: "block1".to_string(),
+                match_type: PolicyType::Simple("test".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
 
         // Block should take precedence
         let decision = engine.check("test content", PolicyContext::All);
@@ -579,13 +606,16 @@ mod tests {
     #[test]
     fn test_check_returns_flag_if_no_block() {
         let mut engine = Engine::new();
-        engine.policies.insert("flag1".to_string(), Policy {
-            id: "flag1".to_string(),
-            match_type: PolicyType::Simple("test".to_string()),
-            action: Action::Flag,
-            context: PolicyContext::All,
-            kill: false,
-        });
+        engine.policies.insert(
+            "flag1".to_string(),
+            Policy {
+                id: "flag1".to_string(),
+                match_type: PolicyType::Simple("test".to_string()),
+                action: Action::Flag,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
 
         let decision = engine.check("test content", PolicyContext::All);
         assert!(decision.is_some());
@@ -595,13 +625,16 @@ mod tests {
     #[test]
     fn test_check_returns_none_for_allow() {
         let mut engine = Engine::new();
-        engine.policies.insert("allow1".to_string(), Policy {
-            id: "allow1".to_string(),
-            match_type: PolicyType::Simple("test".to_string()),
-            action: Action::Allow,
-            context: PolicyContext::All,
-            kill: false,
-        });
+        engine.policies.insert(
+            "allow1".to_string(),
+            Policy {
+                id: "allow1".to_string(),
+                match_type: PolicyType::Simple("test".to_string()),
+                action: Action::Allow,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
 
         let decision = engine.check("test content", PolicyContext::All);
         assert!(decision.is_none());
@@ -618,18 +651,24 @@ mod tests {
     #[test]
     fn test_check_kill_flag_propagates() {
         let mut engine = Engine::new();
-        engine.policies.insert("kill_policy".to_string(), Policy {
-            id: "kill_policy".to_string(),
-            match_type: PolicyType::Simple("killme".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: true,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["kill_policy".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "kill_policy".to_string(),
+            Policy {
+                id: "kill_policy".to_string(),
+                match_type: PolicyType::Simple("killme".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: true,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["kill_policy".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let decision = engine.check("killme", PolicyContext::All);
         assert!(decision.is_some());
@@ -639,18 +678,24 @@ mod tests {
     #[test]
     fn test_check_role_context_filtering() {
         let mut engine = Engine::new();
-        engine.policies.insert("shell_only".to_string(), Policy {
-            id: "shell_only".to_string(),
-            match_type: PolicyType::Simple("rm".to_string()),
-            action: Action::Block,
-            context: PolicyContext::Shell,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["shell_only".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "shell_only".to_string(),
+            Policy {
+                id: "shell_only".to_string(),
+                match_type: PolicyType::Simple("rm".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Shell,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["shell_only".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         // Should match in Shell context
         let decision = engine.check_role("default", "rm -rf", PolicyContext::Shell);
@@ -670,13 +715,13 @@ mod tests {
     }
 }
 
-    #[test]
-    fn test_load_from_file() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let path = dir.path().join("policies.json");
-        
-        let content = r#"{
+#[test]
+fn test_load_from_file() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let path = dir.path().join("policies.json");
+
+    let content = r#"{
             "policies": [
                 {
                     "id": "file_policy",
@@ -693,134 +738,142 @@ mod tests {
                 }
             ]
         }"#;
-        
-        let mut file = std::fs::File::create(&path).expect("Failed to create file");
-        file.write_all(content.as_bytes()).expect("Failed to write");
-        
-        let engine = Engine::load_from_file(path.to_str().unwrap()).expect("Failed to load");
-        
-        assert!(engine.policies.contains_key("file_policy"));
-        assert!(engine.roles.contains_key("test_role"));
-    }
 
-    #[test]
-    fn test_load_from_file_missing() {
-        let result = Engine::load_from_file("/nonexistent/path/policies.json");
-        assert!(result.is_err());
-    }
+    let mut file = std::fs::File::create(&path).expect("Failed to create file");
+    file.write_all(content.as_bytes()).expect("Failed to write");
 
-    #[test]
-    fn test_load_policies_from_dir() {
-        let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let policy_path = dir.path().join("policy1.json");
-        
-        let content = r#"{
+    let engine = Engine::load_from_file(path.to_str().unwrap()).expect("Failed to load");
+
+    assert!(engine.policies.contains_key("file_policy"));
+    assert!(engine.roles.contains_key("test_role"));
+}
+
+#[test]
+fn test_load_from_file_missing() {
+    let result = Engine::load_from_file("/nonexistent/path/policies.json");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_load_policies_from_dir() {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let policy_path = dir.path().join("policy1.json");
+
+    let content = r#"{
             "id": "dir_policy",
             "type": "Simple",
             "pattern": "test",
             "action": "Flag"
         }"#;
-        
-        std::fs::write(&policy_path, content).expect("Failed to write");
-        
-        let mut engine = Engine::new();
-        engine.load_policies_from_dir(dir.path()).expect("Failed to load");
-        
-        assert!(engine.policies.contains_key("dir_policy"));
-    }
 
-    #[test]
-    fn test_load_policies_from_dir_multiple() {
-        let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        
-        // Write array of policies
-        let policy_path = dir.path().join("policies.json");
-        let content = r#"[
+    std::fs::write(&policy_path, content).expect("Failed to write");
+
+    let mut engine = Engine::new();
+    engine
+        .load_policies_from_dir(dir.path())
+        .expect("Failed to load");
+
+    assert!(engine.policies.contains_key("dir_policy"));
+}
+
+#[test]
+fn test_load_policies_from_dir_multiple() {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    // Write array of policies
+    let policy_path = dir.path().join("policies.json");
+    let content = r#"[
             {"id": "p1", "type": "Simple", "pattern": "a", "action": "Block"},
             {"id": "p2", "type": "Simple", "pattern": "b", "action": "Flag"}
         ]"#;
-        std::fs::write(&policy_path, content).expect("Failed to write");
-        
-        let mut engine = Engine::new();
-        engine.load_policies_from_dir(dir.path()).expect("Failed to load");
-        
-        assert!(engine.policies.contains_key("p1"));
-        assert!(engine.policies.contains_key("p2"));
-    }
+    std::fs::write(&policy_path, content).expect("Failed to write");
 
-    #[test]
-    fn test_load_policies_from_nonexistent_dir() {
-        let mut engine = Engine::new();
-        let result = engine.load_policies_from_dir(std::path::Path::new("/nonexistent/dir"));
-        assert!(result.is_ok()); // Should not error on nonexistent dir
-    }
+    let mut engine = Engine::new();
+    engine
+        .load_policies_from_dir(dir.path())
+        .expect("Failed to load");
 
-    #[test]
-    fn test_load_roles_from_dir() {
-        let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let role_path = dir.path().join("role.json");
-        
-        let content = r#"{
+    assert!(engine.policies.contains_key("p1"));
+    assert!(engine.policies.contains_key("p2"));
+}
+
+#[test]
+fn test_load_policies_from_nonexistent_dir() {
+    let mut engine = Engine::new();
+    let result = engine.load_policies_from_dir(std::path::Path::new("/nonexistent/dir"));
+    assert!(result.is_ok()); // Should not error on nonexistent dir
+}
+
+#[test]
+fn test_load_roles_from_dir() {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let role_path = dir.path().join("role.json");
+
+    let content = r#"{
             "name": "dir_role",
             "policies": ["p1"],
             "is_dynamic": false
         }"#;
-        
-        std::fs::write(&role_path, content).expect("Failed to write");
-        
-        let mut engine = Engine::new();
-        engine.load_roles_from_dir(dir.path()).expect("Failed to load");
-        
-        assert!(engine.roles.contains_key("dir_role"));
-    }
 
-    #[test]
-    fn test_load_roles_from_dir_multiple() {
-        let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        
-        let role_path = dir.path().join("roles.json");
-        let content = r#"[
+    std::fs::write(&role_path, content).expect("Failed to write");
+
+    let mut engine = Engine::new();
+    engine
+        .load_roles_from_dir(dir.path())
+        .expect("Failed to load");
+
+    assert!(engine.roles.contains_key("dir_role"));
+}
+
+#[test]
+fn test_load_roles_from_dir_multiple() {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    let role_path = dir.path().join("roles.json");
+    let content = r#"[
             {"name": "r1", "policies": [], "is_dynamic": false},
             {"name": "r2", "policies": [], "is_dynamic": true}
         ]"#;
-        std::fs::write(&role_path, content).expect("Failed to write");
-        
-        let mut engine = Engine::new();
-        engine.load_roles_from_dir(dir.path()).expect("Failed to load");
-        
-        assert!(engine.roles.contains_key("r1"));
-        assert!(engine.roles.contains_key("r2"));
-    }
+    std::fs::write(&role_path, content).expect("Failed to write");
 
-    #[test]
-    fn test_load_roles_from_nonexistent_dir() {
-        let mut engine = Engine::new();
-        let result = engine.load_roles_from_dir(std::path::Path::new("/nonexistent/dir"));
-        assert!(result.is_ok());
-    }
+    let mut engine = Engine::new();
+    engine
+        .load_roles_from_dir(dir.path())
+        .expect("Failed to load");
 
-    #[test]
-    fn test_load_policies_ignores_non_json() {
-        let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        
-        // Create non-JSON file
-        let txt_path = dir.path().join("policy.txt");
-        std::fs::write(&txt_path, "not json").expect("Failed to write");
-        
-        let mut engine = Engine::new();
-        let result = engine.load_policies_from_dir(dir.path());
-        assert!(result.is_ok());
-        assert!(engine.policies.is_empty()); // No policies loaded
-    }
+    assert!(engine.roles.contains_key("r1"));
+    assert!(engine.roles.contains_key("r2"));
+}
 
-    #[test]
-    fn test_load_roles_ignores_invalid_json() {
-        let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        
-        let role_path = dir.path().join("invalid.json");
-        std::fs::write(&role_path, "not valid json").expect("Failed to write");
-        
-        let mut engine = Engine::new();
-        let result = engine.load_roles_from_dir(dir.path());
-        assert!(result.is_ok()); // Should not error, just warn
-    }
+#[test]
+fn test_load_roles_from_nonexistent_dir() {
+    let mut engine = Engine::new();
+    let result = engine.load_roles_from_dir(std::path::Path::new("/nonexistent/dir"));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_load_policies_ignores_non_json() {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    // Create non-JSON file
+    let txt_path = dir.path().join("policy.txt");
+    std::fs::write(&txt_path, "not json").expect("Failed to write");
+
+    let mut engine = Engine::new();
+    let result = engine.load_policies_from_dir(dir.path());
+    assert!(result.is_ok());
+    assert!(engine.policies.is_empty()); // No policies loaded
+}
+
+#[test]
+fn test_load_roles_ignores_invalid_json() {
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    let role_path = dir.path().join("invalid.json");
+    std::fs::write(&role_path, "not valid json").expect("Failed to write");
+
+    let mut engine = Engine::new();
+    let result = engine.load_roles_from_dir(dir.path());
+    assert!(result.is_ok()); // Should not error, just warn
+}

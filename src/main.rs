@@ -1,6 +1,11 @@
 use clap::{CommandFactory, Parser};
-use sevorix_watchtower::{handle_config, handle_integrations, handle_validate, logging::{init_logging, init_logging_with_session}, run_server, validate_startup_config, Cli, Commands, DaemonManager, HubCommands, SessionCommands};
 use sevorix_watchtower::prime::print_prime;
+use sevorix_watchtower::{
+    handle_config, handle_integrations, handle_validate,
+    logging::{init_logging, init_logging_with_session},
+    run_server, validate_startup_config, Cli, Commands, DaemonManager, HubCommands,
+    SessionCommands,
+};
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -17,7 +22,10 @@ fn main() -> anyhow::Result<()> {
     let daemon = DaemonManager::new()?;
 
     match cli.command {
-        Some(Commands::Start { watchtower_only, ebpf_only }) => {
+        Some(Commands::Start {
+            watchtower_only,
+            ebpf_only,
+        }) => {
             // Handle mutually exclusive flags
             if watchtower_only && ebpf_only {
                 eprintln!("Error: --watchtower-only and --ebpf-only are mutually exclusive");
@@ -125,7 +133,11 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Config { subcmd }) => handle_config(subcmd),
         Some(Commands::Hub { subcmd }) => handle_hub(subcmd),
         Some(Commands::Integrations { subcmd }) => handle_integrations(subcmd),
-        Some(Commands::Validate { command, role, context }) => handle_validate(command, role, context),
+        Some(Commands::Validate {
+            command,
+            role,
+            context,
+        }) => handle_validate(command, role, context),
         Some(Commands::Prime { agent_type }) => print_prime(&agent_type),
         Some(Commands::Session { subcmd }) => handle_session(subcmd),
         Some(Commands::Run) => {
@@ -159,15 +171,20 @@ fn spawn_ebpf_daemon() -> anyhow::Result<std::process::Child> {
         .arg("-n")
         .arg(&ebpf_binary)
         .spawn()
-        .map_err(|e| anyhow::anyhow!(
-            "Failed to start eBPF daemon via sudo -n: {}. \
-             Run ./install.sh to configure the required sudoers rule.", e
-        ))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to start eBPF daemon via sudo -n: {}. \
+             Run ./install.sh to configure the required sudoers rule.",
+                e
+            )
+        })?;
 
     // Write the PID file from here so EbpfDaemonManager can find it.
     // The sudo process PID is valid for the lifetime of the daemon.
     if let Some(proj_dirs) = directories::ProjectDirs::from("com", "sevorix", "sevorix") {
-        let state_dir = proj_dirs.state_dir().unwrap_or_else(|| proj_dirs.cache_dir());
+        let state_dir = proj_dirs
+            .state_dir()
+            .unwrap_or_else(|| proj_dirs.cache_dir());
         let _ = std::fs::create_dir_all(state_dir);
         let pid_path = state_dir.join("sevorix-ebpf.pid");
         let _ = std::fs::write(&pid_path, child.id().to_string());
@@ -192,8 +209,9 @@ fn get_ebpf_daemon_path() -> anyhow::Result<std::path::PathBuf> {
     }
 
     // Fall back to PATH lookup
-    which::which("sevorix-ebpf-daemon")
-        .map_err(|_| anyhow::anyhow!("Could not find sevorix-ebpf-daemon in PATH or alongside sevorix binary"))
+    which::which("sevorix-ebpf-daemon").map_err(|_| {
+        anyhow::anyhow!("Could not find sevorix-ebpf-daemon in PATH or alongside sevorix binary")
+    })
 }
 
 /// Stop the eBPF daemon by reading its PID file and sending SIGTERM.
@@ -205,7 +223,9 @@ fn stop_ebpf_daemon() -> anyhow::Result<()> {
     let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
         .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
 
-    let state_dir = proj_dirs.state_dir().unwrap_or_else(|| proj_dirs.cache_dir());
+    let state_dir = proj_dirs
+        .state_dir()
+        .unwrap_or_else(|| proj_dirs.cache_dir());
     let pid_path = state_dir.join("sevorix-ebpf.pid");
 
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
@@ -237,7 +257,9 @@ fn print_ebpf_daemon_status() {
         }
     };
 
-    let state_dir = proj_dirs.state_dir().unwrap_or_else(|| proj_dirs.cache_dir());
+    let state_dir = proj_dirs
+        .state_dir()
+        .unwrap_or_else(|| proj_dirs.cache_dir());
     let pid_path = state_dir.join("sevorix-ebpf.pid");
 
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
@@ -326,7 +348,11 @@ mod tests {
     fn test_cli_start_command() {
         let cli = Cli::try_parse_from(["sevorix", "start"]);
         assert!(cli.is_ok());
-        if let Some(Commands::Start { watchtower_only, ebpf_only }) = cli.unwrap().command {
+        if let Some(Commands::Start {
+            watchtower_only,
+            ebpf_only,
+        }) = cli.unwrap().command
+        {
             assert!(!watchtower_only);
             assert!(!ebpf_only);
         } else {
@@ -338,7 +364,11 @@ mod tests {
     fn test_cli_start_watchtower_only() {
         let cli = Cli::try_parse_from(["sevorix", "start", "--watchtower-only"]);
         assert!(cli.is_ok());
-        if let Some(Commands::Start { watchtower_only, ebpf_only }) = cli.unwrap().command {
+        if let Some(Commands::Start {
+            watchtower_only,
+            ebpf_only,
+        }) = cli.unwrap().command
+        {
             assert!(watchtower_only);
             assert!(!ebpf_only);
         } else {
@@ -350,7 +380,11 @@ mod tests {
     fn test_cli_start_ebpf_only() {
         let cli = Cli::try_parse_from(["sevorix", "start", "--ebpf-only"]);
         assert!(cli.is_ok());
-        if let Some(Commands::Start { watchtower_only, ebpf_only }) = cli.unwrap().command {
+        if let Some(Commands::Start {
+            watchtower_only,
+            ebpf_only,
+        }) = cli.unwrap().command
+        {
             assert!(!watchtower_only);
             assert!(ebpf_only);
         } else {
@@ -401,7 +435,12 @@ mod tests {
     fn test_cli_validate_command() {
         let cli = Cli::try_parse_from(["sevorix", "validate", "echo hello"]);
         assert!(cli.is_ok());
-        if let Some(Commands::Validate { command, role, context }) = cli.unwrap().command {
+        if let Some(Commands::Validate {
+            command,
+            role,
+            context,
+        }) = cli.unwrap().command
+        {
             assert_eq!(command, "echo hello");
             assert!(role.is_none());
             assert_eq!(context, "Shell"); // default
@@ -412,9 +451,22 @@ mod tests {
 
     #[test]
     fn test_cli_validate_with_options() {
-        let cli = Cli::try_parse_from(["sevorix", "validate", "DROP TABLE", "-r", "admin", "-C", "All"]);
+        let cli = Cli::try_parse_from([
+            "sevorix",
+            "validate",
+            "DROP TABLE",
+            "-r",
+            "admin",
+            "-C",
+            "All",
+        ]);
         assert!(cli.is_ok());
-        if let Some(Commands::Validate { command, role, context }) = cli.unwrap().command {
+        if let Some(Commands::Validate {
+            command,
+            role,
+            context,
+        }) = cli.unwrap().command
+        {
             assert_eq!(command, "DROP TABLE");
             assert_eq!(role, Some("admin".to_string()));
             assert_eq!(context, "All");
@@ -433,11 +485,21 @@ mod tests {
 
     #[test]
     fn test_cli_hub_login_command() {
-        let cli = Cli::try_parse_from(["sevorix", "hub", "login", "-e", "test@example.com", "-p", "secret"]);
+        let cli = Cli::try_parse_from([
+            "sevorix",
+            "hub",
+            "login",
+            "-e",
+            "test@example.com",
+            "-p",
+            "secret",
+        ]);
         assert!(cli.is_ok());
         if let Some(Commands::Hub { subcmd }) = cli.unwrap().command {
             match subcmd {
-                HubCommands::Login { email, password, .. } => {
+                HubCommands::Login {
+                    email, password, ..
+                } => {
                     assert_eq!(email, Some("test@example.com".to_string()));
                     assert_eq!(password, Some("secret".to_string()));
                 }
@@ -473,18 +535,33 @@ mod tests {
     #[test]
     fn test_cli_hub_push_command() {
         let cli = Cli::try_parse_from([
-            "sevorix", "hub", "push",
-            "-n", "my-policy",
-            "-v", "1.0.0",
-            "-f", "/path/to/policy.json",
-            "-d", "My policy description",
-            "-t", "security",
-            "-t", "blocking"
+            "sevorix",
+            "hub",
+            "push",
+            "-n",
+            "my-policy",
+            "-v",
+            "1.0.0",
+            "-f",
+            "/path/to/policy.json",
+            "-d",
+            "My policy description",
+            "-t",
+            "security",
+            "-t",
+            "blocking",
         ]);
         assert!(cli.is_ok());
         if let Some(Commands::Hub { subcmd }) = cli.unwrap().command {
             match subcmd {
-                HubCommands::Push { name, version, file, description, tag, .. } => {
+                HubCommands::Push {
+                    name,
+                    version,
+                    file,
+                    description,
+                    tag,
+                    ..
+                } => {
                     assert_eq!(name, "my-policy");
                     assert_eq!(version, "1.0.0");
                     assert_eq!(file, "/path/to/policy.json");
@@ -500,11 +577,24 @@ mod tests {
 
     #[test]
     fn test_cli_hub_pull_command() {
-        let cli = Cli::try_parse_from(["sevorix", "hub", "pull", "my-policy", "1.0.0", "-o", "/tmp/policy.json"]);
+        let cli = Cli::try_parse_from([
+            "sevorix",
+            "hub",
+            "pull",
+            "my-policy",
+            "1.0.0",
+            "-o",
+            "/tmp/policy.json",
+        ]);
         assert!(cli.is_ok());
         if let Some(Commands::Hub { subcmd }) = cli.unwrap().command {
             match subcmd {
-                HubCommands::Pull { name, version, output, .. } => {
+                HubCommands::Pull {
+                    name,
+                    version,
+                    output,
+                    ..
+                } => {
                     assert_eq!(name, "my-policy");
                     assert_eq!(version, "1.0.0");
                     assert_eq!(output, Some("/tmp/policy.json".to_string()));
@@ -518,11 +608,15 @@ mod tests {
 
     #[test]
     fn test_cli_hub_search_command() {
-        let cli = Cli::try_parse_from(["sevorix", "hub", "search", "-q", "security", "-t", "blocking", "-l", "50"]);
+        let cli = Cli::try_parse_from([
+            "sevorix", "hub", "search", "-q", "security", "-t", "blocking", "-l", "50",
+        ]);
         assert!(cli.is_ok());
         if let Some(Commands::Hub { subcmd }) = cli.unwrap().command {
             match subcmd {
-                HubCommands::Search { query, tag, limit, .. } => {
+                HubCommands::Search {
+                    query, tag, limit, ..
+                } => {
                     assert_eq!(query, Some("security".to_string()));
                     assert_eq!(tag, Some("blocking".to_string()));
                     assert_eq!(limit, 50);
@@ -602,13 +696,27 @@ mod tests {
     #[test]
     fn test_parse_allowed_roles_multiple() {
         let roles = parse_allowed_roles(Some("admin,dev,user"));
-        assert_eq!(roles, Some(vec!["admin".to_string(), "dev".to_string(), "user".to_string()]));
+        assert_eq!(
+            roles,
+            Some(vec![
+                "admin".to_string(),
+                "dev".to_string(),
+                "user".to_string()
+            ])
+        );
     }
 
     #[test]
     fn test_parse_allowed_roles_with_spaces() {
         let roles = parse_allowed_roles(Some("admin , dev , user"));
-        assert_eq!(roles, Some(vec!["admin".to_string(), "dev".to_string(), "user".to_string()]));
+        assert_eq!(
+            roles,
+            Some(vec![
+                "admin".to_string(),
+                "dev".to_string(),
+                "user".to_string()
+            ])
+        );
     }
 
     #[test]
@@ -625,11 +733,21 @@ mod tests {
 
     #[test]
     fn test_cli_hub_register_command() {
-        let cli = Cli::try_parse_from(["sevorix", "hub", "register", "-e", "new@example.com", "-p", "password123"]);
+        let cli = Cli::try_parse_from([
+            "sevorix",
+            "hub",
+            "register",
+            "-e",
+            "new@example.com",
+            "-p",
+            "password123",
+        ]);
         assert!(cli.is_ok());
         if let Some(Commands::Hub { subcmd }) = cli.unwrap().command {
             match subcmd {
-                HubCommands::Register { email, password, .. } => {
+                HubCommands::Register {
+                    email, password, ..
+                } => {
                     assert_eq!(email, Some("new@example.com".to_string()));
                     assert_eq!(password, Some("password123".to_string()));
                 }
@@ -642,10 +760,17 @@ mod tests {
 }
 
 async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
-    use sevorix_watchtower::hub::{HubClient, PushRequest, DependencyRef, check_executable_policy, clear_token, save_token, check_auth_status};
+    use sevorix_watchtower::hub::{
+        check_auth_status, check_executable_policy, clear_token, save_token, DependencyRef,
+        HubClient, PushRequest,
+    };
 
     match cmd {
-        HubCommands::Register { hub_url, email, password } => {
+        HubCommands::Register {
+            hub_url,
+            email,
+            password,
+        } => {
             use dialoguer::{Input, Password};
 
             println!("SevorixHub Registration\n");
@@ -653,18 +778,16 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             // Prompt for email if not provided
             let email = match email {
                 Some(e) => e,
-                None => {
-                    Input::new()
-                        .with_prompt("Email address")
-                        .validate_with(|input: &String| -> Result<(), &str> {
-                            if input.contains('@') && input.contains('.') {
-                                Ok(())
-                            } else {
-                                Err("Please enter a valid email address")
-                            }
-                        })
-                        .interact_text()?
-                }
+                None => Input::new()
+                    .with_prompt("Email address")
+                    .validate_with(|input: &String| -> Result<(), &str> {
+                        if input.contains('@') && input.contains('.') {
+                            Ok(())
+                        } else {
+                            Err("Please enter a valid email address")
+                        }
+                    })
+                    .interact_text()?,
             };
 
             // Prompt for password if not provided
@@ -681,9 +804,7 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
                             }
                         })
                         .interact()?;
-                    let confirm = Password::new()
-                        .with_prompt("Confirm password")
-                        .interact()?;
+                    let confirm = Password::new().with_prompt("Confirm password").interact()?;
                     if pwd != confirm {
                         anyhow::bail!("Passwords do not match");
                     }
@@ -696,10 +817,17 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
 
             println!("\n✓ Successfully registered user '{}'", response.email);
             println!("  User ID: {}", response.id);
-            println!("\nYou can now login with: sevorix hub login -e {}", response.email);
+            println!(
+                "\nYou can now login with: sevorix hub login -e {}",
+                response.email
+            );
         }
 
-        HubCommands::Login { hub_url, email, password } => {
+        HubCommands::Login {
+            hub_url,
+            email,
+            password,
+        } => {
             use dialoguer::{Input, Password};
 
             println!("SevorixHub Login\n");
@@ -707,28 +835,22 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             // Prompt for email if not provided
             let email = match email {
                 Some(e) => e,
-                None => {
-                    Input::new()
-                        .with_prompt("Email address")
-                        .validate_with(|input: &String| -> Result<(), &str> {
-                            if input.contains('@') && input.contains('.') {
-                                Ok(())
-                            } else {
-                                Err("Please enter a valid email address")
-                            }
-                        })
-                        .interact_text()?
-                }
+                None => Input::new()
+                    .with_prompt("Email address")
+                    .validate_with(|input: &String| -> Result<(), &str> {
+                        if input.contains('@') && input.contains('.') {
+                            Ok(())
+                        } else {
+                            Err("Please enter a valid email address")
+                        }
+                    })
+                    .interact_text()?,
             };
 
             // Prompt for password if not provided
             let password = match password {
                 Some(p) => p,
-                None => {
-                    Password::new()
-                        .with_prompt("Password")
-                        .interact()?
-                }
+                None => Password::new().with_prompt("Password").interact()?,
             };
 
             let client = HubClient::new(hub_url.as_deref())?;
@@ -741,7 +863,17 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             println!("  Token saved to ~/.sevorix/hub_token");
         }
 
-        HubCommands::Push { hub_url, name, version, file, description, tag, artifact_type, dep, visibility } => {
+        HubCommands::Push {
+            hub_url,
+            name,
+            version,
+            file,
+            description,
+            tag,
+            artifact_type,
+            dep,
+            visibility,
+        } => {
             // Read the policy file
             let content = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", file, e))?;
@@ -786,19 +918,32 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
 
             let response = client.push(req).await?;
 
-            println!("Pushed artifact: {}@{} [{}]", response.name, response.version, response.artifact_type);
+            println!(
+                "Pushed artifact: {}@{} [{}]",
+                response.name, response.version, response.artifact_type
+            );
             println!("  ID: {}", response.id);
             println!("  Owner: {}", response.owner);
             println!("  Downloads: {}", response.downloads);
             if !response.dependencies.is_empty() {
                 println!("  Dependencies:");
                 for d in &response.dependencies {
-                    println!("    - {}@{}{}", d.name, d.version, if d.required { "" } else { " (optional)" });
+                    println!(
+                        "    - {}@{}{}",
+                        d.name,
+                        d.version,
+                        if d.required { "" } else { " (optional)" }
+                    );
                 }
             }
         }
 
-        HubCommands::Pull { hub_url, name, version, output } => {
+        HubCommands::Pull {
+            hub_url,
+            name,
+            version,
+            output,
+        } => {
             let client = HubClient::new(hub_url.as_deref())?;
             let response = client.pull(&name, &version).await?;
 
@@ -825,7 +970,10 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
                 }
             }
 
-            println!("\nArtifact: {}@{} [{}]", response.name, response.version, response.artifact_type);
+            println!(
+                "\nArtifact: {}@{} [{}]",
+                response.name, response.version, response.artifact_type
+            );
             println!("Owner: {}", response.owner);
             println!("Downloads: {}", response.downloads);
             if let Some(desc) = response.description {
@@ -834,25 +982,39 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             if !response.dependencies.is_empty() {
                 println!("Dependencies:");
                 for d in &response.dependencies {
-                    println!("  - {}@{}{}", d.name, d.version, if d.required { "" } else { " (optional)" });
+                    println!(
+                        "  - {}@{}{}",
+                        d.name,
+                        d.version,
+                        if d.required { "" } else { " (optional)" }
+                    );
                 }
             }
         }
 
-        HubCommands::Search { hub_url, query, tag, limit } => {
+        HubCommands::Search {
+            hub_url,
+            query,
+            tag,
+            limit,
+        } => {
             let client = HubClient::new(hub_url.as_deref())?;
             let response = client.search(query.as_deref(), tag.as_deref()).await?;
 
             if response.results.is_empty() {
                 println!("No artifacts found.");
             } else {
-                println!("Found {} artifact(s):\n", response.results.len().min(limit as usize));
+                println!(
+                    "Found {} artifact(s):\n",
+                    response.results.len().min(limit as usize)
+                );
                 for artifact in response.results.iter().take(limit as usize) {
                     println!("  {}@{}", artifact.name, artifact.version);
                     if let Some(desc) = &artifact.description {
                         println!("    {}", desc);
                     }
-                    println!("    Owner: {} | Downloads: {} | Tags: {}",
+                    println!(
+                        "    Owner: {} | Downloads: {} | Tags: {}",
                         artifact.owner,
                         artifact.downloads,
                         artifact.tags.join(", ")
@@ -866,11 +1028,17 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             }
         }
 
-        HubCommands::Yank { hub_url, name, version, reason } => {
+        HubCommands::Yank {
+            hub_url,
+            name,
+            version,
+            reason,
+        } => {
             let client = HubClient::new(hub_url.as_deref())?;
             // Resolve the UUID via pull
-            let artifact = client.pull(&name, &version).await
-                .map_err(|e| anyhow::anyhow!("Could not find artifact '{}@{}': {}", name, version, e))?;
+            let artifact = client.pull(&name, &version).await.map_err(|e| {
+                anyhow::anyhow!("Could not find artifact '{}@{}': {}", name, version, e)
+            })?;
             client.yank(&artifact.id, reason.as_deref()).await?;
             println!("Yanked {}@{}", name, version);
             if let Some(r) = &reason {
@@ -878,10 +1046,15 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             }
         }
 
-        HubCommands::Unyank { hub_url, name, version } => {
+        HubCommands::Unyank {
+            hub_url,
+            name,
+            version,
+        } => {
             let client = HubClient::new(hub_url.as_deref())?;
-            let artifact = client.pull(&name, &version).await
-                .map_err(|e| anyhow::anyhow!("Could not find artifact '{}@{}': {}", name, version, e))?;
+            let artifact = client.pull(&name, &version).await.map_err(|e| {
+                anyhow::anyhow!("Could not find artifact '{}@{}': {}", name, version, e)
+            })?;
             client.unyank(&artifact.id).await?;
             println!("Unyanked {}@{}", name, version);
         }

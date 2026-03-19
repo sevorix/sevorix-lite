@@ -89,7 +89,10 @@ mod tests {
         let token = create_token(user_id, email, secret).expect("token creation should succeed");
         let result = verify_token(&token, wrong_secret);
 
-        assert!(result.is_err(), "verification with wrong secret should fail");
+        assert!(
+            result.is_err(),
+            "verification with wrong secret should fail"
+        );
     }
 
     #[test]
@@ -98,7 +101,10 @@ mod tests {
         let malformed_token = "not.a.valid.token";
 
         let result = verify_token(malformed_token, secret);
-        assert!(result.is_err(), "verification of malformed token should fail");
+        assert!(
+            result.is_err(),
+            "verification of malformed token should fail"
+        );
     }
 
     #[test]
@@ -121,7 +127,10 @@ mod tests {
         assert_eq!(claims.email, email);
         // Token should have an expiry in the future
         let now = Utc::now().timestamp() as usize;
-        assert!(claims.exp > now, "token should not be expired immediately after creation");
+        assert!(
+            claims.exp > now,
+            "token should not be expired immediately after creation"
+        );
     }
 
     #[test]
@@ -141,7 +150,10 @@ mod tests {
         let hash2 = hash_password(password).expect("hashing should succeed");
 
         // Different salts should produce different hashes
-        assert_ne!(hash1, hash2, "different salts should produce different hashes");
+        assert_ne!(
+            hash1, hash2,
+            "different salts should produce different hashes"
+        );
     }
 
     #[test]

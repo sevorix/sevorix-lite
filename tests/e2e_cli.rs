@@ -62,8 +62,7 @@ fn test_8_6_validate_block_command() {
     );
 
     // Output should be valid JSON containing a BLOCK verdict.
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("stdout was not valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout was not valid JSON");
     assert_eq!(
         json["verdict"].as_str().unwrap_or(""),
         "BLOCK",
@@ -101,8 +100,7 @@ fn test_8_6_validate_allow_command() {
         output.status.code().is_some(),
         "process was killed by a signal"
     );
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("stdout was not valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout was not valid JSON");
     assert!(
         json.get("verdict").is_some(),
         "output should have a verdict field, got: {json}"
@@ -128,7 +126,10 @@ fn test_8_6_validate_block_with_role_flag() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     println!("stdout: {}", stdout);
 
-    assert!(output.status.code().is_some(), "process was killed by a signal");
+    assert!(
+        output.status.code().is_some(),
+        "process was killed by a signal"
+    );
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -136,8 +137,7 @@ fn test_8_6_validate_block_with_role_flag() {
         output.status.code()
     );
 
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("stdout was not valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout was not valid JSON");
     assert_eq!(json["verdict"].as_str().unwrap_or(""), "BLOCK");
 }
 
@@ -153,11 +153,17 @@ fn test_8_6_validate_output_structure() {
         .expect("failed to run sevorix validate");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("stdout was not valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout was not valid JSON");
 
     // All expected top-level keys must be present.
-    for key in &["command", "verdict", "lane", "reason", "confidence", "context"] {
+    for key in &[
+        "command",
+        "verdict",
+        "lane",
+        "reason",
+        "confidence",
+        "context",
+    ] {
         assert!(
             !json[key].is_null(),
             "expected field '{}' to be present in validate output",
@@ -191,7 +197,10 @@ fn test_8_6_validate_invalid_context() {
     println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
 
     // Invalid context should produce a non-zero exit code and not panic.
-    assert!(output.status.code().is_some(), "process was killed by a signal");
+    assert!(
+        output.status.code().is_some(),
+        "process was killed by a signal"
+    );
     assert_ne!(
         output.status.code(),
         Some(0),
@@ -216,7 +225,10 @@ fn test_8_7_config_check_runs() {
     println!("config check stderr: {}", stderr);
 
     // Must complete without crashing.
-    assert!(output.status.code().is_some(), "process was killed by a signal");
+    assert!(
+        output.status.code().is_some(),
+        "process was killed by a signal"
+    );
 
     // config check always exits 0 — it reports status rather than failing.
     assert_eq!(

@@ -158,9 +158,15 @@ async fn main() -> Result<()> {
     let general_router = Router::new()
         .route("/api/v1/me", get(routes::get_current_user))
         .route("/api/v1/me/email", patch(routes::update_email))
-        .route("/api/v1/me/signing-keys", post(routes::register_signing_key))
+        .route(
+            "/api/v1/me/signing-keys",
+            post(routes::register_signing_key),
+        )
         .route("/api/v1/me/signing-keys", get(routes::list_signing_keys))
-        .route("/api/v1/me/signing-keys/:fingerprint", delete(routes::revoke_signing_key))
+        .route(
+            "/api/v1/me/signing-keys/:fingerprint",
+            delete(routes::revoke_signing_key),
+        )
         .route("/api/v1/users/:user_id", get(routes::get_user_profile))
         .route(
             "/api/v1/admin/users/:user_id/approve",
@@ -188,10 +194,7 @@ async fn main() -> Result<()> {
             "/api/v1/artifacts/:artifact_id/endorsements/:endorsement_id",
             delete(routes::delete_endorsement),
         )
-        .route(
-            "/api/v1/artifacts/:id/yank",
-            post(routes::yank_artifact),
-        )
+        .route("/api/v1/artifacts/:id/yank", post(routes::yank_artifact))
         .route(
             "/api/v1/artifacts/:id/yank",
             delete(routes::unyank_artifact),
@@ -327,7 +330,9 @@ mod tests {
         let result = expand_home(path).unwrap();
 
         // Should handle special characters
-        assert!(result.to_string_lossy().ends_with("path-with_special.chars/file.json"));
+        assert!(result
+            .to_string_lossy()
+            .ends_with("path-with_special.chars/file.json"));
     }
 
     #[test]
@@ -403,11 +408,16 @@ mod tests {
     fn test_cli_with_all_args() {
         let result = Cli::try_parse_from([
             "test",
-            "--database-url", "postgres://localhost/test",
-            "--storage-backend", "filesystem",
-            "--artifacts-dir", "/tmp/test",
-            "--jwt-secret", "secret123",
-            "--port", "9000",
+            "--database-url",
+            "postgres://localhost/test",
+            "--storage-backend",
+            "filesystem",
+            "--artifacts-dir",
+            "/tmp/test",
+            "--jwt-secret",
+            "secret123",
+            "--port",
+            "9000",
         ]);
 
         assert!(result.is_ok());
@@ -423,9 +433,12 @@ mod tests {
     fn test_cli_gcs_backend() {
         let result = Cli::try_parse_from([
             "test",
-            "--database-url", "postgres://localhost/test",
-            "--storage-backend", "gcs",
-            "--gcs-bucket", "my-gcs-bucket",
+            "--database-url",
+            "postgres://localhost/test",
+            "--storage-backend",
+            "gcs",
+            "--gcs-bucket",
+            "my-gcs-bucket",
         ]);
 
         assert!(result.is_ok());
@@ -440,11 +453,15 @@ mod tests {
         // We can't easily test env vars in unit tests, but we verify the struct is correct
         let cli = Cli::try_parse_from([
             "test",
-            "--database-url", "postgres://user:pass@host:5432/db",
+            "--database-url",
+            "postgres://user:pass@host:5432/db",
         ]);
 
         assert!(cli.is_ok());
-        assert_eq!(cli.unwrap().database_url, "postgres://user:pass@host:5432/db");
+        assert_eq!(
+            cli.unwrap().database_url,
+            "postgres://user:pass@host:5432/db"
+        );
     }
 
     #[test]
@@ -452,8 +469,10 @@ mod tests {
         // Test max port
         let result = Cli::try_parse_from([
             "test",
-            "--database-url", "postgres://localhost/test",
-            "--port", "65535",
+            "--database-url",
+            "postgres://localhost/test",
+            "--port",
+            "65535",
         ]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().port, 65535);
@@ -461,8 +480,10 @@ mod tests {
         // Test min port
         let result = Cli::try_parse_from([
             "test",
-            "--database-url", "postgres://localhost/test",
-            "--port", "1",
+            "--database-url",
+            "postgres://localhost/test",
+            "--port",
+            "1",
         ]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().port, 1);
@@ -479,8 +500,10 @@ mod tests {
         let long_secret = "x".repeat(1000);
         let result = Cli::try_parse_from([
             "test",
-            "--database-url", "postgres://localhost/test",
-            "--jwt-secret", &long_secret,
+            "--database-url",
+            "postgres://localhost/test",
+            "--jwt-secret",
+            &long_secret,
         ]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().jwt_secret.len(), 1000);
@@ -490,8 +513,10 @@ mod tests {
     fn test_cli_artifacts_dir_with_tilde() {
         let result = Cli::try_parse_from([
             "test",
-            "--database-url", "postgres://localhost/test",
-            "--artifacts-dir", "~/my-artifacts",
+            "--database-url",
+            "postgres://localhost/test",
+            "--artifacts-dir",
+            "~/my-artifacts",
         ]);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().artifacts_dir, "~/my-artifacts");

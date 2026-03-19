@@ -29,7 +29,10 @@ impl WsClient {
             }
         });
 
-        WsClient { rx, _handle: handle }
+        WsClient {
+            rx,
+            _handle: handle,
+        }
     }
 
     /// Wait up to `timeout` for an event matching `predicate`.

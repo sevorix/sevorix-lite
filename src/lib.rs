@@ -8,14 +8,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use dashmap::DashMap;
 use directories::{ProjectDirs, UserDirs};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
     sync::{Arc, RwLock},
 };
-use dashmap::DashMap;
 use tokio::sync::{broadcast, oneshot, watch, Mutex};
 
 /// Unix socket path used for synchronous cgroup registration between
@@ -36,12 +36,17 @@ pub mod settings;
 
 use assets::Assets;
 pub use cli::{Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands, SessionCommands};
-pub use daemon::{DaemonManager, EbpfDaemonManager, is_ebpf_daemon_running, is_watchtower_running};
-pub use integrations::{IntegrationRegistry, Integration, IntegrationStatus, InstallResult, Manifest, claude_code::ClaudeCodeIntegration, codex::CodexIntegration, openclaw::OpenClawIntegration};
+pub use daemon::{is_ebpf_daemon_running, is_watchtower_running, DaemonManager, EbpfDaemonManager};
+pub use integrations::{
+    claude_code::ClaudeCodeIntegration, codex::CodexIntegration, openclaw::OpenClawIntegration,
+    InstallResult, Integration, IntegrationRegistry, IntegrationStatus, Manifest,
+};
 use policy::{Action, Engine, PolicyContext, PolicyType};
 use proxy::proxy_handler;
-use scanner::{log_threat, log_kill, scan_content, scan_for_poison, scan_syscall_with_engine, PoisonPill};
-use sevorix_core::{detect_enforcement_tier, EnforcementTier, SyscallEvent, SeccompDecision};
+use scanner::{
+    log_kill, log_threat, scan_content, scan_for_poison, scan_syscall_with_engine, PoisonPill,
+};
+use sevorix_core::{detect_enforcement_tier, EnforcementTier, SeccompDecision, SyscallEvent};
 
 /// Holds both channel halves for one pending intervention decision.
 pub struct PendingEntry {
@@ -147,12 +152,10 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
         IntegrationsCommands::Uninstall { name } => {
             let resolved = resolve_integration_name(&name);
             match registry.get(resolved) {
-                Some(integration) => {
-                    match integration.uninstall() {
-                        Ok(()) => println!("Successfully uninstalled '{}'", resolved),
-                        Err(e) => eprintln!("Failed to uninstall '{}': {}", resolved, e),
-                    }
-                }
+                Some(integration) => match integration.uninstall() {
+                    Ok(()) => println!("Successfully uninstalled '{}'", resolved),
+                    Err(e) => eprintln!("Failed to uninstall '{}': {}", resolved, e),
+                },
                 None => {
                     eprintln!("Integration '{}' not found.", name);
                 }
@@ -197,38 +200,41 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
                     } else {
                         "not installed"
                     };
-                    println!("  {} - {} ({})", integration.name(), integration.description(), status);
+                    println!(
+                        "  {} - {} ({})",
+                        integration.name(),
+                        integration.description(),
+                        status
+                    );
                 }
             }
         }
-        IntegrationsCommands::Status { name } => {
-            match name {
-                Some(n) => {
-                    let resolved = resolve_integration_name(&n);
-                    match registry.get(resolved) {
-                        Some(integration) => {
-                            println!("Integration: {}", integration.name());
-                            println!("Description: {}", integration.description());
-                            println!("Status: {:?}", integration.status());
-                        }
-                        None => {
-                            eprintln!("Integration '{}' not found.", n);
-                        }
+        IntegrationsCommands::Status { name } => match name {
+            Some(n) => {
+                let resolved = resolve_integration_name(&n);
+                match registry.get(resolved) {
+                    Some(integration) => {
+                        println!("Integration: {}", integration.name());
+                        println!("Description: {}", integration.description());
+                        println!("Status: {:?}", integration.status());
                     }
-                }
-                None => {
-                    let integrations = registry.list();
-                    if integrations.is_empty() {
-                        println!("No integrations registered.");
-                    } else {
-                        println!("Integration Status:");
-                        for integration in integrations {
-                            println!("  {}: {:?}", integration.name(), integration.status());
-                        }
+                    None => {
+                        eprintln!("Integration '{}' not found.", n);
                     }
                 }
             }
-        }
+            None => {
+                let integrations = registry.list();
+                if integrations.is_empty() {
+                    println!("No integrations registered.");
+                } else {
+                    println!("Integration Status:");
+                    for integration in integrations {
+                        println!("  {}: {:?}", integration.name(), integration.status());
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -255,7 +261,10 @@ pub fn handle_validate_config() {
                 println!("✓ ~/.sevorix/policies/: {} policy file(s) found", count);
             }
         } else {
-            warnings.push("~/.sevorix/policies/: Not found (optional — place .json policy files here)".to_string());
+            warnings.push(
+                "~/.sevorix/policies/: Not found (optional — place .json policy files here)"
+                    .to_string(),
+            );
         }
 
         // Check primary roles directory
@@ -266,7 +275,9 @@ pub fn handle_validate_config() {
                 println!("✓ ~/.sevorix/roles/: {} role file(s) found", count);
             }
         } else {
-            warnings.push("~/.sevorix/roles/: Not found (optional — place .json role files here)".to_string());
+            warnings.push(
+                "~/.sevorix/roles/: Not found (optional — place .json role files here)".to_string(),
+            );
         }
 
         // Check hub token
@@ -274,7 +285,10 @@ pub fn handle_validate_config() {
         if token_path.exists() {
             println!("✓ ~/.sevorix/hub_token: Present");
         } else {
-            warnings.push("~/.sevorix/hub_token: Not found (run 'sevorix hub login' to authenticate)".to_string());
+            warnings.push(
+                "~/.sevorix/hub_token: Not found (run 'sevorix hub login' to authenticate)"
+                    .to_string(),
+            );
         }
     }
 
@@ -283,13 +297,19 @@ pub fn handle_validate_config() {
         let legacy_policy = proj_dirs.config_dir().join("policies.json");
         if legacy_policy.exists() {
             match std::fs::read_to_string(&legacy_policy) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(_) => println!("✓ ~/.config/sevorix/policies.json: Valid JSON (legacy fallback)"),
-                        Err(e) => errors.push(format!("~/.config/sevorix/policies.json: Invalid JSON - {}", e)),
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(_) => {
+                        println!("✓ ~/.config/sevorix/policies.json: Valid JSON (legacy fallback)")
                     }
-                }
-                Err(e) => errors.push(format!("~/.config/sevorix/policies.json: Cannot read - {}", e)),
+                    Err(e) => errors.push(format!(
+                        "~/.config/sevorix/policies.json: Invalid JSON - {}",
+                        e
+                    )),
+                },
+                Err(e) => errors.push(format!(
+                    "~/.config/sevorix/policies.json: Cannot read - {}",
+                    e
+                )),
             }
         }
     }
@@ -327,7 +347,10 @@ pub fn handle_validate(command: String, role: Option<String>, context: String) {
         "Syscall" => PolicyContext::Syscall,
         "All" => PolicyContext::All,
         _ => {
-            eprintln!("Error: Invalid context '{}'. Use Shell, Network, Syscall, or All.", context);
+            eprintln!(
+                "Error: Invalid context '{}'. Use Shell, Network, Syscall, or All.",
+                context
+            );
             std::process::exit(1);
         }
     };
@@ -371,7 +394,9 @@ pub fn handle_validate(command: String, role: Option<String>, context: String) {
     for base in &base_dirs {
         let policy_path = base.join("policies.json");
         if policy_path.exists() {
-            if let Ok(legacy_engine) = Engine::load_from_file(policy_path.to_str().unwrap_or("policies.json")) {
+            if let Ok(legacy_engine) =
+                Engine::load_from_file(policy_path.to_str().unwrap_or("policies.json"))
+            {
                 engine.merge(legacy_engine);
                 break;
             }
@@ -405,8 +430,8 @@ pub fn handle_validate(command: String, role: Option<String>, context: String) {
 /// Returns an error if configuration is invalid so `sevorix start` can exit
 /// with a clear message before reporting success.
 pub fn validate_startup_config() -> anyhow::Result<()> {
-    use directories::UserDirs;
     use crate::policy::Engine;
+    use directories::UserDirs;
 
     // Load roles from disk (same search path as run_server)
     let mut engine = Engine::new();
@@ -464,14 +489,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/active-sessions", get(active_sessions_handler));
 
 
-    app
-        .route("/health", get(health_handler))
+    app.route("/health", get(health_handler))
         .route("/api/version", get(get_version))
         .fallback(proxy_handler)
         .with_state(state)
 }
 
-pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uuid) -> anyhow::Result<()> {
+pub async fn run_server(
+    allowed_roles: Option<Vec<String>>,
+    session_id: uuid::Uuid,
+) -> anyhow::Result<()> {
     // Setup paths
     let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
         .ok_or_else(|| anyhow::anyhow!("No home dir"))?;
@@ -504,7 +531,11 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
         if policy_dir.exists() && policy_dir.is_dir() {
             tracing::info!("Loading policies from directory: {}", policy_dir.display());
             if let Err(e) = engine.load_policies_from_dir(&policy_dir) {
-                tracing::error!("Error loading policies from {}: {}", policy_dir.display(), e);
+                tracing::error!(
+                    "Error loading policies from {}: {}",
+                    policy_dir.display(),
+                    e
+                );
             } else {
                 policies_loaded = true;
             }
@@ -606,7 +637,10 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
         tracing::info!("   (BPF LSM unavailable — 'bpf' not in /sys/kernel/security/lsm)");
     }
     if let Some(state_dir) = proj_dirs.state_dir() {
-        tracing::info!("📝 Logging Threats to: {}/threat_log.txt", state_dir.display());
+        tracing::info!(
+            "📝 Logging Threats to: {}/threat_log.txt",
+            state_dir.display()
+        );
     }
     tracing::info!("--------------------------------------------------");
 
@@ -615,7 +649,10 @@ pub async fn run_server(allowed_roles: Option<Vec<String>>, session_id: uuid::Uu
     Ok(())
 }
 
-async fn session_register(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
+async fn session_register(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
     if let Some(path) = body["cgroup_path"].as_str() {
         state.active_sessions.lock().await.insert(path.to_string());
 
@@ -639,17 +676,14 @@ async fn notify_ebpf_daemon_cgroup(cgroup_path: &str) {
 
     let msg = format!("{}\n", json!({"cgroup_path": cgroup_path}));
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        async {
-            let stream = UnixStream::connect(EBPF_SOCK_PATH).await?;
-            let (reader, mut writer) = stream.into_split();
-            writer.write_all(msg.as_bytes()).await?;
-            let mut lines = BufReader::new(reader).lines();
-            let _ack = lines.next_line().await?;
-            Ok::<_, std::io::Error>(())
-        },
-    )
+    let result = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        let stream = UnixStream::connect(EBPF_SOCK_PATH).await?;
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(msg.as_bytes()).await?;
+        let mut lines = BufReader::new(reader).lines();
+        let _ack = lines.next_line().await?;
+        Ok::<_, std::io::Error>(())
+    })
     .await;
 
     match result {
@@ -664,22 +698,32 @@ async fn active_sessions_handler(State(state): State<Arc<AppState>>) -> impl Int
     Json(json!({ "sessions": sessions }))
 }
 
-async fn session_unregister(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
+async fn session_unregister(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
     if let Some(path) = body["cgroup_path"].as_str() {
         state.active_sessions.lock().await.remove(path);
     }
     StatusCode::OK
 }
 
-async fn session_set_role(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> impl IntoResponse {
+async fn session_set_role(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
     let Some(role) = body["role"].as_str() else {
         return (StatusCode::BAD_REQUEST, "Missing 'role' field").into_response();
     };
     if !state.policy_engine.read().unwrap().roles.contains_key(role) {
         return (
             StatusCode::BAD_REQUEST,
-            format!("Role '{}' not found. Load it into ~/.sevorix/roles/ and reload policies.", role),
-        ).into_response();
+            format!(
+                "Role '{}' not found. Load it into ~/.sevorix/roles/ and reload policies.",
+                role
+            ),
+        )
+            .into_response();
     }
     *state.current_role.write().unwrap() = Some(role.to_string());
     tracing::info!("Session role updated to '{}'", role);
@@ -714,7 +758,10 @@ async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl Int
     let mut policies_loaded = false;
     for base in &base_dirs {
         let policy_dir = base.join("policies");
-        if policy_dir.exists() && policy_dir.is_dir() && engine.load_policies_from_dir(&policy_dir).is_ok() {
+        if policy_dir.exists()
+            && policy_dir.is_dir()
+            && engine.load_policies_from_dir(&policy_dir).is_ok()
+        {
             policies_loaded = true;
         }
     }
@@ -734,7 +781,8 @@ async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl Int
         candidate_paths.push(std::path::PathBuf::from("policies.json"));
         for path in &candidate_paths {
             if path.exists() {
-                if let Ok(legacy) = Engine::load_from_file(path.to_str().unwrap_or("policies.json")) {
+                if let Ok(legacy) = Engine::load_from_file(path.to_str().unwrap_or("policies.json"))
+                {
                     engine.merge(legacy);
                     break;
                 }
@@ -746,7 +794,6 @@ async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl Int
     tracing::info!("Policies reloaded via API");
     Json(json!({ "status": "reloaded" })).into_response()
 }
-
 
 async fn dashboard_redirect() -> impl IntoResponse {
     axum::response::Redirect::permanent("/dashboard/index.html")
@@ -920,7 +967,12 @@ async fn analyze_intent(
     }
 
     // --- DECISION RULES ---
-    let mut scan = scan_content(&text, Some(resolved_role.as_str()), &state.policy_engine.read().unwrap(), context);
+    let mut scan = scan_content(
+        &text,
+        Some(resolved_role.as_str()),
+        &state.policy_engine.read().unwrap(),
+        context,
+    );
 
 
     // --- USER INTERVENTION for FLAG (shell channel) ---
@@ -928,7 +980,13 @@ async fn analyze_intent(
         let event_id = uuid::Uuid::new_v4().to_string();
         let (decision_tx, decision_rx) = oneshot::channel::<bool>();
         let (pause_tx, pause_rx) = watch::channel(false);
-        state.pending_decisions.insert(event_id.clone(), PendingEntry { decision_tx, pause_tx });
+        state.pending_decisions.insert(
+            event_id.clone(),
+            PendingEntry {
+                decision_tx,
+                pause_tx,
+            },
+        );
 
         let pending_event = json!({
             "type": "PENDING",
@@ -952,7 +1010,8 @@ async fn analyze_intent(
             pause_rx,
             state.intervention_timeout_secs,
             state.intervention_timeout_allow,
-        ).await;
+        )
+        .await;
 
         // Still in map → timeout fired (not resolved by user via decide_handler)
         if state.pending_decisions.remove(&event_id).is_some() {
@@ -989,7 +1048,8 @@ async fn analyze_intent(
                 "lane": "RED",
                 "reason": "Blocked by operator",
                 "confidence": null,
-            })).into_response();
+            }))
+            .into_response();
         }
 
         // Operator allowed — update verdict so the event logs as ALLOW
@@ -1177,30 +1237,64 @@ async fn syscall_policy_handler(
 /// Map syscall name to x86-64 syscall number.
 fn syscall_nr_by_name(name: &str) -> Option<u64> {
     match name {
-        "read" => Some(0), "write" => Some(1), "open" => Some(2), "close" => Some(3),
-        "stat" => Some(4), "fstat" => Some(5), "lstat" => Some(6),
-        "mmap" => Some(9), "mprotect" => Some(10), "munmap" => Some(11),
-        "brk" => Some(12), "pipe" => Some(22),
-        "dup" => Some(32), "dup2" => Some(33),
-        "socket" => Some(41), "connect" => Some(42), "accept" => Some(43),
-        "sendto" => Some(44), "recvfrom" => Some(45),
-        "bind" => Some(49), "listen" => Some(50),
-        "clone" => Some(56), "fork" => Some(57), "vfork" => Some(58),
-        "execve" => Some(59), "exit" => Some(60), "wait4" => Some(61),
-        "kill" => Some(62), "uname" => Some(63),
-        "fcntl" => Some(72), "getcwd" => Some(79),
-        "chdir" => Some(80), "fchdir" => Some(81),
-        "rename" => Some(82), "mkdir" => Some(83), "rmdir" => Some(84),
-        "creat" => Some(85), "link" => Some(86), "unlink" => Some(87),
-        "symlink" => Some(88), "readlink" => Some(89),
-        "chmod" => Some(90), "chown" => Some(92),
-        "ptrace" => Some(101), "getuid" => Some(102), "getgid" => Some(104),
-        "setuid" => Some(105), "setgid" => Some(106),
-        "mount" => Some(165), "umount2" => Some(166),
-        "openat" => Some(257), "mkdirat" => Some(258),
-        "unlinkat" => Some(263), "renameat" => Some(264),
-        "fchmodat" => Some(268), "faccessat" => Some(269),
-        "renameat2" => Some(316), "execveat" => Some(322),
+        "read" => Some(0),
+        "write" => Some(1),
+        "open" => Some(2),
+        "close" => Some(3),
+        "stat" => Some(4),
+        "fstat" => Some(5),
+        "lstat" => Some(6),
+        "mmap" => Some(9),
+        "mprotect" => Some(10),
+        "munmap" => Some(11),
+        "brk" => Some(12),
+        "pipe" => Some(22),
+        "dup" => Some(32),
+        "dup2" => Some(33),
+        "socket" => Some(41),
+        "connect" => Some(42),
+        "accept" => Some(43),
+        "sendto" => Some(44),
+        "recvfrom" => Some(45),
+        "bind" => Some(49),
+        "listen" => Some(50),
+        "clone" => Some(56),
+        "fork" => Some(57),
+        "vfork" => Some(58),
+        "execve" => Some(59),
+        "exit" => Some(60),
+        "wait4" => Some(61),
+        "kill" => Some(62),
+        "uname" => Some(63),
+        "fcntl" => Some(72),
+        "getcwd" => Some(79),
+        "chdir" => Some(80),
+        "fchdir" => Some(81),
+        "rename" => Some(82),
+        "mkdir" => Some(83),
+        "rmdir" => Some(84),
+        "creat" => Some(85),
+        "link" => Some(86),
+        "unlink" => Some(87),
+        "symlink" => Some(88),
+        "readlink" => Some(89),
+        "chmod" => Some(90),
+        "chown" => Some(92),
+        "ptrace" => Some(101),
+        "getuid" => Some(102),
+        "getgid" => Some(104),
+        "setuid" => Some(105),
+        "setgid" => Some(106),
+        "mount" => Some(165),
+        "umount2" => Some(166),
+        "openat" => Some(257),
+        "mkdirat" => Some(258),
+        "unlinkat" => Some(263),
+        "renameat" => Some(264),
+        "fchmodat" => Some(268),
+        "faccessat" => Some(269),
+        "renameat2" => Some(316),
+        "execveat" => Some(322),
         _ => None,
     }
 }
@@ -1236,9 +1330,8 @@ async fn ebpf_policies_handler(
                 && p.action == Action::Block
         })
         .filter_map(|p| match &p.match_type {
-            PolicyType::Simple(name) => syscall_nr_by_name(name.trim()).map(|nr| {
-                json!({ "syscall_nr": nr, "errno": libc::EPERM })
-            }),
+            PolicyType::Simple(name) => syscall_nr_by_name(name.trim())
+                .map(|nr| json!({ "syscall_nr": nr, "errno": libc::EPERM })),
             _ => None,
         })
         .collect();
@@ -1384,20 +1477,22 @@ async fn get_recent_events(
     let page = q.page.unwrap_or(1).max(1);
 
     // Parse layer filter into a set of accepted layer strings.
-    let layer_filter: Option<Vec<String>> = q.layer.map(|s| {
-        s.split(',').map(|l| l.trim().to_lowercase()).collect()
-    });
+    let layer_filter: Option<Vec<String>> = q
+        .layer
+        .map(|s| s.split(',').map(|l| l.trim().to_lowercase()).collect());
 
     let lane_filter: Option<String> = q.lane.map(|s| s.to_uppercase());
 
-    let search_term: Option<String> = q.search
+    let search_term: Option<String> = q
+        .search
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty());
 
     // Resolve which session's traffic file to read.
     let traffic_path: std::path::PathBuf = if q.session.as_deref() == Some("legacy") {
         if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
-            proj_dirs.state_dir()
+            proj_dirs
+                .state_dir()
                 .unwrap_or_else(|| proj_dirs.cache_dir())
                 .join("traffic_events.jsonl")
         } else {
@@ -1414,7 +1509,8 @@ async fn get_recent_events(
                 "limit": limit,
                 "total_pages": 0,
                 "error": "invalid session id"
-            })).into_response();
+            }))
+            .into_response();
         }
     } else {
         state.traffic_log_path.clone()
@@ -1427,11 +1523,16 @@ async fn get_recent_events(
         let reader = BufReader::new(file);
 
         for line in reader.lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
 
             // Layer filter.
             if let Some(ref layers) = layer_filter {
-                let event_layer = event.get("layer").and_then(|v| v.as_str()).unwrap_or("shell");
+                let event_layer = event
+                    .get("layer")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("shell");
                 if !layers.iter().any(|l| l == event_layer) {
                     continue;
                 }
@@ -1447,12 +1548,20 @@ async fn get_recent_events(
 
             // Full-text search
             if let Some(ref term) = search_term {
-                let haystack = ["payload", "verdict", "lane", "layer", "reason", "context", "syscall_name"]
-                    .iter()
-                    .filter_map(|k| event.get(k).and_then(|v| v.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .to_lowercase();
+                let haystack = [
+                    "payload",
+                    "verdict",
+                    "lane",
+                    "layer",
+                    "reason",
+                    "context",
+                    "syscall_name",
+                ]
+                .iter()
+                .filter_map(|k| event.get(k).and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
                 if !haystack.contains(term.as_str()) {
                     continue;
                 }
@@ -1480,7 +1589,8 @@ async fn get_recent_events(
         "page": page,
         "limit": limit,
         "total_pages": total_pages,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// Compute aggregate stats from a traffic log file.
@@ -1490,7 +1600,8 @@ async fn get_stats_handler(
 ) -> impl IntoResponse {
     let traffic_path: std::path::PathBuf = if q.session.as_deref() == Some("legacy") {
         if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
-            proj_dirs.state_dir()
+            proj_dirs
+                .state_dir()
                 .unwrap_or_else(|| proj_dirs.cache_dir())
                 .join("traffic_events.jsonl")
         } else {
@@ -1517,7 +1628,9 @@ async fn get_stats_handler(
     if let Ok(file) = std::fs::File::open(&traffic_path) {
         use std::io::{BufRead, BufReader};
         for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             total += 1;
 
             if event.get("lane").and_then(|v| v.as_str()) == Some("RED") {
@@ -1528,7 +1641,10 @@ async fn get_stats_handler(
                 latency_count += 1;
             }
 
-            let layer = event.get("layer").and_then(|v| v.as_str()).unwrap_or("shell");
+            let layer = event
+                .get("layer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("shell");
             match layer {
                 "syscall" => syscall += 1,
                 "network" => network += 1,
@@ -1537,7 +1653,11 @@ async fn get_stats_handler(
         }
     }
 
-    let avg_latency = if latency_count > 0 { latency_sum / latency_count } else { 0 };
+    let avg_latency = if latency_count > 0 {
+        latency_sum / latency_count
+    } else {
+        0
+    };
 
     Json(json!({
         "total": total,
@@ -1595,7 +1715,9 @@ async fn get_sessions_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         if legacy_path.exists() {
             let (event_count, first_ts, last_ts) = summarize_traffic_file(&legacy_path);
             if event_count > 0 {
-                let size_bytes = std::fs::metadata(&legacy_path).map(|m| m.len()).unwrap_or(0);
+                let size_bytes = std::fs::metadata(&legacy_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 sessions.push(json!({
                     "session_id": "legacy",
                     "is_current": false,
@@ -1632,7 +1754,9 @@ fn summarize_traffic_file(path: &std::path::Path) -> (usize, Option<String>, Opt
     let mut first_ts: Option<String> = None;
     let mut last_ts: Option<String> = None;
     for line in reader.lines().map_while(Result::ok) {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         count += 1;
         let ts = v["timestamp"].as_str().map(String::from);
         if first_ts.is_none() {
@@ -1794,18 +1918,24 @@ mod tests {
     #[test]
     fn test_scan_content_integration() {
         let mut engine = Engine::new();
-        engine.policies.insert("test_block".to_string(), Policy {
-            id: "test_block".to_string(),
-            match_type: PolicyType::Simple("BLOCKME".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["test_block".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "test_block".to_string(),
+            Policy {
+                id: "test_block".to_string(),
+                match_type: PolicyType::Simple("BLOCKME".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["test_block".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let result = scan_content("BLOCKME", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
@@ -1824,11 +1954,14 @@ mod tests {
     #[test]
     fn test_scan_syscall_with_engine_integration() {
         let mut engine = Engine::new();
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec![],
-            is_dynamic: false,
-        });
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec![],
+                is_dynamic: false,
+            },
+        );
         let event = SyscallEvent {
             syscall_name: "read".to_string(),
             syscall_number: 0,
@@ -1845,55 +1978,85 @@ mod tests {
     #[test]
     fn test_app_state_with_custom_engine() {
         let mut engine = Engine::new();
-        engine.policies.insert("test".to_string(), Policy {
-            id: "test".to_string(),
-            match_type: PolicyType::Simple("pattern".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
+        engine.policies.insert(
+            "test".to_string(),
+            Policy {
+                id: "test".to_string(),
+                match_type: PolicyType::Simple("pattern".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
 
         let state = create_test_app_state_with_engine(engine);
-        assert!(state.policy_engine.read().unwrap().policies.contains_key("test"));
+        assert!(state
+            .policy_engine
+            .read()
+            .unwrap()
+            .policies
+            .contains_key("test"));
     }
 
     #[test]
     fn test_scan_content_with_role() {
         let mut engine = Engine::new();
-        engine.policies.insert("role_test".to_string(), Policy {
-            id: "role_test".to_string(),
-            match_type: PolicyType::Simple("DANGEROUS".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("custom_role".to_string(), Role {
-            name: "custom_role".to_string(),
-            policies: vec!["role_test".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "role_test".to_string(),
+            Policy {
+                id: "role_test".to_string(),
+                match_type: PolicyType::Simple("DANGEROUS".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "custom_role".to_string(),
+            Role {
+                name: "custom_role".to_string(),
+                policies: vec!["role_test".to_string()],
+                is_dynamic: false,
+            },
+        );
 
-        let result = scan_content("DANGEROUS content", Some("custom_role"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "DANGEROUS content",
+            Some("custom_role"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "BLOCK");
     }
 
     #[test]
     fn test_scan_content_flag_action() {
         let mut engine = Engine::new();
-        engine.policies.insert("flag_test".to_string(), Policy {
-            id: "flag_test".to_string(),
-            match_type: PolicyType::Simple("SUSPICIOUS".to_string()),
-            action: Action::Flag,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["flag_test".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "flag_test".to_string(),
+            Policy {
+                id: "flag_test".to_string(),
+                match_type: PolicyType::Simple("SUSPICIOUS".to_string()),
+                action: Action::Flag,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["flag_test".to_string()],
+                is_dynamic: false,
+            },
+        );
 
-        let result = scan_content("SUSPICIOUS content", Some("default"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "SUSPICIOUS content",
+            Some("default"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "FLAG");
         assert_eq!(result.lane, "YELLOW");
         assert_eq!(result.delay, 500);
@@ -1902,18 +2065,24 @@ mod tests {
     #[test]
     fn test_scan_content_with_kill_flag() {
         let mut engine = Engine::new();
-        engine.policies.insert("kill_test".to_string(), Policy {
-            id: "kill_test".to_string(),
-            match_type: PolicyType::Simple("KILLME".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: true,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["kill_test".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "kill_test".to_string(),
+            Policy {
+                id: "kill_test".to_string(),
+                match_type: PolicyType::Simple("KILLME".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: true,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["kill_test".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let result = scan_content("KILLME now", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
@@ -1958,18 +2127,24 @@ mod tests {
     fn test_handle_validate_allows_safe_command() {
         // Test that safe commands are allowed by testing the underlying logic directly
         let mut engine = Engine::new();
-        engine.policies.insert("test".to_string(), Policy {
-            id: "test".to_string(),
-            match_type: PolicyType::Simple("DANGEROUS".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["test".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "test".to_string(),
+            Policy {
+                id: "test".to_string(),
+                match_type: PolicyType::Simple("DANGEROUS".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["test".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let result = scan_content("ECHO HELLO", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "ALLOW");
@@ -1978,38 +2153,55 @@ mod tests {
     #[test]
     fn test_handle_validate_blocks_dangerous_command() {
         let mut engine = Engine::new();
-        engine.policies.insert("block_drop".to_string(), Policy {
-            id: "block_drop".to_string(),
-            match_type: PolicyType::Simple("DROP".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["block_drop".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "block_drop".to_string(),
+            Policy {
+                id: "block_drop".to_string(),
+                match_type: PolicyType::Simple("DROP".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["block_drop".to_string()],
+                is_dynamic: false,
+            },
+        );
 
-        let result = scan_content("DROP TABLE users", Some("default"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "DROP TABLE users",
+            Some("default"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "BLOCK");
     }
 
     #[test]
     fn test_handle_validate_context_routing() {
         let mut engine = Engine::new();
-        engine.policies.insert("shell_only".to_string(), Policy {
-            id: "shell_only".to_string(),
-            match_type: PolicyType::Simple("RM".to_string()),
-            action: Action::Block,
-            context: PolicyContext::Shell,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["shell_only".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "shell_only".to_string(),
+            Policy {
+                id: "shell_only".to_string(),
+                match_type: PolicyType::Simple("RM".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Shell,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["shell_only".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         // Should block in Shell context
         let result = scan_content("RM -rf /", Some("default"), &engine, PolicyContext::Shell);
@@ -2023,23 +2215,32 @@ mod tests {
     #[test]
     fn test_handle_validate_with_role() {
         let mut engine = Engine::new();
-        engine.policies.insert("admin_block".to_string(), Policy {
-            id: "admin_block".to_string(),
-            match_type: PolicyType::Simple("SECRET".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("admin".to_string(), Role {
-            name: "admin".to_string(),
-            policies: vec!["admin_block".to_string()],
-            is_dynamic: false,
-        });
-        engine.roles.insert("user".to_string(), Role {
-            name: "user".to_string(),
-            policies: vec![],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "admin_block".to_string(),
+            Policy {
+                id: "admin_block".to_string(),
+                match_type: PolicyType::Simple("SECRET".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "admin".to_string(),
+            Role {
+                name: "admin".to_string(),
+                policies: vec!["admin_block".to_string()],
+                is_dynamic: false,
+            },
+        );
+        engine.roles.insert(
+            "user".to_string(),
+            Role {
+                name: "user".to_string(),
+                policies: vec![],
+                is_dynamic: false,
+            },
+        );
 
         // Admin role should block
         let result = scan_content("SECRET DATA", Some("admin"), &engine, PolicyContext::All);
@@ -2053,7 +2254,10 @@ mod tests {
     #[test]
     fn test_app_state_traffic_log_path() {
         let state = create_test_app_state();
-        assert_eq!(state.traffic_log_path, std::path::PathBuf::from("/tmp/test_traffic.jsonl"));
+        assert_eq!(
+            state.traffic_log_path,
+            std::path::PathBuf::from("/tmp/test_traffic.jsonl")
+        );
     }
 
     #[test]
@@ -2068,16 +2272,24 @@ mod tests {
     #[test]
     fn test_app_state_policy_engine_access() {
         let mut engine = Engine::new();
-        engine.policies.insert("test".to_string(), Policy {
-            id: "test".to_string(),
-            match_type: PolicyType::Simple("pattern".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
+        engine.policies.insert(
+            "test".to_string(),
+            Policy {
+                id: "test".to_string(),
+                match_type: PolicyType::Simple("pattern".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
 
         let state = create_test_app_state_with_engine(engine);
-        assert!(state.policy_engine.read().unwrap().policies.contains_key("test"));
+        assert!(state
+            .policy_engine
+            .read()
+            .unwrap()
+            .policies
+            .contains_key("test"));
     }
 
     #[tokio::test]
@@ -2085,7 +2297,10 @@ mod tests {
         use axum::response::IntoResponse;
         let response = dashboard_redirect().await.into_response();
         // Verify it returns a redirect response
-        assert_eq!(response.status(), axum::http::StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::PERMANENT_REDIRECT
+        );
     }
 
     #[test]
@@ -2110,8 +2325,10 @@ mod tests {
             let response = static_handler(uri).await.into_response();
             // Should return 200 if index.html exists in assets
             // Note: This depends on the Assets embed
-            assert!(response.status() == axum::http::StatusCode::OK ||
-                    response.status() == axum::http::StatusCode::NOT_FOUND);
+            assert!(
+                response.status() == axum::http::StatusCode::OK
+                    || response.status() == axum::http::StatusCode::NOT_FOUND
+            );
         });
     }
 
@@ -2122,7 +2339,9 @@ mod tests {
         let state = create_test_app_state();
         let response = get_version(State(state)).await.into_response();
         // Should return JSON with version, edition, and enforcement_tier
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("version").is_some());
         assert!(json.get("edition").is_some());
@@ -2134,11 +2353,15 @@ mod tests {
         use axum::response::IntoResponse;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let state = create_test_app_state_with_path(
-                std::path::PathBuf::from("/tmp/nonexistent_traffic_test.jsonl")
-            );
-            let response = get_recent_events(State(state), Query(EventQuery::default())).await.into_response();
-            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            let state = create_test_app_state_with_path(std::path::PathBuf::from(
+                "/tmp/nonexistent_traffic_test.jsonl",
+            ));
+            let response = get_recent_events(State(state), Query(EventQuery::default()))
+                .await
+                .into_response();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
             let json: Value = serde_json::from_slice(&body).unwrap();
             assert!(json.get("events").unwrap().as_array().unwrap().is_empty());
         });
@@ -2158,8 +2381,12 @@ mod tests {
             std::fs::write(&path, format!("{}\n{}\n", event1, event2)).unwrap();
 
             let state = create_test_app_state_with_path(path);
-            let response = get_recent_events(State(state), Query(EventQuery::default())).await.into_response();
-            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            let response = get_recent_events(State(state), Query(EventQuery::default()))
+                .await
+                .into_response();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
             let json: Value = serde_json::from_slice(&body).unwrap();
 
             let events = json.get("events").unwrap().as_array().unwrap();

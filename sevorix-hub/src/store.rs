@@ -4,9 +4,16 @@ use std::path::PathBuf;
 /// Trait defining artifact storage operations.
 pub trait ArtifactStore: Send + Sync {
     /// Store artifact bytes under the given ID. Returns the resolved file path/object key.
-    fn store(&self, id: &str, data: &[u8]) -> impl std::future::Future<Output = Result<String>> + Send;
+    fn store(
+        &self,
+        id: &str,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = Result<String>> + Send;
     /// Retrieve artifact bytes from the given file path/object key.
-    fn retrieve(&self, file_path: &str) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
+    fn retrieve(
+        &self,
+        file_path: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
 }
 
 /// Filesystem-backed artifact store for local development.
@@ -233,7 +240,10 @@ mod tests {
         let id = "retrieve-test";
         let original_data = b"{\"key\": \"value\"}";
 
-        store.store(id, original_data).await.expect("store should succeed");
+        store
+            .store(id, original_data)
+            .await
+            .expect("store should succeed");
         let retrieved = store
             .retrieve(&dir.path().join(format!("{}.json", id)).to_string_lossy())
             .await
@@ -250,10 +260,16 @@ mod tests {
         let id = "overwrite-test";
 
         // First write
-        store.store(id, b"original data").await.expect("store should succeed");
+        store
+            .store(id, b"original data")
+            .await
+            .expect("store should succeed");
 
         // Second write (overwrite)
-        store.store(id, b"new data").await.expect("store should succeed");
+        store
+            .store(id, b"new data")
+            .await
+            .expect("store should succeed");
 
         // Should have new data
         let retrieved = store
@@ -323,7 +339,10 @@ mod tests {
         let data = b"test data";
 
         let path = store.store(id, data).await.expect("store should succeed");
-        let retrieved = store.retrieve(&path).await.expect("retrieve should succeed");
+        let retrieved = store
+            .retrieve(&path)
+            .await
+            .expect("retrieve should succeed");
 
         assert_eq!(retrieved, data);
     }

@@ -1131,12 +1131,7 @@ where
         };
         // Signal that we've received the fd and are about to enter the poll loop
         let _ = ready_tx.send(());
-        run_notification_loop_with_channels(
-            parent_pid,
-            child_pid_clone,
-            notifier_fd,
-            event_tx,
-        )
+        run_notification_loop_with_channels(parent_pid, child_pid_clone, notifier_fd, event_tx)
     });
 
     // NOW load the seccomp filter. The notification thread is already running and
@@ -1347,13 +1342,19 @@ fn run_notification_loop_with_channels(
         // Poll with a timeout so we can periodically check if the child exited.
         // This also avoids blocking forever if the seccomp filter is gone.
         let poll_ret = unsafe {
-            let mut pfd = libc::pollfd { fd: notifier_fd, events: libc::POLLIN, revents: 0 };
+            let mut pfd = libc::pollfd {
+                fd: notifier_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             libc::poll(&mut pfd as *mut libc::pollfd, 1, 200)
         };
 
         if poll_ret < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if errno == libc::EINTR { continue; }
+            if errno == libc::EINTR {
+                continue;
+            }
             // Poll failed (e.g., fd was closed when child exited)
             return Ok(());
         }
@@ -1423,7 +1424,12 @@ fn run_notification_loop_with_channels(
 }
 
 /// Build a SyscallEvent from raw notification data without going through libseccomp.
-pub(crate) fn build_syscall_event(pid: u32, syscall_nr: i64, name: &str, raw_args: &[u64; 6]) -> crate::SyscallEvent {
+pub(crate) fn build_syscall_event(
+    pid: u32,
+    syscall_nr: i64,
+    name: &str,
+    raw_args: &[u64; 6],
+) -> crate::SyscallEvent {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| {
@@ -1509,8 +1515,8 @@ fn build_syscall_filter(
     syscall_names: &[impl AsRef<str>],
     action: ScmpAction,
 ) -> Result<ScmpFilterContext, SeccompNotifierError> {
-    let mut filter = ScmpFilterContext::new(ScmpAction::Allow)
-        .map_err(SeccompNotifierError::FilterCreation)?;
+    let mut filter =
+        ScmpFilterContext::new(ScmpAction::Allow).map_err(SeccompNotifierError::FilterCreation)?;
     for name in syscall_names {
         let name_str = name.as_ref();
         if let Ok(syscall) = ScmpSyscall::from_name(name_str) {
@@ -2994,7 +3000,7 @@ mod tests {
         buffer.extend_from_slice(&10u16.to_ne_bytes()); // AF_INET6
         buffer.extend_from_slice(&443u16.to_be_bytes()); // port (big-endian)
         buffer.extend_from_slice(&0u32.to_ne_bytes()); // flowinfo (4 bytes)
-        // IPv6 address: 2001:db8::1 (16 bytes)
+                                                       // IPv6 address: 2001:db8::1 (16 bytes)
         buffer.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00]);
         buffer.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
 

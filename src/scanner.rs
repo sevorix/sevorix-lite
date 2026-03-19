@@ -1,8 +1,8 @@
 use crate::policy::{Action, Engine, PolicyContext};
 use directories::ProjectDirs;
-use sevorix_core::{SyscallEvent, SeccompDecision};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sevorix_core::{SeccompDecision, SyscallEvent};
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -153,7 +153,10 @@ pub fn scan_content(
 
 /// Scans a syscall event against the provided policies.
 /// Formats the syscall event as a string and checks against policies with Syscall context.
-pub fn scan_syscall(event: &SyscallEvent, policies: &[crate::policy::Policy]) -> SecurityScanResult {
+pub fn scan_syscall(
+    event: &SyscallEvent,
+    policies: &[crate::policy::Policy],
+) -> SecurityScanResult {
     // Format syscall event as a string for pattern matching
     let args_str = event.args.join(", ");
     let content = format!(
@@ -374,7 +377,12 @@ mod tests {
     #[test]
     fn test_red_lane_drop() {
         let engine = create_test_engine();
-        let result = scan_content("DROP TABLE users", Some("default"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "DROP TABLE users",
+            Some("default"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "BLOCK");
         assert_eq!(result.lane, "RED");
         assert!(result.log_msg.unwrap().contains("Data Destruction"));
@@ -383,7 +391,12 @@ mod tests {
     #[test]
     fn test_red_lane_wire() {
         let engine = create_test_engine();
-        let result = scan_content("WIRE FUNDS TO ABROAD", Some("default"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "WIRE FUNDS TO ABROAD",
+            Some("default"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "BLOCK");
         assert_eq!(result.lane, "RED");
         assert!(result.log_msg.unwrap().contains("Financial Transaction"));
@@ -392,7 +405,12 @@ mod tests {
     #[test]
     fn test_yellow_lane_select() {
         let engine = create_test_engine();
-        let result = scan_content("SELECT * FROM users", Some("default"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "SELECT * FROM users",
+            Some("default"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "FLAG");
         assert_eq!(result.lane, "YELLOW");
         assert_eq!(result.delay, 500);
@@ -409,15 +427,13 @@ mod tests {
 
     #[test]
     fn test_scan_syscall_blocks_dangerous() {
-        let policies = vec![
-            Policy {
-                id: "block_execve".to_string(),
-                match_type: PolicyType::Simple("execve".to_string()),
-                action: Action::Block,
-                context: PolicyContext::Syscall,
-                kill: false,
-            },
-        ];
+        let policies = vec![Policy {
+            id: "block_execve".to_string(),
+            match_type: PolicyType::Simple("execve".to_string()),
+            action: Action::Block,
+            context: PolicyContext::Syscall,
+            kill: false,
+        }];
 
         let event = SyscallEvent {
             syscall_name: "execve".to_string(),
@@ -435,15 +451,13 @@ mod tests {
 
     #[test]
     fn test_scan_syscall_allows_safe() {
-        let policies = vec![
-            Policy {
-                id: "block_execve".to_string(),
-                match_type: PolicyType::Simple("execve".to_string()),
-                action: Action::Block,
-                context: PolicyContext::Syscall,
-                kill: false,
-            },
-        ];
+        let policies = vec![Policy {
+            id: "block_execve".to_string(),
+            match_type: PolicyType::Simple("execve".to_string()),
+            action: Action::Block,
+            context: PolicyContext::Syscall,
+            kill: false,
+        }];
 
         let event = SyscallEvent {
             syscall_name: "read".to_string(),
@@ -461,15 +475,13 @@ mod tests {
 
     #[test]
     fn test_scan_syscall_flags_suspicious() {
-        let policies = vec![
-            Policy {
-                id: "flag_connect".to_string(),
-                match_type: PolicyType::Simple("connect".to_string()),
-                action: Action::Flag,
-                context: PolicyContext::Syscall,
-                kill: false,
-            },
-        ];
+        let policies = vec![Policy {
+            id: "flag_connect".to_string(),
+            match_type: PolicyType::Simple("connect".to_string()),
+            action: Action::Flag,
+            context: PolicyContext::Syscall,
+            kill: false,
+        }];
 
         let event = SyscallEvent {
             syscall_name: "connect".to_string(),
@@ -488,18 +500,24 @@ mod tests {
     #[test]
     fn test_scan_syscall_with_engine_blocks() {
         let mut engine = Engine::new();
-        engine.policies.insert("block_execve".to_string(), Policy {
-            id: "block_execve".to_string(),
-            match_type: PolicyType::Simple("execve".to_string()),
-            action: Action::Block,
-            context: PolicyContext::Syscall,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["block_execve".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "block_execve".to_string(),
+            Policy {
+                id: "block_execve".to_string(),
+                match_type: PolicyType::Simple("execve".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["block_execve".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let event = SyscallEvent {
             syscall_name: "execve".to_string(),
@@ -517,18 +535,24 @@ mod tests {
     #[test]
     fn test_scan_syscall_with_engine_kills() {
         let mut engine = Engine::new();
-        engine.policies.insert("kill_execve".to_string(), Policy {
-            id: "kill_execve".to_string(),
-            match_type: PolicyType::Simple("execve".to_string()),
-            action: Action::Block,
-            context: PolicyContext::Syscall,
-            kill: true,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["kill_execve".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "kill_execve".to_string(),
+            Policy {
+                id: "kill_execve".to_string(),
+                match_type: PolicyType::Simple("execve".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: true,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["kill_execve".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let event = SyscallEvent {
             syscall_name: "execve".to_string(),
@@ -546,18 +570,24 @@ mod tests {
     #[test]
     fn test_scan_syscall_with_engine_allows() {
         let mut engine = Engine::new();
-        engine.policies.insert("block_execve".to_string(), Policy {
-            id: "block_execve".to_string(),
-            match_type: PolicyType::Simple("execve".to_string()),
-            action: Action::Block,
-            context: PolicyContext::Syscall,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["block_execve".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "block_execve".to_string(),
+            Policy {
+                id: "block_execve".to_string(),
+                match_type: PolicyType::Simple("execve".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["block_execve".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let event = SyscallEvent {
             syscall_name: "read".to_string(),
@@ -575,18 +605,24 @@ mod tests {
     #[test]
     fn test_scan_syscall_with_engine_flags_as_allow() {
         let mut engine = Engine::new();
-        engine.policies.insert("flag_connect".to_string(), Policy {
-            id: "flag_connect".to_string(),
-            match_type: PolicyType::Simple("connect".to_string()),
-            action: Action::Flag,
-            context: PolicyContext::Syscall,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["flag_connect".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "flag_connect".to_string(),
+            Policy {
+                id: "flag_connect".to_string(),
+                match_type: PolicyType::Simple("connect".to_string()),
+                action: Action::Flag,
+                context: PolicyContext::Syscall,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["flag_connect".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let event = SyscallEvent {
             syscall_name: "connect".to_string(),
@@ -605,20 +641,31 @@ mod tests {
     #[test]
     fn test_scan_content_with_kill_flag() {
         let mut engine = Engine::new();
-        engine.policies.insert("kill_policy".to_string(), Policy {
-            id: "kill_policy".to_string(),
-            match_type: PolicyType::Simple("dangerous".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: true,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["kill_policy".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "kill_policy".to_string(),
+            Policy {
+                id: "kill_policy".to_string(),
+                match_type: PolicyType::Simple("dangerous".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: true,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["kill_policy".to_string()],
+                is_dynamic: false,
+            },
+        );
 
-        let result = scan_content("dangerous operation", Some("default"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "dangerous operation",
+            Some("default"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "BLOCK");
         assert!(result.kill);
     }
@@ -652,20 +699,31 @@ mod tests {
     #[test]
     fn test_scan_content_unknown_policy_id() {
         let mut engine = Engine::new();
-        engine.policies.insert("unknown_id".to_string(), Policy {
-            id: "unknown_id".to_string(),
-            match_type: PolicyType::Simple("blockme".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["unknown_id".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "unknown_id".to_string(),
+            Policy {
+                id: "unknown_id".to_string(),
+                match_type: PolicyType::Simple("blockme".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["unknown_id".to_string()],
+                is_dynamic: false,
+            },
+        );
 
-        let result = scan_content("blockme please", Some("default"), &engine, PolicyContext::All);
+        let result = scan_content(
+            "blockme please",
+            Some("default"),
+            &engine,
+            PolicyContext::All,
+        );
         assert_eq!(result.verdict, "BLOCK");
         assert!(result.log_msg.unwrap().contains("Policy Violation"));
     }
@@ -674,79 +732,135 @@ mod tests {
     fn test_log_threat_writes_to_file() {
         // The log function writes to ProjectDirs, so we can't easily verify
         // the file contents. But we can verify it doesn't panic.
-        log_threat("test-agent", "DROP TABLE users", "SQL Injection detected", "99.5%");
+        log_threat(
+            "test-agent",
+            "DROP TABLE users",
+            "SQL Injection detected",
+            "99.5%",
+        );
     }
 
     #[test]
     fn test_log_kill_writes_to_file() {
         // Similar to test_log_threat_writes_to_file, this verifies no panic
-        log_kill("execve", 1234, 1, &["/bin/sh".to_string(), "-c".to_string()], "kill_policy");
+        log_kill(
+            "execve",
+            1234,
+            1,
+            &["/bin/sh".to_string(), "-c".to_string()],
+            "kill_policy",
+        );
     }
 
     #[test]
     fn test_scan_content_with_shell_context() {
         let mut engine = create_test_engine();
-        engine.policies.insert("shell_only".to_string(), Policy {
-            id: "shell_only".to_string(),
-            match_type: PolicyType::Simple("RMMOD".to_string()),
-            action: Action::Block,
-            context: PolicyContext::Shell,
-            kill: false,
-        });
-        engine.roles.get_mut("default").unwrap().policies.push("shell_only".to_string());
+        engine.policies.insert(
+            "shell_only".to_string(),
+            Policy {
+                id: "shell_only".to_string(),
+                match_type: PolicyType::Simple("RMMOD".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Shell,
+                kill: false,
+            },
+        );
+        engine
+            .roles
+            .get_mut("default")
+            .unwrap()
+            .policies
+            .push("shell_only".to_string());
 
         // Should block in Shell context
-        let result = scan_content("RMMOD some_module", Some("default"), &engine, PolicyContext::Shell);
+        let result = scan_content(
+            "RMMOD some_module",
+            Some("default"),
+            &engine,
+            PolicyContext::Shell,
+        );
         assert_eq!(result.verdict, "BLOCK");
 
         // Should NOT block in Network context
-        let result = scan_content("RMMOD some_module", Some("default"), &engine, PolicyContext::Network);
+        let result = scan_content(
+            "RMMOD some_module",
+            Some("default"),
+            &engine,
+            PolicyContext::Network,
+        );
         assert_eq!(result.verdict, "ALLOW");
     }
 
     #[test]
     fn test_scan_content_with_network_context() {
         let mut engine = create_test_engine();
-        engine.policies.insert("net_only".to_string(), Policy {
-            id: "net_only".to_string(),
-            match_type: PolicyType::Simple("CURL".to_string()),
-            action: Action::Flag,
-            context: PolicyContext::Network,
-            kill: false,
-        });
-        engine.roles.get_mut("default").unwrap().policies.push("net_only".to_string());
+        engine.policies.insert(
+            "net_only".to_string(),
+            Policy {
+                id: "net_only".to_string(),
+                match_type: PolicyType::Simple("CURL".to_string()),
+                action: Action::Flag,
+                context: PolicyContext::Network,
+                kill: false,
+            },
+        );
+        engine
+            .roles
+            .get_mut("default")
+            .unwrap()
+            .policies
+            .push("net_only".to_string());
 
         // Should flag in Network context
-        let result = scan_content("CURL http://example.com", Some("default"), &engine, PolicyContext::Network);
+        let result = scan_content(
+            "CURL http://example.com",
+            Some("default"),
+            &engine,
+            PolicyContext::Network,
+        );
         assert_eq!(result.verdict, "FLAG");
 
         // Should NOT flag in Shell context
-        let result = scan_content("CURL http://example.com", Some("default"), &engine, PolicyContext::Shell);
+        let result = scan_content(
+            "CURL http://example.com",
+            Some("default"),
+            &engine,
+            PolicyContext::Shell,
+        );
         assert_eq!(result.verdict, "ALLOW");
     }
 
     #[test]
     fn test_scan_content_multiple_matching_policies() {
         let mut engine = Engine::new();
-        engine.policies.insert("block1".to_string(), Policy {
-            id: "block1".to_string(),
-            match_type: PolicyType::Simple("MATCH".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.policies.insert("block2".to_string(), Policy {
-            id: "block2".to_string(),
-            match_type: PolicyType::Simple("MATCH".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["block1".to_string(), "block2".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "block1".to_string(),
+            Policy {
+                id: "block1".to_string(),
+                match_type: PolicyType::Simple("MATCH".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.policies.insert(
+            "block2".to_string(),
+            Policy {
+                id: "block2".to_string(),
+                match_type: PolicyType::Simple("MATCH".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["block1".to_string(), "block2".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         // Should return first block decision
         let result = scan_content("MATCH", Some("default"), &engine, PolicyContext::All);
@@ -756,25 +870,34 @@ mod tests {
     #[test]
     fn test_scan_content_block_takes_precedence_over_flag() {
         let mut engine = Engine::new();
-        engine.policies.insert("flag1".to_string(), Policy {
-            id: "flag1".to_string(),
-            match_type: PolicyType::Simple("TEST".to_string()),
-            action: Action::Flag,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.policies.insert("block1".to_string(), Policy {
-            id: "block1".to_string(),
-            match_type: PolicyType::Simple("TEST".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-        });
-        engine.roles.insert("default".to_string(), Role {
-            name: "default".to_string(),
-            policies: vec!["flag1".to_string(), "block1".to_string()],
-            is_dynamic: false,
-        });
+        engine.policies.insert(
+            "flag1".to_string(),
+            Policy {
+                id: "flag1".to_string(),
+                match_type: PolicyType::Simple("TEST".to_string()),
+                action: Action::Flag,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.policies.insert(
+            "block1".to_string(),
+            Policy {
+                id: "block1".to_string(),
+                match_type: PolicyType::Simple("TEST".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["flag1".to_string(), "block1".to_string()],
+                is_dynamic: false,
+            },
+        );
 
         let result = scan_content("TEST", Some("default"), &engine, PolicyContext::All);
         assert_eq!(result.verdict, "BLOCK");
