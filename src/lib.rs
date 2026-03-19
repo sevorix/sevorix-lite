@@ -132,7 +132,10 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
     match cmd {
         IntegrationsCommands::Install { name } => {
             if is_under_development(&name) {
-                eprintln!("'{}' integration is under development and not yet available.", name);
+                eprintln!(
+                    "'{}' integration is under development and not yet available.",
+                    name
+                );
                 return;
             }
             let resolved = resolve_integration_name(&name);
@@ -158,7 +161,10 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
         }
         IntegrationsCommands::Uninstall { name } => {
             if is_under_development(&name) {
-                eprintln!("'{}' integration is under development and not yet available.", name);
+                eprintln!(
+                    "'{}' integration is under development and not yet available.",
+                    name
+                );
                 return;
             }
             let resolved = resolve_integration_name(&name);

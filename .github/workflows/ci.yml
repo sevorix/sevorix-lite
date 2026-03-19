@@ -68,6 +68,8 @@ jobs:
           components: clippy
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v2"
       - name: Lint with Clippy
         run: cargo clippy --workspace --exclude sevorix-ebpf ${{ matrix.features }} -- -D warnings
 
