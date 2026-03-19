@@ -10,11 +10,9 @@ use axum::{
 };
 use serde::Deserialize;
 use directories::{ProjectDirs, UserDirs};
-use uuid;
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
-    process::Command,
     sync::{Arc, RwLock},
 };
 use dashmap::DashMap;
@@ -716,10 +714,8 @@ async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl Int
     let mut policies_loaded = false;
     for base in &base_dirs {
         let policy_dir = base.join("policies");
-        if policy_dir.exists() && policy_dir.is_dir() {
-            if engine.load_policies_from_dir(&policy_dir).is_ok() {
-                policies_loaded = true;
-            }
+        if policy_dir.exists() && policy_dir.is_dir() && engine.load_policies_from_dir(&policy_dir).is_ok() {
+            policies_loaded = true;
         }
     }
     for base in &base_dirs {

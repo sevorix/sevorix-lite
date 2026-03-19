@@ -10,7 +10,7 @@ pub mod openclaw;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Result of an installation operation.
@@ -148,7 +148,7 @@ impl IntegrationRegistry {
     }
 
     /// Restore files from a backup.
-    pub fn restore_backup(&self, integration_name: &str, backup_path: &PathBuf) -> Result<()> {
+    pub fn restore_backup(&self, integration_name: &str, backup_path: &Path) -> Result<()> {
         let manifest_path = self.manifest_path(integration_name);
         if !manifest_path.exists() {
             return Ok(());

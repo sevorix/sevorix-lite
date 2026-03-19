@@ -216,10 +216,10 @@ impl Integration for OpenClawIntegration {
 
         // Backup existing config if present
         let backup_path = self.backup_config()?;
-        if backup_path.is_some() {
+        if let Some(ref path) = backup_path {
             config_changes.push(format!(
                 "Backed up existing config to {:?}",
-                backup_path.unwrap()
+                path
             ));
         }
 
@@ -284,15 +284,13 @@ impl Integration for OpenClawIntegration {
         let mut config = self.read_config()?;
 
         // Remove our SHELL setting from env
-        if let Some(env) = config.get_mut("env") {
-            if let Value::Object(ref mut env_map) = env {
-                env_map.remove("SHELL");
+        if let Some(Value::Object(ref mut env_map)) = config.get_mut("env") {
+            env_map.remove("SHELL");
 
-                // If env is now empty, remove it entirely
-                if env_map.is_empty() {
-                    if let Value::Object(ref mut config_map) = config {
-                        config_map.remove("env");
-                    }
+            // If env is now empty, remove it entirely
+            if env_map.is_empty() {
+                if let Value::Object(ref mut config_map) = config {
+                    config_map.remove("env");
                 }
             }
         }

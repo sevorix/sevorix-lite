@@ -133,11 +133,9 @@ impl Default for PtyMultiplexerConfig {
     fn default() -> Self {
         Self {
             shell: "/bin/bash".to_string(),
-            env_vars: vec![],
-            passthrough_commands: vec![
-                "vim", "vi", "nvim", "less", "more", "man",
-                "top", "htop", "btop", "screen", "tmux",
-            ]
+            env_vars: Vec::new(),
+            passthrough_commands: ["vim", "vi", "nvim", "less", "more", "man",
+                "top", "htop", "btop", "screen", "tmux"]
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -267,8 +265,8 @@ impl SavedTerminal {
         // Disable canonical mode and echo
         raw_attrs.local_flags &= !(LocalFlags::ICANON | LocalFlags::ECHO);
         // Set VMIN and VTIME using control_chars
-        raw_attrs.control_chars[libc::VMIN as usize] = 1;
-        raw_attrs.control_chars[libc::VTIME as usize] = 0;
+        raw_attrs.control_chars[libc::VMIN] = 1;
+        raw_attrs.control_chars[libc::VTIME] = 0;
 
         termios::tcsetattr(&file, SetArg::TCSAFLUSH, &raw_attrs)
             .map_err(|e| PtyMultiplexerError::TerminalAttrs(e.into()))?;
@@ -424,6 +422,7 @@ pub struct PtyMultiplexer {
     /// HTTP client for validation.
     client: reqwest::blocking::Client,
     /// Validation timeout in milliseconds.
+    #[allow(dead_code)]
     validation_timeout_ms: u64,
 }
 
@@ -564,7 +563,7 @@ impl PtyMultiplexer {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
-                Err(e) if e == nix::errno::Errno::ECHILD => {
+                Err(nix::errno::Errno::ECHILD) => {
                     return Ok(ExitStatus::from_raw(0));
                 }
                 Err(_) => {
@@ -658,7 +657,7 @@ impl PtyMultiplexer {
                 self.bash_pty.write_all(line.as_bytes())?;
                 self.bash_pty.write_all(b"\n")?;
             }
-            "BLOCK" | _ => {
+            _ => {
                 // Show error, don't forward
                 eprintln!("\r\n[SEVSH] BLOCKED: {}\r", verdict.reason);
             }

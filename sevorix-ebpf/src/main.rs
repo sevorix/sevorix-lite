@@ -15,7 +15,6 @@
 
 use aya_ebpf::{
     bindings::BPF_SOCK_OPS_TCP_CONNECT_CB,
-    cty::c_long,
     helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
     macros::{lsm, map, sock_ops, tracepoint},
     programs::{LsmContext, SockOpsContext, TracePointContext},

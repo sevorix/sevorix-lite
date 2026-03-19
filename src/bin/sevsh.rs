@@ -922,8 +922,7 @@ async fn handle_bash_invocation(
                                 );
                                 libc::close(pipe_write);
                                 apply_syscall_deny_filter(&deny_names).map_err(|e| {
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::Other,
+                                    std::io::Error::other(
                                         format!("seccomp fallback: {}", e),
                                     )
                                 })
@@ -1037,8 +1036,7 @@ async fn handle_bash_invocation(
                 unsafe {
                     command.pre_exec(move || {
                         apply_syscall_deny_filter(&deny_names).map_err(|e| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            std::io::Error::other(
                                 format!("seccomp filter failed: {}", e),
                             )
                         })

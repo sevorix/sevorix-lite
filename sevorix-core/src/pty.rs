@@ -518,25 +518,15 @@ pub fn spawn_pty_shell_with_seccomp(
 /// * `notifier_fd` - The seccomp notification file descriptor
 /// * `event_tx` - Channel to send syscall events to the main thread
 fn run_pty_notification_loop(
-    parent_tgid: Pid,
+    _parent_tgid: Pid,
     child_pid: Arc<AtomicI32>,
     notifier_fd: RawFd,
     event_tx: Sender<PtySyscallEvent>,
 ) -> Result<(), SeccompNotifierError> {
     use crate::seccomp::{
-        build_syscall_event, raw_recv_notification, raw_respond_allow, raw_respond_deny_eperm,
+        build_syscall_event, raw_recv_notification, raw_respond_allow,
         syscall_name,
     };
-
-    // Deny with a specific errno via raw ioctl (stack-allocated, no malloc).
-    fn raw_respond_deny_errno(fd: i32, id: u64, errno: i32) {
-        #[repr(C)]
-        #[derive(Default)]
-        struct Resp { id: u64, val: i64, error: i32, flags: u32 }
-        let mut resp = Resp { id, val: 0, error: -errno, flags: 0 };
-        const NOTIF_SEND: libc::c_ulong = 0xc018_2101;
-        unsafe { libc::ioctl(fd, NOTIF_SEND, &mut resp) };
-    }
 
     // Clone/fork syscall numbers on x86_64
     const SYS_CLONE: i64 = 56;
@@ -551,7 +541,7 @@ fn run_pty_notification_loop(
                 Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
                     return Ok(());
                 }
-                Err(e) if e == nix::errno::Errno::ECHILD => {
+                Err(nix::errno::Errno::ECHILD) => {
                     return Ok(());
                 }
                 _ => {}

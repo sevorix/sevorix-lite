@@ -300,6 +300,7 @@ fn handle_session(cmd: SessionCommands) {
 }
 
 /// Parse allowed roles from CLI string
+#[allow(dead_code)]
 fn parse_allowed_roles(roles_str: Option<&str>) -> Option<Vec<String>> {
     roles_str.map(|s| {
         s.split(',')

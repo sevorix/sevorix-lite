@@ -1336,7 +1336,7 @@ fn run_notification_loop_with_channels(
                 Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
                     return Ok(());
                 }
-                Err(e) if e == nix::errno::Errno::ECHILD => {
+                Err(nix::errno::Errno::ECHILD) => {
                     // Parent already reaped the child; nothing left to monitor.
                     return Ok(());
                 }
@@ -1411,11 +1411,8 @@ fn run_notification_loop_with_channels(
         // NON-BLOCKING: Try to get an immediate decision. If the main thread is
         // busy (e.g., blocked in waitpid), auto-allow to prevent deadlock.
         // The main thread will process events when it's ready - we don't wait.
-        let allow = match response_rx.try_recv() {
-            Ok(a) => a,
-            // No immediate decision available - AUTO-ALLOW to prevent deadlock
-            Err(_) => true,
-        };
+        // No immediate decision available - AUTO-ALLOW to prevent deadlock
+        let allow = response_rx.try_recv().unwrap_or(true);
 
         if allow {
             raw_respond_allow(notifier_fd, req.id);
@@ -1589,17 +1586,12 @@ pub fn run_seccomp_notify_supervisor<F>(notify_fd: RawFd, mut on_intercepted: F)
 where
     F: FnMut(&SyscallInfo),
 {
-    loop {
-        match ScmpNotifReq::receive(notify_fd) {
-            Ok(req) => {
-                let info = SyscallInfo::from(&req);
-                on_intercepted(&info);
-                let resp = SeccompNotifier::deny_eperm(&req);
-                if resp.respond(notify_fd).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
+    while let Ok(req) = ScmpNotifReq::receive(notify_fd) {
+        let info = SyscallInfo::from(&req);
+        on_intercepted(&info);
+        let resp = SeccompNotifier::deny_eperm(&req);
+        if resp.respond(notify_fd).is_err() {
+            break;
         }
     }
     unsafe { libc::close(notify_fd) };
@@ -1609,6 +1601,7 @@ where
 ///
 /// This function receives notifications from the kernel about intercepted syscalls,
 /// invokes the callback for policy decisions, and sends responses back to the kernel.
+#[allow(dead_code)]
 fn run_notification_loop<F>(
     child_pid: Pid,
     notifier: &SeccompNotifier,
