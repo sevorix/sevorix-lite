@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use crate::policy::{Action, Engine, PolicyContext};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};

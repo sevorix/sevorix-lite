@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use crate::log_traffic_event;
 use crate::policy::PolicyContext;
 use crate::scanner::{log_threat, scan_content, scan_for_poison, PoisonPill};

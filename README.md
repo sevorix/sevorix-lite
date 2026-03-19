@@ -191,3 +191,11 @@ cd sevorix-release
     ```
 2.  **View Dashboard:**
     Open `http://localhost:3000/dashboard/desktop.html`
+
+## License
+
+Sevorix Watchtower is open source under the [AGPL-3.0](LICENSE) license.
+
+For commercial or proprietary use — including embedding in closed-source products
+or running as a hosted service without publishing your source — a commercial license
+is available. Contact chris@sevorix.com for details.

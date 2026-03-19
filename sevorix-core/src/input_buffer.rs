@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Input buffering for PTY multiplexer.
 //!
 //! This module provides character-by-character input buffering with immediate echo,

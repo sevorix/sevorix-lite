@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;

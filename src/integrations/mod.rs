@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Integration infrastructure for external tool support.
 //!
 //! This module provides the core Integration trait and registry for managing

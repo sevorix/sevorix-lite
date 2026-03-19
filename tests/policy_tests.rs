@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use sevorix_watchtower::policy::{Action, Engine, Policy, PolicyContext, PolicyType, Role};
 use sevorix_watchtower::scanner::scan_content;
 

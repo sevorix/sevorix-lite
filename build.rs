@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Build script for sevorix-watchtower.
 //!
 //! Compiles eBPF programs when the `ebpf` feature is enabled.

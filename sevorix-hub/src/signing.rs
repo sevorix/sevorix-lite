@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use crate::error::{AppError, AppResult};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};

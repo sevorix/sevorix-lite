@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;

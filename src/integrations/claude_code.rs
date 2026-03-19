@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Claude Code integration for Sevorix.
 //!
 //! The integration surfaces as `sevorix integrations start claude`, which

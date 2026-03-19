@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! OpenAI Codex integration for Sevorix.
 //!
 //! This integration configures Codex CLI to use sevsh as its shell,

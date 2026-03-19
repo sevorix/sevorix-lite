@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Sevorix eBPF Programs
 //!
 //! This crate contains eBPF programs for syscall and network interception.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -105,6 +108,11 @@ fn resolve_integration_name(name: &str) -> &str {
     }
 }
 
+/// Returns true if the integration is under development and not yet available.
+fn is_under_development(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(), "codex" | "openclaw")
+}
+
 /// Handle integration commands
 pub fn handle_integrations(cmd: IntegrationsCommands) {
     let mut registry = match IntegrationRegistry::new() {
@@ -119,15 +127,14 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
     if let Ok(claude_code) = ClaudeCodeIntegration::new() {
         registry.register(std::sync::Arc::new(claude_code));
     }
-    if let Ok(codex) = CodexIntegration::new() {
-        registry.register(std::sync::Arc::new(codex));
-    }
-    if let Ok(openclaw) = OpenClawIntegration::new() {
-        registry.register(std::sync::Arc::new(openclaw));
-    }
+    // Codex and OpenClaw are under development and not yet registered.
 
     match cmd {
         IntegrationsCommands::Install { name } => {
+            if is_under_development(&name) {
+                eprintln!("'{}' integration is under development and not yet available.", name);
+                return;
+            }
             let resolved = resolve_integration_name(&name);
             match registry.get(resolved) {
                 Some(integration) => match integration.install() {
@@ -150,6 +157,10 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
             }
         }
         IntegrationsCommands::Uninstall { name } => {
+            if is_under_development(&name) {
+                eprintln!("'{}' integration is under development and not yet available.", name);
+                return;
+            }
             let resolved = resolve_integration_name(&name);
             match registry.get(resolved) {
                 Some(integration) => match integration.uninstall() {
@@ -186,14 +197,10 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
         }
         IntegrationsCommands::List => {
             let integrations = registry.list();
+            println!("Available integrations:");
             if integrations.is_empty() {
-                println!("No integrations registered.");
-                println!("\nNote: Integrations will be added in future phases:");
-                println!("  - Claude Code (Phase 3)");
-                println!("  - OpenClaw (Phase 4)");
-                println!("  - Codex (Phase 4)");
+                println!("  (none registered)");
             } else {
-                println!("Available integrations:");
                 for integration in integrations {
                     let status = if integration.is_installed() {
                         "installed"
@@ -208,9 +215,16 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
                     );
                 }
             }
+            println!("\nUnder development (not yet available):");
+            println!("  Codex    - OpenAI Codex CLI integration");
+            println!("  OpenClaw - OpenClaw integration");
         }
         IntegrationsCommands::Status { name } => match name {
             Some(n) => {
+                if is_under_development(&n) {
+                    println!("'{}' is under development and not yet available.", n);
+                    return;
+                }
                 let resolved = resolve_integration_name(&n);
                 match registry.get(resolved) {
                     Some(integration) => {

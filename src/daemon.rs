@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use anyhow::{Context, Result};
 use daemonize::{Daemonize, Outcome};
 use directories::{ProjectDirs, UserDirs};

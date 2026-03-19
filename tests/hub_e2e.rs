@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 /// End-to-end tests for the SevorixHub API.
 ///
 /// These tests hit the live hub server and require a valid auth token at

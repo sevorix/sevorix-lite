@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Sevorix Hub - Policy artifact registry service.
 //!
 //! This crate provides the core functionality for the Sevorix Hub service,

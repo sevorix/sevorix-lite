@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use dashmap::DashMap;
 use sevorix_core::EnforcementTier;
 use sevorix_watchtower::{build_router, policy::Engine, AppState};

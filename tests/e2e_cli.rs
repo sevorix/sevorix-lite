@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 /// E2E tests for CLI commands (scenarios 8.6–8.9).
 ///
 /// Scenarios 8.1–8.5 (daemon lifecycle: start/stop/status/restart) are

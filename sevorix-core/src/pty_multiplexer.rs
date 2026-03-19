@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! PTY Multiplexer for shell command interception and validation.
 //!
 //! This module implements the PTY multiplexer architecture described in the design doc.

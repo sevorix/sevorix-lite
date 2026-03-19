@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 /// E2E tests for integrations CLI subcommands (scenarios 9.1–9.10).
 ///
 /// These tests exercise the `sevorix integrations` subcommands via
@@ -220,7 +223,8 @@ fn test_9_5_status_claude_code_output_structure() {
     );
 }
 
-/// `integrations status` with no name shows all integrations.
+/// `integrations status` with no name shows all active integrations.
+/// Codex and OpenClaw are under development and not shown here.
 #[test]
 fn test_9_5_status_all_shows_all_integrations() {
     let (stdout, stderr, code) = run(&["integrations", "status"]);
@@ -237,14 +241,6 @@ fn test_9_5_status_all_shows_all_integrations() {
     assert!(
         stdout.contains("Claude Code"),
         "expected 'Claude Code' in all-status; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("Codex"),
-        "expected 'Codex' in all-status; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("OpenClaw"),
-        "expected 'OpenClaw' in all-status; got: {stdout}"
     );
 }
 
@@ -347,20 +343,16 @@ fn test_9_9_codex_appears_in_list() {
     );
 }
 
-/// `integrations status codex` shows structured status output.
+/// `integrations status codex` reports that Codex is under development.
 #[test]
 fn test_9_9_codex_status_output() {
     let (stdout, stderr, _code) = run(&["integrations", "status", "Codex"]);
     println!("stdout:\n{}\nstderr:\n{}", stdout, stderr);
 
-    // Should output the structured status block, not an error.
+    let combined = format!("{stdout}{stderr}");
     assert!(
-        stdout.contains("Integration:"),
-        "expected 'Integration:' label in Codex status; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("Codex"),
-        "expected 'Codex' in status output; got: {stdout}"
+        combined.contains("under development"),
+        "expected 'under development' message for Codex status; got: {combined}"
     );
 }
 
@@ -380,18 +372,15 @@ fn test_9_10_openclaw_appears_in_list() {
     );
 }
 
-/// `integrations status OpenClaw` shows structured output.
+/// `integrations status OpenClaw` reports that OpenClaw is under development.
 #[test]
 fn test_9_10_openclaw_status_output() {
     let (stdout, stderr, _code) = run(&["integrations", "status", "OpenClaw"]);
     println!("stdout:\n{}\nstderr:\n{}", stdout, stderr);
 
+    let combined = format!("{stdout}{stderr}");
     assert!(
-        stdout.contains("Integration:"),
-        "expected 'Integration:' label in OpenClaw status; got: {stdout}"
-    );
-    assert!(
-        stdout.contains("OpenClaw"),
-        "expected 'OpenClaw' in status output; got: {stdout}"
+        combined.contains("under development"),
+        "expected 'under development' message for OpenClaw status; got: {combined}"
     );
 }

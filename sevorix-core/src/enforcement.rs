@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Enforcement tier detection.
 //!
 //! Detects whether the kernel supports BPF LSM hooks at runtime, selecting

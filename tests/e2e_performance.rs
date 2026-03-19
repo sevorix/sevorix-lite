@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 mod common;
 use common::harness::TestHarness;
 use common::ws_client::WsClient;

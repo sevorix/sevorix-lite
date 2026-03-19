@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! seccomp-unotify infrastructure for syscall interception.
 //!
 //! This module provides a seccomp user-space notification system that allows

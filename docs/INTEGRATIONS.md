@@ -187,29 +187,21 @@ http://localhost:3000/dashboard/desktop.html
 
 ---
 
-## Codex Integration
+## Codex Integration *(under development)*
+
+> **Not yet available.** This integration is under active development.
 
 Codex CLI respects the `$SHELL` environment variable, so the integration
-modifies `~/.codex/config.json` to set `SHELL` to sevsh directly — no mount
+will modify `~/.codex/config.json` to set `SHELL` to sevsh directly — no mount
 namespace needed.
-
-```sh
-sevorix integrations install codex
-sevorix integrations status codex
-sevorix integrations uninstall codex
-```
 
 ---
 
-## OpenClaw Integration
+## OpenClaw Integration *(under development)*
 
-Similar to Codex — configures OpenClaw to use sevsh via its config file.
+> **Not yet available.** This integration is under active development.
 
-```sh
-sevorix integrations install openclaw
-sevorix integrations status openclaw
-sevorix integrations uninstall openclaw
-```
+Similar to Codex — will configure OpenClaw to use sevsh via its config file.
 
 ---
 

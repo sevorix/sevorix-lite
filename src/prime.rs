@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 //! Context primers for AI agents operating with or within Sevorix.
 //!
 //! `sevorix prime <agent-type>` prints a markdown document to stdout

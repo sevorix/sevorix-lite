@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use clap::{CommandFactory, Parser};
 use sevorix_watchtower::prime::print_prime;
 use sevorix_watchtower::{

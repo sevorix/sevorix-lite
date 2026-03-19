@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Sevorix
+
 use clap::Parser;
 use serde_json::json;
 use sevorix_core::{
