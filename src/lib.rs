@@ -1788,7 +1788,6 @@ async fn health_handler() -> impl IntoResponse {
 }
 
 async fn get_version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    #[cfg(not(feature = "pro"))]
     let edition = "lite";
 
     let tier = match state.enforcement_tier {

@@ -101,6 +101,11 @@ def strip_cfg_pro_blocks(content: str) -> str:
                 i += 1
                 continue
 
+            # Remove #[cfg(not(feature = "pro"))] — always true in lite, unknown feature warning
+            if stripped.startswith('#[cfg(not(feature = "pro"))]'):
+                i += 1
+                continue
+
             result_lines.append(line)
         else:
             # Inside a pro block - track braces
