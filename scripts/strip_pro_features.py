@@ -183,6 +183,28 @@ def process_file(filepath: Path, is_rust: bool) -> bool:
         return False
 
 
+def strip_yaml_pro_blocks(content: str) -> str:
+    """
+    Remove pro-only sections from YAML files delimited by comment markers.
+
+    Removes blocks between (and including):
+      # [pro-only-start] ... # [pro-only-end]
+    """
+    lines = content.split('\n')
+    result = []
+    in_pro_block = False
+    for line in lines:
+        if line.strip() == '# [pro-only-start]':
+            in_pro_block = True
+            continue
+        if line.strip() == '# [pro-only-end]':
+            in_pro_block = False
+            continue
+        if not in_pro_block:
+            result.append(line)
+    return '\n'.join(result)
+
+
 def strip_html_pro_sections(content: str) -> str:
     """
     Remove pro-only sections from HTML files delimited by comment markers.
@@ -283,7 +305,27 @@ def main():
             modified_files.append(str(cargo_path.relative_to(repo_root)))
             print(f"Modified: {cargo_path.relative_to(repo_root)}")
 
-    # 7. Summary
+    # 7. Process GitHub Actions workflows
+    workflows_dir = repo_root / '.github' / 'workflows'
+    if workflows_dir.exists():
+        # Delete publish-lite.yml — watchtower-only, should not exist in lite repo
+        publish_lite = workflows_dir / 'publish-lite.yml'
+        if publish_lite.exists():
+            publish_lite.unlink()
+            removed_files.append('.github/workflows/publish-lite.yml')
+            print(f"Removed: .github/workflows/publish-lite.yml")
+
+        # Strip pro-only blocks from remaining workflow files
+        for yml_file in sorted(workflows_dir.glob('*.yml')):
+            content = yml_file.read_text()
+            original = content
+            content = strip_yaml_pro_blocks(content)
+            if content != original:
+                yml_file.write_text(content)
+                modified_files.append(str(yml_file.relative_to(repo_root)))
+                print(f"Modified: {yml_file.relative_to(repo_root)}")
+
+    # 8. Summary
     print("\n=== Strip Summary ===")
     print(f"Removed files: {len(removed_files)}")
     for f in removed_files:
@@ -292,7 +334,7 @@ def main():
     for f in modified_files:
         print(f"  - {f}")
 
-    # 8. Verify no pro references remain (security check)
+    # 9. Verify no pro references remain (security check)
     print("\n=== Security Verification ===")
     pro_patterns = [
         r'jury',

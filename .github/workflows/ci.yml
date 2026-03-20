@@ -23,8 +23,6 @@ jobs:
         include:
           - edition: lite
             features: ''
-          - edition: pro
-            features: '--features pro'
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -56,8 +54,6 @@ jobs:
         include:
           - edition: lite
             features: ''
-          - edition: pro
-            features: '--features pro'
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -81,8 +77,6 @@ jobs:
         include:
           - edition: lite
             features: ''
-          - edition: pro
-            features: '--features pro'
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
