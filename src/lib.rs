@@ -508,7 +508,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/session/set-role", post(session_set_role))
         .route("/api/active-sessions", get(active_sessions_handler));
 
-
     app.route("/health", get(health_handler))
         .route("/api/version", get(get_version))
         .fallback(proxy_handler)
@@ -525,8 +524,6 @@ pub async fn run_server(
 
     // Setup the shared state for the Dashboard + JuryConfig
     let (tx, _rx) = broadcast::channel(8192);
-
-
 
     // Initialize Engine
     let mut engine = Engine::new();
@@ -994,7 +991,6 @@ async fn analyze_intent(
         context,
     );
 
-
     // --- USER INTERVENTION for FLAG (shell channel) ---
     if scan.verdict == "FLAG" {
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -1426,7 +1422,6 @@ async fn ebpf_event_handler(
     }))
     .into_response()
 }
-
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, state))
