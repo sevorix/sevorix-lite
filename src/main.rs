@@ -680,6 +680,26 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // handle_hub_async tests — exercises functions defined in main.rs
+    // Logout and Status are chosen because they are purely local operations
+    // (read/remove a token file; no network calls).
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_handle_hub_async_logout_succeeds_when_not_logged_in() {
+        // clear_token() is a no-op when no token file exists; must not panic
+        let result = handle_hub_async(HubCommands::Logout).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_hub_async_status_when_unauthenticated() {
+        // check_auth_status() reads the local token file — no network needed
+        let result = handle_hub_async(HubCommands::Status { hub_url: None }).await;
+        assert!(result.is_ok());
+    }
+
     #[test]
     fn test_cli_hub_register_command() {
         let cli = Cli::try_parse_from([

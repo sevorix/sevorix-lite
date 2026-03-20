@@ -254,6 +254,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_print_prime_policy_manager() {
+        // Exercises the actual function code path, not just the constant
+        print_prime("policy-manager");
+    }
+
+    #[test]
+    fn test_print_prime_pm_alias() {
+        print_prime("pm");
+    }
+
+    #[test]
+    fn test_print_prime_guarded_agent() {
+        print_prime("guarded-agent");
+    }
+
+    #[test]
+    fn test_print_prime_guard_alias() {
+        print_prime("guard");
+    }
+
+    #[test]
+    fn test_print_prime_uppercase_normalizes() {
+        // "PM" should normalize to "pm" and match the alias
+        print_prime("PM");
+    }
+
+    #[test]
     fn test_policy_manager_aliases() {
         // Verify the content is non-empty for both aliases
         assert!(POLICY_MANAGER_PRIME.contains("Policy Manager"));
