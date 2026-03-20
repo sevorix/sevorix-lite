@@ -284,15 +284,15 @@ def main():
                 print(f"Modified: {html_file.relative_to(repo_root)}")
 
     # 5. Replace README.md with lite version
-    lite_readme = repo_root / 'lite' / 'README.md'
+    lite_readme = repo_root / 'README_LITE.md'
     main_readme = repo_root / 'README.md'
     if lite_readme.exists():
         import shutil
         shutil.copy(lite_readme, main_readme)
         modified_files.append('README.md')
-        print(f"Replaced: README.md with lite/README.md")
+        print(f"Replaced: README.md with README_LITE.md")
     else:
-        print(f"WARNING: lite/README.md not found — README.md not replaced", file=sys.stderr)
+        print(f"WARNING: README_LITE.md not found — README.md not replaced", file=sys.stderr)
 
     # 6. Update Cargo.toml
     cargo_path = repo_root / 'Cargo.toml'
