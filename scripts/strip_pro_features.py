@@ -320,11 +320,13 @@ def main():
             removed_files.append('.github/workflows/publish-lite.yml')
             print(f"Removed: .github/workflows/publish-lite.yml")
 
-        # Strip pro-only blocks from remaining workflow files
+        # Strip pro-only blocks and apply lite overrides to remaining workflow files
         for yml_file in sorted(workflows_dir.glob('*.yml')):
             content = yml_file.read_text()
             original = content
             content = strip_yaml_pro_blocks(content)
+            # Public lite repo uses GitHub-hosted runners, not self-hosted
+            content = content.replace('runs-on: self-hosted', 'runs-on: ubuntu-latest')
             if content != original:
                 yml_file.write_text(content)
                 modified_files.append(str(yml_file.relative_to(repo_root)))

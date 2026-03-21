@@ -17,7 +17,7 @@ env:
 jobs:
   e2e:
     name: E2E (${{ matrix.edition }} edition)
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
