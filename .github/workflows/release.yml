@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          # To add more targets in the future, append entries here, e.g.:
+          # - target: aarch64-unknown-linux-gnu
+          #   arch: aarch64
+          #   use_cross: true
+          # - target: x86_64-apple-darwin
+          #   arch: x86_64
+          #   os: macos
+          #   runs_on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          VERSION="${{ github.ref_name }}"
+          ARCHIVE="sevorix-${VERSION}-${{ matrix.arch }}-linux.tar.gz"
+          cp target/${{ matrix.target }}/release/sevorix sevorix
+          tar czf "${ARCHIVE}" sevorix
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Sevorix Lite ${{ github.ref_name }}" \
+            --generate-notes \
+            *.tar.gz *.tar.gz.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
