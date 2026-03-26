@@ -40,7 +40,7 @@ jobs:
         run: |
           VERSION="${{ github.ref_name }}"
           ARCHIVE="sevorix-${VERSION}-${{ matrix.arch }}-linux.tar.gz"
-          cp target/${{ matrix.target }}/release/sevorix sevorix
+          cp target/${{ matrix.target }}/release/sevorix_watchtower sevorix
           tar czf "${ARCHIVE}" sevorix
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
