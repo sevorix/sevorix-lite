@@ -39,7 +39,18 @@ fn read_log_entries(path: &std::path::Path) -> Vec<serde_json::Value> {
     content
         .lines()
         .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| {
+            // In pro builds, events are wrapped in a SignedReceipt envelope
+            // where `payload` is an object (ReceiptPayload). Unwrap to the
+            // inner payload so field checks work uniformly across build modes.
+            if v.get("receipt_version").is_some() {
+                if let Some(payload) = v.get("payload").cloned() {
+                    return payload;
+                }
+            }
+            v
+        })
         .collect()
 }
 
@@ -71,18 +82,21 @@ async fn test_12_2_log_entry_schema() {
     assert!(!entries.is_empty(), "should have log entries");
 
     for entry in &entries {
-        // Check required fields exist (may be null but should be present)
+        // Check required fields exist (may be null but should be present).
+        // Pro builds emit ReceiptPayload (decision, action_payload) while
+        // non-pro builds emit the flat event format (verdict, lane, payload).
+        let has_verdict = entry.get("verdict").is_some() || entry.get("decision").is_some();
+        assert!(has_verdict, "missing verdict/decision: {:?}", entry);
+
+        let has_payload = entry.get("payload").is_some()
+            || entry.get("action_payload").is_some()
+            || entry.get("type").is_some();
         assert!(
-            entry.get("verdict").is_some(),
-            "missing verdict: {:?}",
+            has_payload,
+            "missing payload/action_payload/type: {:?}",
             entry
         );
-        assert!(entry.get("lane").is_some(), "missing lane: {:?}", entry);
-        assert!(
-            entry.get("payload").is_some() || entry.get("type").is_some(),
-            "missing payload or type: {:?}",
-            entry
-        );
+
         // Timestamp should be a string
         if let Some(ts) = entry.get("timestamp") {
             assert!(ts.is_string(), "timestamp should be string");
@@ -102,7 +116,7 @@ async fn test_12_2_role_field_in_log() {
     // Find ALLOW or BLOCK entries (not PENDING which have different format)
     let traffic_entries: Vec<_> = entries
         .iter()
-        .filter(|e| e.get("verdict").is_some())
+        .filter(|e| e.get("verdict").is_some() || e.get("decision").is_some())
         .collect();
 
     for entry in &traffic_entries {

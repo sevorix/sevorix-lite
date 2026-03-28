@@ -55,9 +55,19 @@ def strip_cfg_pro_blocks(content: str) -> str:
             ])
 
             if is_block_start:
-                # This starts a block - skip until we find {, then track braces
-                waiting_for_brace = True
-                in_pro_block = False  # Don't track braces yet
+                # This starts a block - need to track braces until balanced.
+                # If the signature line already contains `{` (common for single-line
+                # fn signatures), start counting from that line so we don't mistake
+                # a brace inside the body (e.g. json!({...})) as the opener.
+                if '{' in line:
+                    in_pro_block = True
+                    brace_depth = line.count('{') - line.count('}')
+                    waiting_for_brace = False
+                    if brace_depth <= 0:
+                        in_pro_block = False
+                else:
+                    waiting_for_brace = True
+                    in_pro_block = False
                 pending_attribute = False
                 i += 1
                 continue
@@ -96,6 +106,11 @@ def strip_cfg_pro_blocks(content: str) -> str:
         if not in_pro_block:
             # Check for #[cfg(feature = "pro")] start
             if stripped.startswith('#[cfg(feature = "pro")]'):
+                # Also strip any doc-comment lines (///) that immediately
+                # precede this attribute — they document the pro-only item
+                # and would become orphaned after the item is removed.
+                while result_lines and result_lines[-1].strip().startswith('///'):
+                    result_lines.pop()
                 # This line starts a pro block - skip the attribute
                 pending_attribute = True
                 i += 1
@@ -175,9 +190,9 @@ def process_file(filepath: Path, is_rust: bool) -> bool:
         if is_rust:
             # Strip cfg(feature = "pro") blocks
             content = strip_cfg_pro_blocks(content)
-            # Remove jury module references
-            if filepath.name != 'jury.rs':  # jury.rs will be deleted
-                content = strip_mod_declaration(content, 'jury')
+            # Remove module declarations for whole-file pro modules
+            for mod_name in ('jury', 'receipt', 'receipt_cli'):
+                content = strip_mod_declaration(content, mod_name)
 
         if content != original:
             filepath.write_text(content)
@@ -253,12 +268,18 @@ def main():
     modified_files = []
     removed_files = []
 
-    # 1. Remove src/jury.rs (Pro-only file)
-    jury_path = repo_root / 'src' / 'jury.rs'
-    if jury_path.exists():
-        jury_path.unlink()
-        removed_files.append(str(jury_path.relative_to(repo_root)))
-        print(f"Removed: {jury_path.relative_to(repo_root)}")
+    # 1. Remove Pro-only source files (whole-file modules gated behind the pro feature)
+    pro_only_files = [
+        repo_root / 'src' / 'jury.rs',
+        repo_root / 'src' / 'receipt.rs',
+        repo_root / 'src' / 'receipt_cli.rs',
+    ]
+    pro_only_names = {p.name for p in pro_only_files}
+    for pro_path in pro_only_files:
+        if pro_path.exists():
+            pro_path.unlink()
+            removed_files.append(str(pro_path.relative_to(repo_root)))
+            print(f"Removed: {pro_path.relative_to(repo_root)}")
 
     # 2. Process Rust source files
     src_dir = repo_root / 'src'

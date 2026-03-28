@@ -778,6 +778,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2836,14 +2845,19 @@ dependencies = [
 name = "sevorix-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
+ "hex",
  "libc",
  "libseccomp",
  "nix",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -2912,13 +2926,16 @@ dependencies = [
  "axum",
  "aya",
  "aya-build",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "daemonize",
  "dashmap 6.1.0",
  "dialoguer",
  "directories",
+ "dirs",
  "dns-lookup",
+ "ed25519-dalek",
  "futures-util",
  "http-body",
  "http-body-util",
