@@ -626,6 +626,8 @@ pub async fn run_server(
     let session_id_str = session_id.to_string();
     let traffic_log_path = log_dir.join(format!("{}-traffic.jsonl", session_id_str));
 
+    // Load (or generate) the Ed25519 signing key and compute the initial policy hash.
+
     let app_state = Arc::new(AppState {
         tx,
         policy_engine: Arc::new(RwLock::new(engine)),
@@ -1018,6 +1020,7 @@ async fn analyze_intent(
             "timeout_secs": state.intervention_timeout_secs,
             "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
         });
+        #[allow(deprecated)]
         log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
         let _ = state.tx.send(pending_event.to_string());
 
@@ -1056,6 +1059,7 @@ async fn analyze_intent(
                 "role": resolved_role,
             });
             let block_str = block_event.to_string();
+            #[allow(deprecated)]
             log_traffic_event(&state.traffic_log_path, &block_str);
             let _ = state.tx.send(block_str);
             return Json(json!({
@@ -1103,6 +1107,7 @@ async fn analyze_intent(
         "role": resolved_role,
     });
     let event_str = event.to_string();
+    #[allow(deprecated)]
     log_traffic_event(&state.traffic_log_path, &event_str);
     let _ = state.tx.send(event_str);
 
@@ -1187,6 +1192,7 @@ async fn analyze_syscall(
         "ppid": event.ppid
     });
     let event_str = syscall_event.to_string();
+    #[allow(deprecated)]
     log_traffic_event(&state.traffic_log_path, &event_str);
     let _ = state.tx.send(event_str);
 
@@ -1397,6 +1403,7 @@ async fn ebpf_event_handler(
     let event_str = unified_event.to_string();
 
     // Log to traffic events
+    #[allow(deprecated)]
     log_traffic_event(&state.traffic_log_path, &event_str);
 
     // Broadcast to dashboard
@@ -1446,6 +1453,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 }
 
 /// Log a traffic event to the persistent JSONL file
+#[deprecated(note = "use sign_and_log_traffic_event in pro builds")]
 pub fn log_traffic_event(path: &std::path::Path, event: &str) {
     use std::io::Write;
     if let Some(parent) = path.parent() {

@@ -241,8 +241,16 @@ async fn test_5_8_role_in_traffic_log() {
         .last()
         .expect("traffic log should have at least one entry");
 
-    let entry: serde_json::Value =
+    let raw: serde_json::Value =
         serde_json::from_str(last_line).expect("traffic log entry should be valid JSON");
+
+    // In pro builds, events are wrapped in a SignedReceipt envelope; unwrap to
+    // the inner ReceiptPayload so field access works uniformly across build modes.
+    let entry = if raw.get("receipt_version").is_some() {
+        raw.get("payload").cloned().unwrap_or(raw)
+    } else {
+        raw
+    };
 
     assert_eq!(
         entry["role"], "test-role",

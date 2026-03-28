@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Sevorix
 
+#[cfg(feature = "pro")]
+pub mod signing;
+#[cfg(feature = "pro")]
+pub use signing::{
+    compute_sha256, generate_signing_key, load_or_create_keypair, parse_public_key,
+    public_key_fingerprint, sign_bytes, verify_signature, verifying_key_b64, SigningError,
+};
+
 pub mod enforcement;
 pub mod input_buffer;
 pub mod pty;

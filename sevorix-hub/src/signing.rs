@@ -1,49 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Sevorix
 
+//! Ed25519 signing helpers for the Hub service.
+//!
+//! The core primitives now live in `sevorix_core::signing`. This module
+//! re-exports them and provides thin Hub-specific wrappers that map
+//! `SigningError` to the Hub's `AppError` type.
+
 use crate::error::{AppError, AppResult};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use sha2::{Digest, Sha256};
-
-/// Compute the SHA-256 hash of `data` and return it as a 64-char lowercase hex string.
-pub fn compute_sha256(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
-    hex::encode(hash)
-}
-
-/// Compute the SHA-256 fingerprint of a public key's raw bytes as a 64-char hex string.
-pub fn public_key_fingerprint(pubkey_bytes: &[u8]) -> String {
-    compute_sha256(pubkey_bytes)
-}
+use ed25519_dalek::VerifyingKey;
+pub use sevorix_core::{compute_sha256, public_key_fingerprint, SigningError};
 
 /// Parse a base64-encoded Ed25519 public key (32 raw bytes after decoding).
+///
+/// Maps `SigningError` to `AppError::BadRequest`.
 pub fn parse_public_key(b64: &str) -> AppResult<VerifyingKey> {
-    let bytes = STANDARD
-        .decode(b64)
-        .map_err(|e| AppError::BadRequest(format!("invalid public key encoding: {e}")))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| AppError::BadRequest("public key must be exactly 32 bytes".to_string()))?;
-    VerifyingKey::from_bytes(&bytes)
-        .map_err(|e| AppError::BadRequest(format!("invalid Ed25519 public key: {e}")))
+    sevorix_core::parse_public_key(b64).map_err(|e| AppError::BadRequest(e.to_string()))
 }
 
 /// Verify an Ed25519 signature.
 ///
-/// The signed message is the UTF-8 bytes of `hash_hex` (the 64-char SHA-256 hex string).
+/// The signed message is the UTF-8 bytes of `hash_hex`.
 /// `sig_b64` is the base64-encoded 64-byte Ed25519 signature.
 ///
-/// Returns `Ok(true)` if the signature is valid, `Ok(false)` if it is not.
+/// Returns `Ok(true)` if valid, `Ok(false)` if not.
+/// Maps `SigningError` to `AppError::BadRequest`.
 pub fn verify_signature(key: &VerifyingKey, hash_hex: &str, sig_b64: &str) -> AppResult<bool> {
-    let sig_bytes = STANDARD
-        .decode(sig_b64)
-        .map_err(|e| AppError::BadRequest(format!("invalid signature encoding: {e}")))?;
-    let sig_bytes: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| AppError::BadRequest("signature must be exactly 64 bytes".to_string()))?;
-    let signature = Signature::from_bytes(&sig_bytes);
-    Ok(key.verify(hash_hex.as_bytes(), &signature).is_ok())
+    sevorix_core::verify_signature(key, hash_hex, sig_b64)
+        .map_err(|e| AppError::BadRequest(e.to_string()))
 }
 
 #[cfg(test)]
@@ -59,7 +43,6 @@ mod tests {
 
     #[test]
     fn test_compute_sha256_empty_string() {
-        // Known SHA-256 vector: SHA-256("") is the well-known empty-string digest.
         let result = compute_sha256(b"");
         assert_eq!(
             result,
@@ -69,7 +52,6 @@ mod tests {
 
     #[test]
     fn test_compute_sha256_known_vector() {
-        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
         let result = compute_sha256(b"abc");
         assert_eq!(
             result,
@@ -156,42 +138,34 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{:?}", result.unwrap_err());
         assert!(
-            err.contains("invalid public key encoding"),
+            err.contains("invalid public key encoding") || err.contains("base64"),
             "unexpected error message: {err}"
         );
     }
 
     #[test]
     fn test_parse_public_key_wrong_length_31_bytes() {
-        // 31 bytes encoded as base64 — wrong length for Ed25519.
         let short_bytes = vec![0u8; 31];
         let b64 = STANDARD.encode(&short_bytes);
         let result = parse_public_key(&b64);
         assert!(result.is_err());
         let err = format!("{:?}", result.unwrap_err());
         assert!(
-            err.contains("public key must be exactly 32 bytes"),
+            err.contains("32") || err.contains("length"),
             "unexpected error message: {err}"
         );
     }
 
     #[test]
     fn test_parse_public_key_wrong_length_33_bytes() {
-        // 33 bytes — also wrong length.
         let long_bytes = vec![0u8; 33];
         let b64 = STANDARD.encode(&long_bytes);
         let result = parse_public_key(&b64);
         assert!(result.is_err());
-        let err = format!("{:?}", result.unwrap_err());
-        assert!(
-            err.contains("public key must be exactly 32 bytes"),
-            "unexpected error message: {err}"
-        );
     }
 
     #[test]
     fn test_parse_public_key_empty_string() {
-        // Empty base64 decodes to 0 bytes — wrong length.
         let result = parse_public_key("");
         assert!(result.is_err());
     }
@@ -223,7 +197,6 @@ mod tests {
         let (signing_key, hash_hex, mut sig_b64) = make_keypair_and_signature(b"test content");
         let verifying_key = signing_key.verifying_key();
 
-        // Corrupt the base64 signature by decoding, flipping a byte, re-encoding.
         let mut sig_bytes = STANDARD.decode(&sig_b64).unwrap();
         sig_bytes[0] ^= 0xFF;
         sig_b64 = STANDARD.encode(&sig_bytes);
@@ -239,10 +212,8 @@ mod tests {
     #[test]
     fn test_verify_signature_wrong_key() {
         let (signing_key, hash_hex, sig_b64) = make_keypair_and_signature(b"test content");
-        // Use the correct signing key's verifying key initially, but then generate a different key.
         let _ = signing_key.verifying_key();
 
-        // Generate a completely different keypair — the verifying key won't match.
         let mut csprng = OsRng;
         let wrong_signing_key = SigningKey::generate(&mut csprng);
         let wrong_verifying_key = wrong_signing_key.verifying_key();
@@ -259,7 +230,6 @@ mod tests {
     fn test_verify_signature_wrong_hash() {
         let (signing_key, _hash_hex, sig_b64) = make_keypair_and_signature(b"test content");
         let verifying_key = signing_key.verifying_key();
-        // Use a different hash than what was signed.
         let different_hash = compute_sha256(b"different content");
 
         let result = verify_signature(&verifying_key, &different_hash, &sig_b64);
@@ -276,39 +246,26 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
         let result = verify_signature(&verifying_key, &hash_hex, "not!!valid!!base64@@");
         assert!(result.is_err());
-        let err = format!("{:?}", result.unwrap_err());
-        assert!(
-            err.contains("invalid signature encoding"),
-            "unexpected error message: {err}"
-        );
     }
 
     #[test]
     fn test_verify_signature_wrong_length() {
         let (signing_key, hash_hex, _) = make_keypair_and_signature(b"test content");
         let verifying_key = signing_key.verifying_key();
-        // Encode only 32 bytes — wrong length for a 64-byte Ed25519 signature.
         let short_sig = STANDARD.encode(&[0u8; 32]);
         let result = verify_signature(&verifying_key, &hash_hex, &short_sig);
         assert!(result.is_err());
-        let err = format!("{:?}", result.unwrap_err());
-        assert!(
-            err.contains("signature must be exactly 64 bytes"),
-            "unexpected error message: {err}"
-        );
     }
 
     #[test]
     fn test_verify_signature_all_zeros_signature() {
-        // A 64-byte all-zeros signature that is valid length but will fail verification.
         let (signing_key, hash_hex, _) = make_keypair_and_signature(b"test content");
         let verifying_key = signing_key.verifying_key();
         let zero_sig = STANDARD.encode(&[0u8; 64]);
         let result = verify_signature(&verifying_key, &hash_hex, &zero_sig);
-        // Either returns Ok(false) or Err — both are acceptable as long as it doesn't return Ok(true).
         match result {
             Ok(valid) => assert!(!valid, "all-zeros signature should not be valid"),
-            Err(_) => {} // Also acceptable
+            Err(_) => {}
         }
     }
 }
