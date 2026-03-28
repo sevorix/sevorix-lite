@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Sevorix
 
+#[allow(deprecated)]
 use crate::log_traffic_event;
 use crate::policy::PolicyContext;
 use crate::scanner::{log_threat, scan_content, scan_for_poison, PoisonPill};
@@ -88,6 +89,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
                 "confidence": "N/A"
             });
             let event_str = event.to_string();
+            #[allow(deprecated)]
             log_traffic_event(&state.traffic_log_path, &event_str);
             let _ = state.tx.send(event_str);
 
@@ -226,6 +228,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             "context": "Network"
         });
         let event_str = event.to_string();
+        #[allow(deprecated)]
         log_traffic_event(&state.traffic_log_path, &event_str);
         let _ = state.tx.send(event_str);
 
@@ -269,6 +272,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             "timeout_secs": state.intervention_timeout_secs,
             "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
         });
+        #[allow(deprecated)]
         log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
         let _ = state.tx.send(pending_event.to_string());
 
@@ -306,6 +310,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
                 "context": "Network",
             });
             let block_str = block_event.to_string();
+            #[allow(deprecated)]
             log_traffic_event(&state.traffic_log_path, &block_str);
             let _ = state.tx.send(block_str);
             return (StatusCode::FORBIDDEN, "Request blocked by operator.").into_response();
@@ -345,6 +350,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         "context": "Network"
     });
     let event_str = event.to_string();
+    #[allow(deprecated)]
     log_traffic_event(&state.traffic_log_path, &event_str);
     let _ = state.tx.send(event_str);
 

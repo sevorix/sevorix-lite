@@ -25,7 +25,18 @@ fn read_log_entries(path: &std::path::Path) -> Vec<serde_json::Value> {
     content
         .lines()
         .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| {
+            // In pro builds, events are wrapped in a SignedReceipt envelope
+            // where `payload` is an object (ReceiptPayload). Unwrap to the
+            // inner payload so filters work uniformly across build modes.
+            if v.get("receipt_version").is_some() {
+                if let Some(payload) = v.get("payload").cloned() {
+                    return payload;
+                }
+            }
+            v
+        })
         .collect()
 }
 
