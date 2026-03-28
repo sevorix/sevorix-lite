@@ -13,28 +13,50 @@ It intercepts, records, and blocks dangerous/undesirable activity in < 20ms. Wha
 
 ## ⚡ Quick Start (Under 60 Seconds)
 
-### 1. Prerequisites
-Requires Linux/WSL/macOS and Rust (`cargo`).
-*Don't have Rust installed? Get it in one line:*
-`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+### 1. Download the latest release
 
-### 2. Install
 ```bash
-git clone [https://github.com/sevorix/sevorix-lite.git](https://github.com/sevorix/sevorix-lite.git)
-cd sevorix-lite
-./install.sh
+curl -LO https://github.com/sevorix/sevorix-lite/releases/latest/download/sevorix-$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)-x86_64-linux.tar.gz
+curl -LO https://github.com/sevorix/sevorix-lite/releases/latest/download/sevorix-$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)-x86_64-linux.tar.gz.sha256
 ```
 
-### 3. Start the Daemon
+Or download directly from the [releases page](https://github.com/sevorix/sevorix-lite/releases/latest).
+
+### 2. Verify and extract
+
+```bash
+sha256sum -c sevorix-*-x86_64-linux.tar.gz.sha256
+tar -xzf sevorix-*-x86_64-linux.tar.gz
+cd sevorix-*-x86_64-linux
+```
+
+### 3. Install
+
+```bash
+./install-binary.sh
+```
+
+### 4. Start the Daemon
 Launch the Sevorix Control Plane in the background.
 ```bash
 sevorix start
 sevorix status
 ```
 
-### 4. Open the Watchtower Dashboard
+### 5. Open the Watchtower Dashboard
 Navigate to your local command center to see real-time enforcement:
 👉 **`http://localhost:3000/dashboard/desktop.html`**
+
+---
+
+### Install from source
+Prefer to build from source? Requires Linux/WSL/macOS and Rust (`cargo`).
+
+```bash
+git clone https://github.com/sevorix/sevorix-lite.git
+cd sevorix-lite
+./install.sh
+```
 
 ---
 
