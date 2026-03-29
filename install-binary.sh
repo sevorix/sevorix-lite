@@ -291,3 +291,23 @@ echo "✅ Installation complete!"
 echo "   Run 'sevorix start' to launch the daemon."
 echo "   Run 'sevorix status' to check status."
 echo "   Run 'sevsh -- <command>' to run a command inside a monitored session."
+
+# ---------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------
+BUNDLE_DIR="$(basename "$PWD")"
+PARENT_DIR="$(dirname "$PWD")"
+TARBALL="${PARENT_DIR}/${BUNDLE_DIR}.tar.gz"
+CHECKSUM="${TARBALL}.sha256"
+
+CLEANUP_TARGETS=()
+[ -f "$TARBALL" ]  && CLEANUP_TARGETS+=("$TARBALL")
+[ -f "$CHECKSUM" ] && CLEANUP_TARGETS+=("$CHECKSUM")
+
+if prompt_confirm \
+    "Clean up installation files" \
+    "Removes the downloaded tarball and this bundle directory."; then
+    rm -f "${CLEANUP_TARGETS[@]}"
+    # cd out of the bundle dir before removing it
+    bash -c "cd '$PARENT_DIR' && rm -rf '$BUNDLE_DIR'" &
+fi
