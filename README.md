@@ -13,28 +13,19 @@ It intercepts, records, and blocks dangerous/undesirable activity in < 20ms. Wha
 
 ## ⚡ Quick Start (Under 60 Seconds)
 
-### 1. Download the latest release
+### 1. Download, verify, and install
 
 ```bash
-curl -LO https://github.com/sevorix/sevorix-lite/releases/latest/download/sevorix-$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)-x86_64-linux.tar.gz
-curl -LO https://github.com/sevorix/sevorix-lite/releases/latest/download/sevorix-$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)-x86_64-linux.tar.gz.sha256
+VERSION=$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)
+curl -LO https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz
+curl -LO https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
+sha256sum -c sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
+tar -xzf sevorix-${VERSION}-x86_64-linux.tar.gz
+cd sevorix-${VERSION}-x86_64-linux
+./install-binary.sh
 ```
 
 Or download directly from the [releases page](https://github.com/sevorix/sevorix-lite/releases/latest).
-
-### 2. Verify and extract
-
-```bash
-sha256sum -c sevorix-*-x86_64-linux.tar.gz.sha256
-tar -xzf sevorix-*-x86_64-linux.tar.gz
-cd sevorix-*-x86_64-linux
-```
-
-### 3. Install
-
-```bash
-./install-binary.sh
-```
 
 ### 4. Start the Daemon
 Launch the Sevorix Control Plane in the background.
