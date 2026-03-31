@@ -29,6 +29,11 @@ async fn test_real_connect_handshake() {
         intervention_timeout_secs: 30,
         intervention_timeout_allow: false,
         current_role: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        http_client: reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default(),
     });
 
     // 2. Setup Router

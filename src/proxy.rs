@@ -357,8 +357,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     // Features: Forwarding (HTTP)
     // Create new client request and stream response.
 
-    // We'll use reqwest for simplicity as it's a high-level wrapper.
-    let client = reqwest::Client::new();
+    // Use the shared client (no_proxy prevents re-entering the proxy via env vars).
+    let client = state.http_client.clone();
 
     // Note: Request URI in proxy mode is absolute.
     let url = uri.to_string();
@@ -379,15 +379,14 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     match req_builder.send().await {
         Ok(res) => {
             let status = res.status();
-            // We can convert reqwest stream to axum body
+            let headers = res.headers().clone();
             let body = Body::from_stream(res.bytes_stream());
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
-
-            // Forward response headers
-            // (Axum/Hyper might handle some automatically, but let's be explicit if needed)
-            // For now, minimal.
+            for (key, value) in headers.iter() {
+                response.headers_mut().insert(key, value.clone());
+            }
 
             response
         }
@@ -452,6 +451,11 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: std::sync::Arc::new(std::sync::RwLock::new(Some("default".to_string()))),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         })
     }
 
@@ -492,6 +496,11 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: std::sync::Arc::new(std::sync::RwLock::new(Some("default".to_string()))),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         })
     }
 
