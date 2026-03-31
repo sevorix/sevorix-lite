@@ -78,6 +78,10 @@ pub struct AppState {
     /// settings.json `default_role` at startup; updated live via
     /// `POST /api/session/set-role`. Fail-closed if None.
     pub current_role: Arc<RwLock<Option<String>>>,
+    /// Shared HTTP client for proxying requests. Built with `.no_proxy()` and
+    /// `.redirect(Policy::none())` so the proxy never follows redirects itself —
+    /// redirect responses are returned to the caller to handle.
+    pub http_client: reqwest::Client,
 }
 
 pub fn handle_config(cmd: ConfigCommands) {
@@ -640,6 +644,11 @@ pub async fn run_server(
         intervention_timeout_secs: intervention_settings.timeout_secs(),
         intervention_timeout_allow: intervention_settings.timeout_action_allow(),
         current_role: Arc::new(RwLock::new(default_role)),
+        http_client: reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default(),
     });
 
     // Define the Routes
@@ -1866,6 +1875,11 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(None)),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         })
     }
 
@@ -1883,6 +1897,11 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(None)),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         })
     }
 
@@ -1900,6 +1919,11 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(None)),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         })
     }
 

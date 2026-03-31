@@ -58,6 +58,11 @@ impl TestHarness {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(default_role)),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         });
 
         let app = build_router(state.clone());
@@ -144,6 +149,11 @@ impl TestHarness {
             intervention_timeout_secs: timeout_secs,
             intervention_timeout_allow: timeout_allow,
             current_role: Arc::new(RwLock::new(None)),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default(),
         });
 
         let app = build_router(state.clone());
