@@ -13,35 +13,40 @@ It intercepts, records, and blocks dangerous/undesirable activity in < 20ms. Wha
 
 ## ⚡ Quick Start (Under 60 Seconds)
 
-### 1. Download, verify, and install
+### 1. Download and install
 
 ```bash
 VERSION=$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)
-curl -LO https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz
-curl -LO https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
-sha256sum -c sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
-tar -xzf sevorix-${VERSION}-x86_64-linux.tar.gz
-cd sevorix-${VERSION}-x86_64-linux
-./install-binary.sh
+curl -L https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz | tar -xz
+cd sevorix-${VERSION}-x86_64-linux && ./install-binary.sh
 ```
 
 Or download directly from the [releases page](https://github.com/sevorix/sevorix-lite/releases/latest).
 
-### 4. Start the Daemon
+### 2. Verify the download (optional)
+
+To verify the integrity of the archive before installing, download and check the SHA256 checksum:
+
+```bash
+curl -LO https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
+sha256sum -c sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
+```
+
+### 3. Start the Daemon
 Launch the Sevorix Control Plane in the background.
 ```bash
 sevorix start
 sevorix status
 ```
 
-### 5. Open the Watchtower Dashboard
+### 4. Open the Watchtower Dashboard
 Navigate to your local command center to see real-time enforcement:
 👉 **`http://localhost:3000/dashboard/desktop.html`**
 
 ---
 
 ### Install from source
-Prefer to build from source? Requires Linux/WSL/macOS and Rust (`cargo`).
+Prefer to build from source? Requires Linux/WSL and Rust (`cargo`).
 
 ```bash
 git clone https://github.com/sevorix/sevorix-lite.git
@@ -60,21 +65,21 @@ Leave your Dashboard open in a browser, and run these in your terminal:
 ### Scenario 1: The Green Lane (Allowed)
 Run a benign command.
 ```bash
-./sevsh -c "echo 'Agent is thinking...'"
+sevsh -c "echo 'Agent is thinking...'"
 ```
 **Result:** The command executes normally.
 
 ### Scenario 2: The Red Lane (Zero-Latency Kill Switch)
 Simulate a rogue agent trying to drop a database table. Our default `policies.json` strictly forbids the `DROP` keyword.
 ```bash
-./sevsh -c "DROP TABLE users;"
+sevsh -c "DROP TABLE users;"
 ```
 **Result:** The command is instantly vaporized. You will see `SEVORIX BLOCKED: Policy Violation` in your terminal.
 
 ### Scenario 3: The Yellow Lane (Human-in-the-Loop)
 Simulate an agent trying to access sensitive data. Our default policy flags the `SELECT` keyword for human review.
 ```bash
-./sevsh -c "SELECT * FROM admin_credentials;"
+sevsh -c "SELECT * FROM admin_credentials;"
 ```
 **Result:** The terminal hangs. Switch to your **Dashboard**. You will see a Yellow Intervention Panel with a countdown timer. Click **Block** or **Allow** to determine the outcome.
 
@@ -112,6 +117,51 @@ Claude is now running. Any command it attempts to execute will be intercepted, e
 ---
 
 ## ⚙️ How it Works: The Architecture
+
+### Without Sevorix
+
+An AI agent has unrestricted access to your system. Shell commands, network requests, and syscalls execute directly — with no interception, no audit trail, and no way to stop a rogue or compromised agent before it causes damage.
+
+```mermaid
+graph LR
+    Agent["🤖 AI Agent"]
+    Agent -->|shell commands| Shell["💻 Shell / OS"]
+    Agent -->|HTTP requests| Network["🌐 Network"]
+    Agent -->|syscalls| Kernel["⚙️ Kernel"]
+```
+
+### With Sevorix
+
+Every action the agent takes passes through the Sevorix enforcement plane before it can reach the system. Actions are evaluated in real time against your policies, and blocked, flagged, or allowed accordingly.
+
+```mermaid
+graph LR
+    Agent["🤖 AI Agent"]
+    PE["📋 Policy Engine"]
+
+    Agent -->|shell commands| sevsh["sevsh"]
+    Agent -->|HTTP requests| Proxy["Network Proxy"]
+    Agent -->|syscalls| eBPF["eBPF"]
+
+    sevsh <-->|evaluate / decide| PE
+    Proxy <-->|evaluate / decide| PE
+    eBPF <-->|evaluate / decide| PE
+
+    sevsh -->|allowed| Shell["💻 Shell / OS"]
+    Proxy -->|allowed| Network["🌐 Network"]
+    eBPF -->|allowed| Kernel["⚙️ Kernel"]
+```
+
+#### Components
+
+| Component | Role |
+|-----------|------|
+| **sevsh** | A secure shell wrapper that intercepts every command before it reaches the OS. Used directly in the Test Drive, and bind-mounted over `/bin/bash` inside the Claude Code vault so there is no escape path. |
+| **Network Proxy** | An HTTP proxy running on the Sevorix daemon. Intercepts all outbound agent HTTP/S requests before they leave the machine. |
+| **eBPF** | A kernel-level syscall interceptor (Linux only, `ebpf` feature). Catches raw syscalls that bypass the shell and network layers entirely. |
+| **Policy Engine** | Consulted by each interceptor before a call is passed or rejected. Evaluates the action against your loaded policies (Simple / Regex / Executable) and returns Allow, Block, or Flag. |
+
+---
 
 Sevorix Watchtower relies on physics, not suggestions. We enforce a **Three-Lane Traffic** system:
 
