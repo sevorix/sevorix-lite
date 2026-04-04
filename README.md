@@ -15,10 +15,25 @@ It intercepts, records, and blocks dangerous/undesirable activity in < 20ms. Wha
 
 ### 1. Download and install
 
+**Linux / WSL:**
 ```bash
 VERSION=$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)
 curl -L https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz | tar -xz
 cd sevorix-${VERSION}-x86_64-linux && ./install-binary.sh
+```
+
+**macOS (Apple Silicon):**
+```bash
+VERSION=$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)
+curl -L https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-aarch64-darwin.tar.gz | tar -xz
+cd sevorix-${VERSION}-aarch64-darwin && ./install-binary.sh
+```
+
+**macOS (Intel):**
+```bash
+VERSION=$(curl -s https://api.github.com/repos/sevorix/sevorix-lite/releases/latest | grep tag_name | cut -d'"' -f4)
+curl -L https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-darwin.tar.gz | tar -xz
+cd sevorix-${VERSION}-x86_64-darwin && ./install-binary.sh
 ```
 
 Or download directly from the [releases page](https://github.com/sevorix/sevorix-lite/releases/latest).
@@ -28,8 +43,10 @@ Or download directly from the [releases page](https://github.com/sevorix/sevorix
 To verify the integrity of the archive before installing, download and check the SHA256 checksum:
 
 ```bash
-curl -LO https://github.com/sevorix/sevorix-lite/releases/download/${VERSION}/sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
+# Linux
 sha256sum -c sevorix-${VERSION}-x86_64-linux.tar.gz.sha256
+# macOS
+shasum -a 256 -c sevorix-${VERSION}-aarch64-darwin.tar.gz.sha256
 ```
 
 ### 3. Start the Daemon
@@ -46,12 +63,20 @@ Navigate to your local command center to see real-time enforcement:
 ---
 
 ### Install from source
-Prefer to build from source? Requires Linux/WSL and Rust (`cargo`).
 
+**Linux/WSL** — builds with full eBPF support:
 ```bash
 git clone https://github.com/sevorix/sevorix-lite.git
 cd sevorix-lite
 ./install.sh
+```
+
+**macOS** — builds proxy + policy engine only (no eBPF, no libseccomp required):
+```bash
+git clone https://github.com/sevorix/sevorix-lite.git
+cd sevorix-lite
+cargo build --release
+cp target/release/sevorix target/release/sevsh ~/.local/bin/
 ```
 
 ---
@@ -160,6 +185,26 @@ graph LR
 | **Network Proxy** | An HTTP proxy running on the Sevorix daemon. Intercepts all outbound agent HTTP/S requests before they leave the machine. |
 | **eBPF** | A kernel-level syscall interceptor (Linux only, `ebpf` feature). Catches raw syscalls that bypass the shell and network layers entirely. |
 | **Policy Engine** | Consulted by each interceptor before a call is passed or rejected. Evaluates the action against your loaded policies (Simple / Regex / Executable) and returns Allow, Block, or Flag. |
+
+### macOS vs Linux
+
+The macOS binary ships the proxy, policy engine, sevsh, and the dashboard. The two Linux-only subsystems — eBPF and seccomp — are not available on macOS because they depend on Linux kernel APIs.
+
+| Capability | macOS | Linux/WSL |
+|-----------|:-----:|:---------:|
+| HTTP proxy + policy enforcement | ✓ | ✓ |
+| sevsh shell interception (text patterns) | ✓ | ✓ |
+| Dashboard + WebSocket | ✓ | ✓ |
+| Claude Code integration | ✓ | ✓ |
+| SevorixHub client | ✓ | ✓ |
+| Human-in-the-loop Yellow Lane | ✓ | ✓ |
+| Shell syscall filtering (seccomp) | — | ✓ |
+| Kernel network interception (eBPF) | — | ✓ |
+| Per-process syscall tracing (eBPF) | — | ✓ |
+
+**What this means in practice:** On macOS, if an AI agent bypasses the HTTP proxy — for example, by opening a raw TCP socket — Sevorix cannot see that traffic. On Linux with eBPF, such bypasses are caught at the kernel level. For most developer workflows on a Mac the proxy layer is sufficient; the eBPF layer provides deeper containment for production or adversarial environments.
+
+`Syscall`-context policies are accepted by the policy engine on macOS but will never trigger (there is no syscall interception layer to feed them). Use `Shell` or `Network` context for policies you want enforced on Mac.
 
 ---
 
@@ -283,6 +328,33 @@ sevorix integrations list   # Show available AI sandboxes
 
 **3. Permission Denied during Claude Code Integration**
 * **The Fix:** When you run `sevorix integrations start claude`, Sevorix uses a Linux mount namespace to safely lock the agent down. This requires temporary `sudo` privileges. Ensure your user has sudo rights, or check that the installer successfully placed the rule in `/etc/sudoers.d/sevorix-claude`.
+
+**4. macOS: daemon does not start on login**
+* **The Fix:** The daemon does not integrate with launchd automatically. To start Sevorix on login, create `~/Library/LaunchAgents/com.sevorix.watchtower.plist`:
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0"><dict>
+      <key>Label</key><string>com.sevorix.watchtower</string>
+      <key>ProgramArguments</key><array>
+          <string>/Users/YOUR_USER/.local/bin/sevorix</string>
+          <string>run</string>
+      </array>
+      <key>RunAtLoad</key><true/>
+      <key>KeepAlive</key><true/>
+      <key>StandardOutPath</key><string>/tmp/sevorix.log</string>
+      <key>StandardErrorPath</key><string>/tmp/sevorix.err</string>
+  </dict></plist>
+  ```
+  Then run `launchctl load ~/Library/LaunchAgents/com.sevorix.watchtower.plist`.
+
+**5. macOS build error: `could not find library 'seccomp'`**
+* **The Fix:** This occurs when building from source before the `libseccomp` dependency is gated as Linux-only in `sevorix-core`. As a temporary workaround, move the dependency in `sevorix-core/Cargo.toml`:
+  ```toml
+  [target.'cfg(target_os = "linux")'.dependencies]
+  libseccomp = "0.4"
+  ```
+  Pre-built macOS binaries from the releases page do not have this issue.
 
 ---
 
