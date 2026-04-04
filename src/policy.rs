@@ -11,12 +11,19 @@ use std::fs;
 
 pub use sevorix_core::{Action, Policy, PolicyContext, PolicyType, Role};
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolicySource {
+    BuiltIn,
+    User,
+}
+
 #[derive(Debug, Clone)]
 pub struct Decision {
     pub policy_id: String,
     pub action: Action,
     /// If true, kill the traced process instead of returning EPERM.
     pub kill: bool,
+    pub source: PolicySource,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,12 +45,14 @@ impl Default for Engine {
 }
 
 impl Engine {
+    #[allow(clippy::let_and_return)] // `let engine` is needed in pro to shadow as mut
     pub fn new() -> Self {
-        Self {
+        let engine = Self {
             policies: HashMap::new(),
             roles: HashMap::new(),
             regex_cache: HashMap::new(),
-        }
+        };
+        engine
     }
 
     pub fn add_policy(&mut self, policy: Policy) {
@@ -55,6 +64,49 @@ impl Engine {
             }
         }
         self.policies.insert(policy.id.clone(), policy);
+    }
+
+    fn check_policy_set<'a>(
+        policies: impl Iterator<Item = &'a Policy>,
+        regex_cache: &HashMap<String, Regex>,
+        content: &str,
+        context: PolicyContext,
+        source: PolicySource,
+    ) -> Option<Decision> {
+        let mut flagged: Option<Decision> = None;
+        for policy in policies {
+            let should_check = match context {
+                PolicyContext::All => true,
+                _ => policy.context == PolicyContext::All || policy.context == context,
+            };
+            if !should_check {
+                continue;
+            }
+            if policy.matches(content, regex_cache) {
+                match policy.action {
+                    Action::Block => {
+                        return Some(Decision {
+                            policy_id: policy.id.clone(),
+                            action: Action::Block,
+                            kill: policy.kill,
+                            source,
+                        });
+                    }
+                    Action::Flag => {
+                        if flagged.is_none() {
+                            flagged = Some(Decision {
+                                policy_id: policy.id.clone(),
+                                action: Action::Flag,
+                                kill: policy.kill,
+                                source: source.clone(),
+                            });
+                        }
+                    }
+                    Action::Allow => {}
+                }
+            }
+        }
+        flagged
     }
 
     pub fn add_role(&mut self, role: Role) {
@@ -140,44 +192,15 @@ impl Engine {
     }
 
     pub fn check(&self, content: &str, context: PolicyContext) -> Option<Decision> {
-        let mut flagged: Option<Decision> = None;
+        // Built-in policies always run first and cannot be overridden (pro only).
 
-        for policy in self.policies.values() {
-            let should_check = match context {
-                PolicyContext::All => true,
-                _ => policy.context == PolicyContext::All || policy.context == context,
-            };
-
-            if !should_check {
-                continue;
-            }
-
-            let matched = policy.matches(content, &self.regex_cache);
-
-            if matched {
-                match policy.action {
-                    Action::Block => {
-                        return Some(Decision {
-                            policy_id: policy.id.clone(),
-                            action: Action::Block,
-                            kill: policy.kill,
-                        });
-                    }
-                    Action::Flag => {
-                        if flagged.is_none() {
-                            flagged = Some(Decision {
-                                policy_id: policy.id.clone(),
-                                action: Action::Flag,
-                                kill: policy.kill,
-                            });
-                        }
-                    }
-                    Action::Allow => {}
-                }
-            }
-        }
-
-        flagged
+        Self::check_policy_set(
+            self.policies.values(),
+            &self.regex_cache,
+            content,
+            context,
+            PolicySource::User,
+        )
     }
 
     pub fn check_role(
@@ -186,6 +209,8 @@ impl Engine {
         content: &str,
         context: PolicyContext,
     ) -> Option<Decision> {
+        // Built-in policies always apply regardless of role (pro only).
+
         let role = self.roles.get(role_name)?;
 
         let mut flagged: Option<Decision> = None;
@@ -210,6 +235,7 @@ impl Engine {
                                 policy_id: policy.id.clone(),
                                 action: Action::Block,
                                 kill: policy.kill,
+                                source: PolicySource::User,
                             });
                         }
                         Action::Flag => {
@@ -218,6 +244,7 @@ impl Engine {
                                     policy_id: policy.id.clone(),
                                     action: Action::Flag,
                                     kill: policy.kill,
+                                    source: PolicySource::User,
                                 });
                             }
                         }

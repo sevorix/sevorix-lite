@@ -2,12 +2,12 @@
 // Copyright (C) 2026 Sevorix
 
 use clap::{CommandFactory, Parser};
+use sevorix_watchtower::find_available_port;
 use sevorix_watchtower::prime::print_prime;
 use sevorix_watchtower::{
     handle_config, handle_integrations, handle_validate,
     logging::{init_logging, init_logging_with_session},
     run_server, validate_startup_config, Cli, Commands, DaemonManager, HubCommands,
-    SessionCommands,
 };
 use tracing::info;
 
@@ -21,13 +21,12 @@ fn main() -> anyhow::Result<()> {
             .collect::<Vec<String>>()
     });
 
-    // Initialize daemon manager for start/stop/status
-    let daemon = DaemonManager::new()?;
-
     match cli.command {
         Some(Commands::Start {
             watchtower_only,
             ebpf_only,
+            name,
+            port,
         }) => {
             // Handle mutually exclusive flags
             if watchtower_only && ebpf_only {
@@ -40,7 +39,6 @@ fn main() -> anyhow::Result<()> {
             let start_ebpf = !watchtower_only;
 
             // Pre-flight check: fail early if eBPF is requested but not available
-            // This prevents daemonizing and then exiting, which leaves orphan processes
             if start_ebpf {
                 #[cfg(not(feature = "ebpf"))]
                 {
@@ -58,8 +56,29 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
 
+                // Lite: enforce single-session limit
+                {
+                    if let Ok(sessions) = DaemonManager::list_sessions() {
+                        if let Some((info, _)) = sessions.iter().find(|(_, running)| *running) {
+                            eprintln!(
+                                "A session '{}' is already running on port {}.",
+                                info.name, info.port
+                            );
+                            eprintln!("  sevorix stop        # stop the current session");
+                            eprintln!("Upgrade to pro for multiple concurrent sessions.");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
                 let session_id = uuid::Uuid::new_v4();
-                daemon.start(session_id, start_ebpf)?;
+                let session_name = name.unwrap_or_else(|| session_id.to_string());
+                let resolved_port = port.unwrap_or_else(|| find_available_port(3000));
+
+                let start_role: Option<String> = None;
+
+                let daemon = DaemonManager::new(&session_name)?;
+                daemon.start(session_id, resolved_port, start_role.clone(), start_ebpf)?;
                 let _guard = init_logging_with_session(session_id);
                 info!("Watchtower daemon initialized. Session ID: {}", session_id);
 
@@ -68,42 +87,40 @@ fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "ebpf")]
                     {
                         info!("Starting eBPF daemon...");
-                        let ebpf_process = spawn_ebpf_daemon()?;
-                        info!("eBPF daemon started with PID: {}", ebpf_process.id());
+                        if let Some(ebpf_process) = spawn_ebpf_daemon(resolved_port)? {
+                            info!("eBPF daemon started with PID: {}", ebpf_process.id());
+                        }
                     }
                 }
 
-                start_runtime(allowed_roles.clone(), session_id)?;
+                start_runtime(allowed_roles.clone(), session_id, resolved_port, start_role)?;
             } else if start_ebpf {
                 // eBPF-only mode: spawn daemon and wait for it
                 #[cfg(feature = "ebpf")]
                 {
                     info!("Starting eBPF daemon...");
-                    let mut ebpf_process = spawn_ebpf_daemon()?;
-                    info!("eBPF daemon started with PID: {}", ebpf_process.id());
-                    let status = ebpf_process.wait()?;
-                    if let Some(code) = status.code() {
-                        std::process::exit(code);
+                    let ebpf_port = port.unwrap_or_else(|| find_available_port(3000));
+                    if let Some(mut ebpf_process) = spawn_ebpf_daemon(ebpf_port)? {
+                        info!("eBPF daemon started with PID: {}", ebpf_process.id());
+                        let status = ebpf_process.wait()?;
+                        if let Some(code) = status.code() {
+                            std::process::exit(code);
+                        }
                     }
                 }
             }
         }
-        Some(Commands::Stop) => {
-            // Stop both Watchtower and eBPF daemon
-            if let Err(e) = daemon.stop() {
-                eprintln!("Error stopping Watchtower daemon: {}", e);
+        Some(Commands::Stop {}) => {
+            if let Err(e) = DaemonManager::stop_all() {
+                eprintln!("Error stopping sessions: {}", e);
             }
-
-            // Also try to stop eBPF daemon
             #[cfg(feature = "ebpf")]
-            {
-                if let Err(e) = stop_ebpf_daemon() {
-                    eprintln!("Error stopping eBPF daemon: {}", e);
-                }
+            if let Err(e) = stop_ebpf_daemon() {
+                eprintln!("Error stopping eBPF daemon: {}", e);
             }
         }
         Some(Commands::Restart) => {
-            let _ = daemon.stop();
+            DaemonManager::stop_all()?;
             #[cfg(feature = "ebpf")]
             {
                 let _ = stop_ebpf_daemon();
@@ -115,23 +132,23 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             let session_id = uuid::Uuid::new_v4();
-            daemon.start(session_id, true)?;
+            let session_name = session_id.to_string();
+            let resolved_port = find_available_port(3000);
+            let daemon = DaemonManager::new(&session_name)?;
+            daemon.start(session_id, resolved_port, None, true)?;
             let _guard = init_logging_with_session(session_id);
             info!("Daemon restarted. Session ID: {}", session_id);
             #[cfg(feature = "ebpf")]
             {
                 info!("Starting eBPF daemon...");
-                let ebpf_process = spawn_ebpf_daemon()?;
-                info!("eBPF daemon started with PID: {}", ebpf_process.id());
+                if let Some(ebpf_process) = spawn_ebpf_daemon(resolved_port)? {
+                    info!("eBPF daemon started with PID: {}", ebpf_process.id());
+                }
             }
-            start_runtime(allowed_roles.clone(), session_id)?;
+            start_runtime(allowed_roles.clone(), session_id, resolved_port, None)?;
         }
-        Some(Commands::Status) => {
-            daemon.status();
-            #[cfg(feature = "ebpf")]
-            {
-                print_ebpf_daemon_status();
-            }
+        Some(Commands::Status {}) => {
+            print_all_sessions_status();
         }
         Some(Commands::Config { subcmd }) => handle_config(subcmd),
         Some(Commands::Hub { subcmd }) => handle_hub(subcmd),
@@ -142,12 +159,11 @@ fn main() -> anyhow::Result<()> {
             context,
         }) => handle_validate(command, role, context),
         Some(Commands::Prime { agent_type }) => print_prime(&agent_type),
-        Some(Commands::Session { subcmd }) => handle_session(subcmd),
         Some(Commands::Run) => {
             // Explicit foreground run
             let (_guard, session_id) = init_logging();
             info!("Running in foreground. Session ID: {}", session_id);
-            start_runtime(allowed_roles, session_id)?;
+            start_runtime(allowed_roles, session_id, find_available_port(3000), None)?;
         }
         None => {
             Cli::command().print_help()?;
@@ -157,22 +173,40 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn start_runtime(allowed_roles: Option<Vec<String>>, session_id: uuid::Uuid) -> anyhow::Result<()> {
+fn start_runtime(
+    allowed_roles: Option<Vec<String>>,
+    session_id: uuid::Uuid,
+    port: u16,
+    initial_role: Option<String>,
+) -> anyhow::Result<()> {
     // Initialize the Tokio runtime here, after potential daemonization
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_server(allowed_roles, session_id))
+        .block_on(run_server(allowed_roles, session_id, port, initial_role))
 }
 
 /// Spawn the eBPF daemon via `sudo -n` and write its PID to the state directory.
 /// eBPF tracepoints need root-level access to tracefs regardless of file capabilities.
+///
+/// Returns `Ok(None)` if the eBPF daemon is already running — the new session will
+/// self-register via the Unix socket cgroup notification, so no second daemon is needed.
 #[cfg(feature = "ebpf")]
-fn spawn_ebpf_daemon() -> anyhow::Result<std::process::Child> {
+fn spawn_ebpf_daemon(port: u16) -> anyhow::Result<Option<std::process::Child>> {
+    if sevorix_watchtower::daemon::is_ebpf_daemon_running() {
+        tracing::info!(
+            "eBPF daemon already running; session on port {} will register via Unix socket",
+            port
+        );
+        return Ok(None);
+    }
+
     let ebpf_binary = get_ebpf_daemon_path()?;
     let child = std::process::Command::new("sudo")
         .arg("-n")
         .arg(&ebpf_binary)
+        .arg("--port")
+        .arg(port.to_string())
         .spawn()
         .map_err(|e| {
             anyhow::anyhow!(
@@ -193,7 +227,7 @@ fn spawn_ebpf_daemon() -> anyhow::Result<std::process::Child> {
         let _ = std::fs::write(&pid_path, child.id().to_string());
     }
 
-    Ok(child)
+    Ok(Some(child))
 }
 
 /// Get the path to the eBPF daemon binary.
@@ -293,35 +327,39 @@ fn handle_hub(cmd: HubCommands) {
     }
 }
 
-fn handle_session(cmd: SessionCommands) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create Tokio runtime");
-
-    rt.block_on(async move {
-        match cmd {
-            SessionCommands::SetRole { role } => {
-                let client = reqwest::Client::new();
-                match client
-                    .post("http://localhost:3000/api/session/set-role")
-                    .json(&serde_json::json!({"role": &role}))
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => println!("Session role set to '{}'", role),
-                    Ok(r) => {
-                        eprintln!("Error: server returned {}", r.status());
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("Error: could not reach Watchtower: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
+fn print_all_sessions_status() {
+    let sessions = DaemonManager::list_sessions().unwrap_or_default();
+    if sessions.is_empty() {
+        println!("No running Watchtower sessions.");
+    } else {
+        println!(
+            "{:<20} {:<38} {:<6} {:<12} STATUS",
+            "NAME", "SESSION_ID", "PORT", "ROLE"
+        );
+        println!("{}", "-".repeat(90));
+        for (info, running) in &sessions {
+            let port_str = if info.port == 0 {
+                "(unknown)".to_string()
+            } else {
+                info.port.to_string()
+            };
+            let id_str = if info.session_id.is_empty() {
+                "(legacy)".to_string()
+            } else {
+                info.session_id.clone()
+            };
+            println!(
+                "{:<20} {:<38} {:<10} {:<12} {}",
+                info.name,
+                id_str,
+                port_str,
+                info.role.as_deref().unwrap_or("(none)"),
+                if *running { "running" } else { "stopped" }
+            );
         }
-    });
+    }
+    #[cfg(feature = "ebpf")]
+    print_ebpf_daemon_status();
 }
 
 #[cfg(test)]
@@ -344,6 +382,7 @@ mod tests {
         if let Some(Commands::Start {
             watchtower_only,
             ebpf_only,
+            ..
         }) = cli.unwrap().command
         {
             assert!(!watchtower_only);
@@ -360,6 +399,7 @@ mod tests {
         if let Some(Commands::Start {
             watchtower_only,
             ebpf_only,
+            ..
         }) = cli.unwrap().command
         {
             assert!(watchtower_only);
@@ -376,6 +416,7 @@ mod tests {
         if let Some(Commands::Start {
             watchtower_only,
             ebpf_only,
+            ..
         }) = cli.unwrap().command
         {
             assert!(!watchtower_only);
@@ -389,7 +430,7 @@ mod tests {
     fn test_cli_stop_command() {
         let cli = Cli::try_parse_from(["sevorix", "stop"]);
         assert!(cli.is_ok());
-        assert!(matches!(cli.unwrap().command, Some(Commands::Stop)));
+        assert!(matches!(cli.unwrap().command, Some(Commands::Stop { .. })));
     }
 
     #[test]
@@ -403,7 +444,10 @@ mod tests {
     fn test_cli_status_command() {
         let cli = Cli::try_parse_from(["sevorix", "status"]);
         assert!(cli.is_ok());
-        assert!(matches!(cli.unwrap().command, Some(Commands::Status)));
+        assert!(matches!(
+            cli.unwrap().command,
+            Some(Commands::Status { .. })
+        ));
     }
 
     #[test]

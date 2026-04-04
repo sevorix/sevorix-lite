@@ -36,8 +36,11 @@ pub struct SyscallEvent {
     pub timestamp: u64,
     /// First 6 arguments of the syscall.
     pub args: [u64; 6],
+    /// cgroup v2 ID (inode of the cgroup directory) of the process at syscall time.
+    /// Set by bpf_get_current_cgroup_id(); used for session routing without procfs.
+    pub cgroup_id: u64,
     /// Reserved for future use.
-    pub _reserved: [u64; 2],
+    pub _reserved: u64,
 }
 
 /// Network connection event data sent from eBPF to userspace.
@@ -69,8 +72,11 @@ pub struct NetworkEvent {
     pub src_port: u16,
     /// Address family (AF_INET=2, AF_INET6=10).
     pub family: u16,
+    /// cgroup v2 ID (inode of the cgroup directory) of the process at event time.
+    /// Set by bpf_get_current_cgroup_id(); used for session routing without procfs.
+    pub cgroup_id: u64,
     /// Reserved for future use.
-    pub _reserved: [u64; 2],
+    pub _reserved: u64,
 }
 
 /// Policy decision from userspace to eBPF.
@@ -180,7 +186,8 @@ mod tests {
             syscall_nr: 59, // execve
             timestamp: 1_000_000_000,
             args: [0u64; 6],
-            _reserved: [0u64; 2],
+            cgroup_id: 0,
+            _reserved: 0,
         };
 
         assert_eq!(event.event_type, 1);
@@ -200,7 +207,8 @@ mod tests {
             syscall_nr: 0,
             timestamp: 999,
             args: [1u64, 2, 3, 4, 5, 6],
-            _reserved: [0u64; 2],
+            cgroup_id: 0,
+            _reserved: 0,
         };
         let cloned = event;
         assert_eq!(cloned.pid, event.pid);
@@ -217,7 +225,8 @@ mod tests {
             syscall_nr: 2,
             timestamp: 0,
             args: [10, 20, 30, 40, 50, 60],
-            _reserved: [0u64; 2],
+            cgroup_id: 0,
+            _reserved: 0,
         };
         assert_eq!(event.args[0], 10);
         assert_eq!(event.args[5], 60);
@@ -253,7 +262,8 @@ mod tests {
             src_ip: 0x7f000001u32.to_be(), // 127.0.0.1
             src_port: 54321u16.to_be(),
             family: 2, // AF_INET
-            _reserved: [0u64; 2],
+            cgroup_id: 0,
+            _reserved: 0,
         };
 
         assert_eq!(event.event_type, 2);
@@ -277,7 +287,8 @@ mod tests {
             src_ip: 0,
             src_port: 12345,
             family: 2,
-            _reserved: [0u64; 2],
+            cgroup_id: 0,
+            _reserved: 0,
         };
         let cloned = event;
         assert_eq!(cloned.pid, event.pid);

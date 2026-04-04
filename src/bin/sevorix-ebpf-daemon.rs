@@ -41,8 +41,9 @@ fn main() {
 
 #[cfg(feature = "ebpf")]
 mod ebpf_impl {
+    use std::collections::HashMap;
     use std::net::IpAddr;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, OnceLock, RwLock};
     use std::time::Duration;
 
     use anyhow::{Context, Result};
@@ -50,7 +51,6 @@ mod ebpf_impl {
     use aya::programs::lsm::LsmLink;
     use aya::programs::{CgroupAttachMode, Lsm, SockOps, TracePoint};
     use aya::{Btf, Ebpf};
-    use directories::ProjectDirs;
     use sevorix_core::{detect_enforcement_tier, EnforcementTier};
     use sevorix_ebpf_common::{NetworkEvent, NetworkKey, PolicyKey, SyscallEvent};
     use tokio::sync::{broadcast, Mutex};
@@ -157,6 +157,34 @@ mod ebpf_impl {
                 s
             }
         })
+    }
+
+    /// Per-session routing table: cgroup inode (u64) → watchtower URL.
+    ///
+    /// Keyed by the cgroup v2 inode as returned by bpf_get_current_cgroup_id() in the
+    /// kernel program and embedded directly in each SyscallEvent/NetworkEvent. This
+    /// removes the need to read /proc/<pid>/cgroup at event-processing time — which
+    /// races with fast commands (e.g. `ls`) that exit before the 10ms ring buffer poll.
+    type RoutingTable = Arc<RwLock<HashMap<u64, String>>>;
+
+    /// Look up the watchtower URL for a given cgroup ID.
+    ///
+    /// The cgroup_id comes directly from the eBPF event (set by bpf_get_current_cgroup_id
+    /// in the kernel program at tracepoint time), so it is always available even after
+    /// the process has exited. Falls back to `default_url` if no matching session is found.
+    fn lookup_url_for_cgroup(
+        cgroup_id: u64,
+        routing_table: &RwLock<HashMap<u64, String>>,
+        default_url: &str,
+    ) -> String {
+        if cgroup_id != 0 {
+            if let Ok(table) = routing_table.read() {
+                if let Some(url) = table.get(&cgroup_id) {
+                    return url.clone();
+                }
+            }
+        }
+        default_url.to_string()
     }
 
     /// Shared HTTP client — created once, reused for all policy query calls.
@@ -434,10 +462,10 @@ mod ebpf_impl {
         stream: tokio::net::UnixStream,
         map: Arc<tokio::sync::Mutex<aya::maps::Map>>,
         pmaps: PolicyMaps,
-        wt_url: String,
+        default_url: String,
+        routing_table: RoutingTable,
     ) {
         use aya::maps::HashMap;
-        use std::os::unix::fs::MetadataExt;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let (reader, mut writer) = stream.into_split();
@@ -453,6 +481,15 @@ mod ebpf_impl {
             Some(p) => p,
             None => return,
         };
+        // The registering session passes its own watchtower URL so the eBPF daemon
+        // can route events for this cgroup to the correct port.
+        let session_url = v["watchtower_url"]
+            .as_str()
+            .unwrap_or(&default_url)
+            .to_string();
+        // Stat for inode: needed for SEVORIX_CGROUP_IDS BPF map AND for the routing table.
+        // The inode matches bpf_get_current_cgroup_id() returned in each event.
+        use std::os::unix::fs::MetadataExt;
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
@@ -466,9 +503,17 @@ mod ebpf_impl {
         match HashMap::<_, u64, u8>::try_from(&mut *guard) {
             Ok(mut ids_map) => match ids_map.insert(ino, 1u8, 0) {
                 Ok(_) => {
-                    info!("eBPF socket: registered cgroup path={} ino={}", path, ino);
+                    info!(
+                        "eBPF socket: registered cgroup path={} ino={} url={}",
+                        path, ino, session_url
+                    );
                     drop(guard);
-                    prefill_policy_maps(&wt_url, &pmaps).await;
+                    // Store cgroup inode → URL so lookup_url_for_cgroup can route events
+                    // directly from the cgroup_id embedded in each eBPF event.
+                    if let Ok(mut table) = routing_table.write() {
+                        table.insert(ino, session_url.clone());
+                    }
+                    prefill_policy_maps(&session_url, &pmaps).await;
                     let _ = writer.write_all(b"{\"ok\":true}\n").await;
                 }
                 Err(e) => {
@@ -540,18 +585,6 @@ mod ebpf_impl {
         }
     }
 
-    fn write_pid_file() -> Result<()> {
-        let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
-            .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
-        let state_dir = proj_dirs
-            .state_dir()
-            .unwrap_or_else(|| proj_dirs.cache_dir());
-        std::fs::create_dir_all(state_dir)?;
-        let pid_path = state_dir.join("sevorix-ebpf.pid");
-        std::fs::write(&pid_path, std::process::id().to_string())?;
-        Ok(())
-    }
-
     /// Event received from eBPF program (used for dashboard broadcast).
     // Fields are written via broadcast::Sender and will be consumed by future dashboard subscribers.
     #[allow(dead_code)]
@@ -580,8 +613,12 @@ mod ebpf_impl {
 
     impl Default for DaemonConfig {
         fn default() -> Self {
+            let port = std::env::var("SEVORIX_WATCHTOWER_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(3000);
             Self {
-                watchtower_url: "http://localhost:3000".to_string(),
+                watchtower_url: format!("http://localhost:{}", port),
                 cgroup_path: "/sys/fs/cgroup".to_string(),
             }
         }
@@ -693,7 +730,8 @@ mod ebpf_impl {
     fn process_event(
         data: &[u8],
         event_tx: &broadcast::Sender<EbpfEvent>,
-        watchtower_url: &str,
+        routing_table: &RwLock<HashMap<u64, String>>,
+        default_url: &str,
         maps: &PolicyMaps,
     ) -> Result<()> {
         if data.len() < 4 {
@@ -714,7 +752,8 @@ mod ebpf_impl {
                     event,
                     event_tx,
                     EventType::SyscallEntry,
-                    watchtower_url,
+                    routing_table,
+                    default_url,
                     maps,
                 )?;
             }
@@ -728,7 +767,8 @@ mod ebpf_impl {
                     event,
                     event_tx,
                     EventType::SyscallExit,
-                    watchtower_url,
+                    routing_table,
+                    default_url,
                     maps,
                 )?;
             }
@@ -738,7 +778,7 @@ mod ebpf_impl {
                     return Ok(());
                 }
                 let event = parse_network_event(data)?;
-                handle_network_event(event, event_tx, watchtower_url, maps)?;
+                handle_network_event(event, event_tx, routing_table, default_url, maps)?;
             }
             _ => {
                 warn!("Unknown event type: {}", event_type);
@@ -767,7 +807,8 @@ mod ebpf_impl {
         event: SyscallEvent,
         event_tx: &broadcast::Sender<EbpfEvent>,
         event_type: EventType,
-        watchtower_url: &str,
+        routing_table: &RwLock<HashMap<u64, String>>,
+        default_url: &str,
         maps: &PolicyMaps,
     ) -> Result<()> {
         let ebpf_event = EbpfEvent {
@@ -789,7 +830,7 @@ mod ebpf_impl {
                 syscall_name(event.syscall_nr)
             );
             if let Ok(permit) = eval_sem().clone().try_acquire_owned() {
-                let url = watchtower_url.to_string();
+                let url = lookup_url_for_cgroup(event.cgroup_id, routing_table, default_url);
                 let maps = maps.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -819,7 +860,8 @@ mod ebpf_impl {
     fn handle_network_event(
         event: NetworkEvent,
         event_tx: &broadcast::Sender<EbpfEvent>,
-        watchtower_url: &str,
+        routing_table: &RwLock<HashMap<u64, String>>,
+        default_url: &str,
         maps: &PolicyMaps,
     ) -> Result<()> {
         let dst_ip = u32::from_be(event.dst_ip);
@@ -829,16 +871,14 @@ mod ebpf_impl {
         let dst_port = u16::from_be(event.dst_port);
         let src_port = u16::from_be(event.src_port);
 
-        // Fix 1: Drop LSM pre-bind events. When src_port=0 the socket hasn't been
-        // bound yet — a duplicate sock_ops event with full port info always follows.
-        if src_port == 0 {
-            return Ok(());
-        }
+        // Resolve the session URL via cgroup_id embedded in the event (set by kernel at
+        // tracepoint time, so it's valid even after the process exits).
+        let session_url = lookup_url_for_cgroup(event.cgroup_id, routing_table, default_url);
 
-        // Fix 2: Skip internal control-plane traffic destined for Watchtower itself.
+        // Fix 2: Skip internal control-plane traffic destined for this session's Watchtower.
         // These are loopback connections from sevsh (health checks, session mgmt) and
         // from this daemon (event logging), and would otherwise create a feedback loop.
-        let watchtower_port = watchtower_url
+        let watchtower_port = session_url
             .rsplit(':')
             .next()
             .and_then(|p| p.parse::<u16>().ok())
@@ -847,9 +887,14 @@ mod ebpf_impl {
             return Ok(());
         }
 
-        info!(
-            "Network event: pid={}, dst={}:{} (protocol={})",
-            event.pid, dst_ip_addr, dst_port, event.protocol
+        tracing::debug!(
+            "Network event: pid={}, cgroup_id={}, dst={}:{} (protocol={}) -> {}",
+            event.pid,
+            event.cgroup_id,
+            dst_ip_addr,
+            dst_port,
+            event.protocol,
+            session_url
         );
 
         let ebpf_event = EbpfEvent {
@@ -868,7 +913,7 @@ mod ebpf_impl {
         };
 
         // Log network event to Watchtower for audit trail (async, non-blocking)
-        let log_url = watchtower_url.to_string();
+        let log_url = session_url.clone();
         let log_dst_ip = dst_ip_addr.to_string();
         let log_pid = event.pid;
         tokio::spawn(async move {
@@ -902,7 +947,7 @@ mod ebpf_impl {
         // passes through; on BLOCK, the destination is added to NET_DENYLIST so
         // future connections are rejected by sock_ops in-kernel.
         if let Ok(permit) = eval_sem().clone().try_acquire_owned() {
-            let url = watchtower_url.to_string();
+            let url = session_url;
             let maps = maps.clone();
             let dst_ip_str = dst_ip_addr.to_string();
             tokio::spawn(async move {
@@ -946,8 +991,14 @@ mod ebpf_impl {
     pub fn run() -> Result<()> {
         diag("run() entered");
 
-        write_pid_file().context("Failed to write eBPF daemon PID file")?;
-        diag("PID file written");
+        // Die when our parent (the sudo wrapper) is killed.
+        // This ensures `sevorix stop` killing the user-owned sudo process also
+        // terminates this root daemon, without needing a separate `sudo kill`.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+        }
+        diag("pdeathsig set");
 
         let log_path = std::env::var("SEVORIX_EBPF_LOG")
             .unwrap_or_else(|_| "/tmp/sevorix-ebpf-daemon.log".to_string());
@@ -1044,17 +1095,22 @@ mod ebpf_impl {
                 let mut ring_buf = RingBuf::try_from(events_map)
                     .context("Failed to create RingBuf from EVENTS map")?;
 
+                // Per-session routing table: cgroup inode → watchtower URL.
+                // Populated at runtime as sessions register their cgroups via the Unix socket.
+                let routing_table: RoutingTable = Arc::new(RwLock::new(HashMap::new()));
+
                 // Background task: sync active sevorix session cgroup IDs into the BPF map.
                 if let Some(cgroup_map_raw) = cgroup_ids_map {
-                    // Wrap in Arc<Mutex> so both the inotify task and the fast-poll task can share it.
+                    // Wrap in Arc<Mutex> so the inotify task can share it.
                     let shared_cgroup_map = Arc::new(Mutex::new(cgroup_map_raw));
                     let cgroup_maps = policy_maps.clone();
                     let cgroup_watchtower_url = config.watchtower_url.clone();
 
                     // Unix socket listener: synchronous cgroup registration.
                     // Watchtower's session_register handler connects here immediately after
-                    // creating the cgroup, sends {"cgroup_path":"..."}, and waits for ACK.
-                    // This ensures SEVORIX_CGROUP_IDS is updated before sevsh runs the child.
+                    // creating the cgroup, sends {"cgroup_path":"...","watchtower_url":"..."},
+                    // and waits for ACK. This ensures SEVORIX_CGROUP_IDS and the routing
+                    // table are both updated before sevsh runs the child process.
                     {
                         use tokio::net::UnixListener;
                         use sevorix_watchtower::EBPF_SOCK_PATH;
@@ -1062,7 +1118,8 @@ mod ebpf_impl {
                         let _ = std::fs::remove_file(EBPF_SOCK_PATH);
                         let socket_cgroup_map = shared_cgroup_map.clone();
                         let socket_policy_maps = policy_maps.clone();
-                        let socket_watchtower_url = config.watchtower_url.clone();
+                        let socket_default_url = config.watchtower_url.clone();
+                        let socket_routing_table = routing_table.clone();
 
                         match UnixListener::bind(EBPF_SOCK_PATH) {
                             Ok(listener) => {
@@ -1078,8 +1135,9 @@ mod ebpf_impl {
                                             Ok((stream, _)) => {
                                                 let map = socket_cgroup_map.clone();
                                                 let pmaps = socket_policy_maps.clone();
-                                                let wt_url = socket_watchtower_url.clone();
-                                                tokio::spawn(handle_cgroup_registration(stream, map, pmaps, wt_url));
+                                                let default_url = socket_default_url.clone();
+                                                let rt = socket_routing_table.clone();
+                                                tokio::spawn(handle_cgroup_registration(stream, map, pmaps, default_url, rt));
                                             }
                                             Err(e) => {
                                                 warn!("eBPF socket: accept error: {}", e);
@@ -1093,73 +1151,6 @@ mod ebpf_impl {
                         }
                     }
 
-                    // Fast-poll task: polls /api/active-sessions every 200ms and syncs
-                    // SEVORIX_CGROUP_IDS from the returned paths. This closes the race
-                    // condition where fast commands complete before the inotify watcher
-                    // detects the new cgroup.
-                    let fast_poll_map = shared_cgroup_map.clone();
-                    let fast_poll_url = config.watchtower_url.clone();
-                    let fast_poll_maps = policy_maps.clone();
-                    tokio::spawn(async move {
-                        use aya::maps::HashMap;
-                        use std::collections::HashSet;
-                        use std::os::unix::fs::MetadataExt;
-
-                        let mut known: HashSet<u64> = HashSet::new();
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            // Fetch active sessions from Watchtower
-                            let sessions: Vec<String> = match http_client()
-                                .get(format!("{}/api/active-sessions", fast_poll_url))
-                                .send()
-                                .await
-                            {
-                                Ok(resp) => resp
-                                    .json::<serde_json::Value>()
-                                    .await
-                                    .ok()
-                                    .and_then(|v| v["sessions"].as_array().cloned())
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .filter_map(|s| s.as_str().map(str::to_string))
-                                    .collect(),
-                                Err(_) => continue,
-                            };
-
-                            // Stat each path to get its inode (cgroup ID)
-                            let active: HashSet<u64> = sessions
-                                .iter()
-                                .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.ino()))
-                                .collect();
-
-                            // Sync map
-                            let mut any_new = false;
-                            let mut guard = fast_poll_map.lock().await;
-                            if let Ok(mut ids_map) = HashMap::<_, u64, u8>::try_from(&mut *guard) {
-                                for &id in active.difference(&known) {
-                                    if ids_map.insert(id, 1u8, 0).is_ok() {
-                                        tracing::info!(
-                                            "eBPF fast-poll: added session cgroup id={}",
-                                            id
-                                        );
-                                        any_new = true;
-                                    }
-                                }
-                                for &id in known.difference(&active) {
-                                    let _ = ids_map.remove(&id);
-                                    tracing::info!(
-                                        "eBPF fast-poll: removed session cgroup id={}",
-                                        id
-                                    );
-                                }
-                            }
-                            drop(guard);
-                            known = active;
-                            if any_new {
-                                prefill_policy_maps(&fast_poll_url, &fast_poll_maps).await;
-                            }
-                        }
-                    });
 
                     let cgroup_map_arc = shared_cgroup_map;
                     let cgroup_maps = cgroup_maps;
@@ -1337,13 +1328,15 @@ mod ebpf_impl {
 
                 info!("Ring buffer ready, waiting for sevorix session events...");
 
+                let default_url = config.watchtower_url.clone();
                 loop {
                     let mut processed = 0u32;
                     while let Some(event) = ring_buf.next() {
                         if let Err(e) = process_event(
                             &event,
                             &event_tx,
-                            &config.watchtower_url,
+                            &routing_table,
+                            &default_url,
                             &policy_maps,
                         ) {
                             error!("Failed to process event: {}", e);
@@ -1362,6 +1355,17 @@ mod ebpf_impl {
 
 #[cfg(feature = "ebpf")]
 fn main() {
+    // Simple --port <N> argument override for SEVORIX_WATCHTOWER_PORT.
+    // Allows `sudo -n sevorix-ebpf-daemon --port 3001` without needing `env`.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(idx) = args.iter().position(|a| a == "--port") {
+        if let Some(port_str) = args.get(idx + 1) {
+            // SAFETY: setting env var before any threads are spawned.
+            unsafe {
+                std::env::set_var("SEVORIX_WATCHTOWER_PORT", port_str);
+            }
+        }
+    }
     if let Err(e) = ebpf_impl::run() {
         eprintln!("Error: {}", e);
         std::process::exit(1);

@@ -26,13 +26,19 @@ pub enum Commands {
         /// Start only the eBPF daemon (no Watchtower proxy)
         #[arg(long)]
         ebpf_only: bool,
+        /// Session name (default: random UUID)
+        #[arg(long)]
+        name: Option<String>,
+        /// Port to listen on (default: auto-assign starting at 3000)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Stop the daemon(s)
-    Stop,
+    Stop {},
     /// Restart the daemon(s)
     Restart,
     /// Check daemon status
-    Status,
+    Status {},
     /// Run in foreground (default)
     Run,
     /// Configuration commands
@@ -66,19 +72,19 @@ pub enum Commands {
         /// Agent type to prime: policy-manager (pm) or guarded-agent (guard)
         agent_type: String,
     },
-    /// Session management commands
-    Session {
-        #[command(subcommand)]
-        subcmd: SessionCommands,
-    },
 }
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
+    /// List all running sessions
+    List,
     /// Set the active policy role for the current session
     SetRole {
         /// Role name to apply to this session
         role: String,
+        /// Target session by name (required when multiple sessions are running)
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
