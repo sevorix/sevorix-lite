@@ -21,6 +21,7 @@ async fn test_real_connect_handshake() {
         traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
         log_dir: std::path::PathBuf::from("/tmp"),
         session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+        port: 3000,
         enforcement_tier: EnforcementTier::Standard,
         active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::new(),

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "builtin:block-session-env-override",
+    "type": "Regex",
+    "pattern": "(SEVORIX_SESSION|SEVORIX_PORT)\\s*=",
+    "action": "Block",
+    "context": "Shell",
+    "kill": false
+  }
+]

@@ -13,7 +13,110 @@ use std::process::{exit, Command, Stdio};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use uuid::Uuid;
 
-const PROXY_URL: &str = "http://localhost:3000";
+/// Return the Watchtower proxy URL.
+/// Resolved proxy URL, set once at process startup and never changed.
+static RESOLVED_PROXY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn proxy_url() -> &'static str {
+    RESOLVED_PROXY_URL
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("http://localhost:3000")
+}
+
+/// Resolve the Watchtower proxy URL for this sevsh invocation.
+///
+/// Resolution order:
+///   1. `SEVORIX_PORT` env var — use that port directly
+///   2. `SEVORIX_SESSION` env var — look up port from session metadata
+///   3. Auto-detect — if exactly one session is running, use its port
+///   4. Fallback — port 3000
+///
+/// The resolved URL is stored as a plain Rust value and `SEVORIX_SESSION` /
+/// `SEVORIX_PORT` are stripped from the child environment so that nested
+/// sevsh invocations cannot inherit an agent-injected override.
+fn resolve_proxy_url() -> String {
+    // Priority 1: direct port override
+    if let Ok(port_str) = std::env::var("SEVORIX_PORT") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return format!("http://localhost:{}", port);
+        }
+    }
+
+    // Priority 2 & 3: look up session metadata
+    let sessions_dir = directories::ProjectDirs::from("com", "sevorix", "sevorix").map(|d| {
+        d.state_dir()
+            .unwrap_or_else(|| d.cache_dir())
+            .join("sessions")
+    });
+
+    if let Some(sdir) = sessions_dir {
+        let target_name = std::env::var("SEVORIX_SESSION").ok();
+        let mut found_port: Option<u16> = None;
+        let mut running_count: usize = 0;
+
+        if let Ok(entries) = std::fs::read_dir(&sdir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let pid = info["pid"].as_i64().unwrap_or(0) as i32;
+                        let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
+                        if !alive {
+                            continue;
+                        }
+                        let port = info["port"].as_u64().unwrap_or(3000) as u16;
+                        let name = info["name"].as_str().unwrap_or("").to_string();
+                        running_count += 1;
+                        if let Some(ref wanted) = target_name {
+                            if &name == wanted {
+                                found_port = Some(port);
+                                break;
+                            }
+                        } else {
+                            // remember last running port for auto-detect
+                            found_port = Some(port);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ref wanted) = target_name {
+            if let Some(p) = found_port {
+                return format!("http://localhost:{}", p);
+            }
+            // Named session requested but not found — warn loudly so the user
+            // can see why traffic is being dropped instead of silently routing
+            // to the wrong session.
+            eprintln!(
+                "[SEVSH] WARNING: session '{}' not found in running sessions. \
+                 Is the session started? Falling back to http://localhost:3000 \
+                 — traffic may go to the wrong session.",
+                wanted
+            );
+        } else if running_count == 1 {
+            if let Some(p) = found_port {
+                return format!("http://localhost:{}", p);
+            }
+        } else if running_count > 1 {
+            // Multiple sessions running with no SEVORIX_SESSION specified.
+            // Refuse the ambiguous fallback — require an explicit session name.
+            eprintln!(
+                "[SEVSH] ERROR: {} sessions are running but SEVORIX_SESSION is not set. \
+                 Set SEVORIX_SESSION=<name> or SEVORIX_PORT=<port> to target a specific session.",
+                running_count
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Fallback: no sessions running (or session dir unreadable). Use default port.
+    "http://localhost:3000".to_string()
+}
 
 // -----------------------------------------------------------------------------
 // Bash-compatible argument parsing
@@ -224,6 +327,12 @@ struct SevshArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve the proxy URL once from env/session metadata, then strip the
+    // session env vars so nested sevsh invocations cannot inherit an agent-injected override.
+    RESOLVED_PROXY_URL.get_or_init(resolve_proxy_url);
+    env::remove_var("SEVORIX_SESSION");
+    env::remove_var("SEVORIX_PORT");
+
     let raw_args: Vec<String> = env::args().collect();
 
     // Internal Sandbox entry point (Child mode)
@@ -241,23 +350,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let session_id = format!("sevsh-{}", Uuid::new_v4());
         env::set_var("SEVORIX_SESSION_ID", &session_id);
 
+        // Set up cgroup for eBPF syscall tracking. Best-effort: if cgroup
+        // creation fails (e.g. helper not installed), proceed without isolation.
+        let cgroup_created = create_session_cgroup(&session_id).unwrap_or_default();
+        if cgroup_created {
+            let path = format!("/sys/fs/cgroup/sevorix/{}", session_id);
+            let url = proxy_url().to_string();
+            let _ = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_default()
+                .post(format!("{}/api/session/register", url))
+                .header("X-Sevorix-Internal", "true")
+                .json(&serde_json::json!({"cgroup_path": path}))
+                .send()
+                .await;
+        }
+
         if inv.command.is_none() && inv.script_file.is_none() {
             let stdin_is_tty = unsafe { libc::isatty(0) != 0 };
             if stdin_is_tty || inv.interactive {
                 // Real interactive session: intercept typed commands via PTY.
                 let exit_code = run_pty_interactive_shell_code(true, &session_id)?;
+                if cgroup_created {
+                    cleanup_session_cgroup(&session_id);
+                }
                 exit(exit_code);
             } else {
                 // Non-interactive with no command (e.g. `bash -l` for profile
                 // sourcing): nothing to intercept, pass straight through.
                 let shell = real_shell();
                 let status = Command::new(&shell).args(inv.to_bash_args()).status()?;
+                if cgroup_created {
+                    cleanup_session_cgroup(&session_id);
+                }
                 exit(status.code().unwrap_or(1));
             }
         }
 
         // Non-interactive: validate and execute.
         let exit_code = handle_bash_invocation(inv, true, &session_id).await?;
+        if cgroup_created {
+            cleanup_session_cgroup(&session_id);
+        }
         exit(exit_code);
     }
 
@@ -315,7 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register session with Watchtower for synchronous eBPF cgroup ID sync
     if cgroup_created {
         let _ = reqwest::Client::new()
-            .post("http://localhost:3000/api/session/register")
+            .post(format!("{}/api/session/register", proxy_url()))
             .header("X-Sevorix-Internal", "true")
             .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
             .send()
@@ -376,7 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if exit_code >= 0 {
         if cgroup_created {
             let _ = reqwest::Client::new()
-                .post("http://localhost:3000/api/session/unregister")
+                .post(format!("{}/api/session/unregister", proxy_url()))
                 .header("X-Sevorix-Internal", "true")
                 .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
                 .send()
@@ -397,7 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup cgroup on exit
     if cgroup_created {
         let _ = reqwest::Client::new()
-            .post("http://localhost:3000/api/session/unregister")
+            .post(format!("{}/api/session/unregister", proxy_url()))
             .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
             .send()
             .await;
@@ -429,7 +564,7 @@ async fn check_watchtower_reachable() -> Result<(), Box<dyn std::error::Error>> 
         .build()?;
 
     let resp = client
-        .get("http://localhost:3000/health")
+        .get(format!("{}/health", proxy_url()))
         .header("X-Sevorix-Internal", "true")
         .send()
         .await?;
@@ -697,9 +832,20 @@ async fn run_parent_bridge(
     Ok(status.code().unwrap_or(1))
 }
 
+fn resolved_proxy_port() -> u16 {
+    let url = proxy_url();
+    // Parse port from "http://localhost:PORT" or "http://localhost:PORT/..."
+    url.split(':')
+        .nth(2)
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(3000)
+}
+
 async fn proxy_unix_to_tcp(mut unix: UnixStream) -> std::io::Result<()> {
-    // Connect to Host Daemon
-    let mut tcp = TcpStream::connect("127.0.0.1:3000").await?;
+    // Connect to Host Daemon using the resolved proxy port (not hardcoded 3000)
+    let addr = format!("127.0.0.1:{}", resolved_proxy_port());
+    let mut tcp = TcpStream::connect(&addr).await?;
     tokio::io::copy_bidirectional(&mut unix, &mut tcp).await?;
     Ok(())
 }
@@ -864,12 +1010,12 @@ async fn handle_bash_invocation(
         // Build environment variables for proxy if needed
         let mut env_vars: Vec<(String, String)> = if use_proxy {
             vec![
-                ("HTTP_PROXY".to_string(), PROXY_URL.to_string()),
-                ("http_proxy".to_string(), PROXY_URL.to_string()),
-                ("HTTPS_PROXY".to_string(), PROXY_URL.to_string()),
-                ("https_proxy".to_string(), PROXY_URL.to_string()),
-                ("ALL_PROXY".to_string(), PROXY_URL.to_string()),
-                ("all_proxy".to_string(), PROXY_URL.to_string()),
+                ("HTTP_PROXY".to_string(), proxy_url().to_string()),
+                ("http_proxy".to_string(), proxy_url().to_string()),
+                ("HTTPS_PROXY".to_string(), proxy_url().to_string()),
+                ("https_proxy".to_string(), proxy_url().to_string()),
+                ("ALL_PROXY".to_string(), proxy_url().to_string()),
+                ("all_proxy".to_string(), proxy_url().to_string()),
                 (
                     "NO_PROXY".to_string(),
                     "localhost,127.0.0.1,::1".to_string(),
@@ -1007,7 +1153,7 @@ async fn handle_bash_invocation(
                                             .map(|a| format!("0x{:x}", a))
                                             .collect();
                                         let _ = client
-                                            .post(format!("{}/analyze-syscall", PROXY_URL))
+                                            .post(format!("{}/analyze-syscall", proxy_url()))
                                             .json(&serde_json::json!({
                                                 "syscall_name": name,
                                                 "syscall_number": info.syscall_nr,
@@ -1074,7 +1220,7 @@ fn run_pty_interactive_shell_code(
     env::set_var("SEVORIX_SESSION_ID", session_id);
 
     if use_proxy {
-        println!("[SEVSH] Auto-Proxy Enabled: {}", PROXY_URL);
+        println!("[SEVSH] Auto-Proxy Enabled: {}", proxy_url());
     }
     println!("[SEVSH] Session ID: {}", session_id);
     println!("[SEVSH] PTY Multiplexer Mode - Full terminal support");
@@ -1083,12 +1229,12 @@ fn run_pty_interactive_shell_code(
     // Build environment variables for proxy if needed
     let mut env_vars: Vec<(String, String)> = if use_proxy {
         vec![
-            ("HTTP_PROXY".to_string(), PROXY_URL.to_string()),
-            ("http_proxy".to_string(), PROXY_URL.to_string()),
-            ("HTTPS_PROXY".to_string(), PROXY_URL.to_string()),
-            ("https_proxy".to_string(), PROXY_URL.to_string()),
-            ("ALL_PROXY".to_string(), PROXY_URL.to_string()),
-            ("all_proxy".to_string(), PROXY_URL.to_string()),
+            ("HTTP_PROXY".to_string(), proxy_url().to_string()),
+            ("http_proxy".to_string(), proxy_url().to_string()),
+            ("HTTPS_PROXY".to_string(), proxy_url().to_string()),
+            ("https_proxy".to_string(), proxy_url().to_string()),
+            ("ALL_PROXY".to_string(), proxy_url().to_string()),
+            ("all_proxy".to_string(), proxy_url().to_string()),
             (
                 "NO_PROXY".to_string(),
                 "localhost,127.0.0.1,::1".to_string(),
@@ -1109,7 +1255,7 @@ fn run_pty_interactive_shell_code(
         shell,
         env_vars,
         passthrough_commands: PtyMultiplexerConfig::default().passthrough_commands,
-        watchtower_url: PROXY_URL.to_string(),
+        watchtower_url: proxy_url().to_string(),
         validation_timeout_ms: 5000,
     };
 
@@ -1142,7 +1288,7 @@ fn real_shell() -> String {
 /// Returns an empty list on any error (non-fatal: enforcement degrades gracefully).
 async fn fetch_syscall_deny_list() -> Vec<String> {
     let client = reqwest::Client::new();
-    let url = format!("{}/syscall-policy", PROXY_URL);
+    let url = format!("{}/syscall-policy", proxy_url());
     match client.get(&url).send().await {
         Ok(resp) => resp
             .json::<serde_json::Value>()
@@ -1184,7 +1330,7 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?;
-    let url = "http://localhost:3000/analyze";
+    let url = format!("{}/analyze", proxy_url());
 
     // Fail-safe: if we can't connect, we must fail closed (or exit process),
     // but returning error here lets the caller decide.

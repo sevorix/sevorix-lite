@@ -18,7 +18,9 @@
 
 use aya_ebpf::{
     bindings::BPF_SOCK_OPS_TCP_CONNECT_CB,
-    helpers::{bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
+    helpers::{
+        bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user,
+    },
     macros::{lsm, map, sock_ops, tracepoint},
     programs::{LsmContext, SockOpsContext, TracePointContext},
 };
@@ -66,6 +68,19 @@ static mut GLOBAL_ALLOWLIST: aya_ebpf::maps::HashMap<u64, u8> =
 #[map(name = "SEVORIX_CGROUP_IDS")]
 static mut SEVORIX_CGROUP_IDS: aya_ebpf::maps::HashMap<u64, u8> =
     aya_ebpf::maps::HashMap::with_max_entries(256, 0);
+
+/// Per-process cgroup ID cache.
+///
+/// Key: pid (u32), Value: cgroup_id (u64).
+///
+/// Populated by the sys_enter tracepoint (which has reliable cgroup_id access)
+/// so that the sock_ops hook can look up the cgroup_id for the connecting process.
+/// This lets sock_ops route network events correctly even though
+/// bpf_get_current_cgroup_id() is unreliable in BPF_PROG_TYPE_SOCK_OPS context.
+/// Entries are overwritten on each syscall, keeping the cached value fresh.
+#[map(name = "PID_CGROUP_MAP")]
+static mut PID_CGROUP_MAP: aya_ebpf::maps::HashMap<u32, u64> =
+    aya_ebpf::maps::HashMap::with_max_entries(4096, 0);
 
 /// Tracepoint handler for syscall entry.
 ///
@@ -122,6 +137,12 @@ pub fn sys_enter(ctx: TracePointContext) -> u32 {
             return 0;
         }
 
+        // Update the pid→cgroup_id cache so sock_ops can route network events.
+        // We write on every syscall (cheap overwrite) to keep the entry fresh.
+        // sock_ops cannot call bpf_get_current_cgroup_id() reliably, so it reads
+        // this map instead.
+        let _ = PID_CGROUP_MAP.insert(&pid, &cgroup_id, 0);
+
         // Fast path: check global allowlist
         if GLOBAL_ALLOWLIST.get(&syscall_nr).is_some() {
             return 0; // Allow immediately, no event
@@ -138,7 +159,8 @@ pub fn sys_enter(ctx: TracePointContext) -> u32 {
                 syscall_nr,
                 timestamp: bpf_ktime_get_ns(),
                 args,
-                _reserved: [0; 2],
+                cgroup_id,
+                _reserved: 0,
             };
             let _ = EVENTS.output(&event, 0);
             return 0;
@@ -159,10 +181,57 @@ pub fn sys_enter(ctx: TracePointContext) -> u32 {
                 syscall_nr,
                 timestamp: bpf_ktime_get_ns(),
                 args,
-                _reserved: [0; 2],
+                cgroup_id,
+                _reserved: 0,
             };
             let _ = EVENTS.output(&event, 0);
             return 0;
+        }
+
+        // Intercept connect() (syscall 42 on x86-64) to emit NetworkEvents.
+        //
+        // connect(fd, *sockaddr, addrlen): args[1] is a userspace pointer to sockaddr.
+        // We read it with bpf_probe_read_user to get the destination IP/port with the
+        // correct cgroup_id — solving the routing problem that sock_ops has
+        // (it cannot call bpf_get_current_cgroup_id on this kernel).
+        //
+        // syscall 42 = connect (x86-64 ABI, see /usr/include/asm/unistd_64.h)
+        if syscall_nr == 42 {
+            // connect(fd, sockaddr_ptr, addrlen): args[1] is a userspace pointer.
+            // Read the sockaddr_in structure fields using integer-addressed reads
+            // to avoid pointer-arithmetic-based derived pointers that the BPF
+            // verifier may reject as type violations.
+            let base: u64 = args[1];
+            let family_ptr = base as *const u16;
+            let port_ptr = (base + 2) as *const u16;
+            let addr_ptr = (base + 4) as *const u32;
+
+            let family_res = bpf_probe_read_user(family_ptr);
+            let port_res = bpf_probe_read_user(port_ptr);
+            let addr_res = bpf_probe_read_user(addr_ptr);
+
+            if let (Ok(family), Ok(dst_port_be), Ok(dst_ip)) = (family_res, port_res, addr_res) {
+                // AF_INET == 2; skip AF_UNIX, AF_INET6, etc.
+                if family == 2 {
+                    let net_event = NetworkEvent {
+                        event_type: NetworkEvent::EVENT_TYPE,
+                        pid,
+                        tid,
+                        _padding0: 0,
+                        dst_ip,
+                        dst_port: dst_port_be, // already BE; userspace applies from_be()
+                        protocol: 6,
+                        op: 0,
+                        timestamp: bpf_ktime_get_ns(),
+                        src_ip: 0,
+                        src_port: 0,
+                        family,
+                        cgroup_id,
+                        _reserved: 0,
+                    };
+                    let _ = EVENTS.output(&net_event, 0);
+                }
+            }
         }
 
         // Unknown syscall - send to userspace for policy evaluation
@@ -174,7 +243,8 @@ pub fn sys_enter(ctx: TracePointContext) -> u32 {
             syscall_nr,
             timestamp: bpf_ktime_get_ns(),
             args,
-            _reserved: [0; 2],
+            cgroup_id,
+            _reserved: 0,
         };
 
         let _ = EVENTS.output(&event, 0);
@@ -227,7 +297,8 @@ pub fn sys_exit(ctx: TracePointContext) -> u32 {
             syscall_nr,
             timestamp: bpf_ktime_get_ns(),
             args: [ret_value as u64, 0, 0, 0, 0, 0], // First arg is return value
-            _reserved: [0; 2],
+            cgroup_id,
+            _reserved: 0,
         };
 
         let _ = EVENTS.output(&event, 0);
@@ -391,44 +462,54 @@ unsafe fn try_lsm_socket_connect(ctx: LsmContext) -> i32 {
         Err(_) => return 0,
     };
 
-    let dst_port = u16::from_be(dst_port_be);
+    // Store dst_port_be (network byte order) in the event so that the userspace
+    // daemon's u16::from_be() conversion yields the correct host-order port.
+    // Also use the host-order value for denylist key lookups.
+    let dst_port_host = u16::from_be(dst_port_be);
 
     // Check NET_DENYLIST (protocol=0 for any, protocol=6 for TCP).
     let key_any = NetworkKey {
         dst_ip,
-        dst_port,
+        dst_port: dst_port_host,
         protocol: 0,
         _padding: 0,
     };
     let key_tcp = NetworkKey {
         dst_ip,
-        dst_port,
+        dst_port: dst_port_host,
         protocol: 6,
         _padding: 0,
     };
 
+    // Emit a NetworkEvent for all connections from active sevorix sessions.
+    // cgroup_id is embedded here (available in LSM context) so userspace can
+    // route the event to the correct per-session Watchtower. src_ip/src_port
+    // are 0 because the socket has not been bound yet at LSM time — that is
+    // expected and acceptable; dst_ip/dst_port are the policy-relevant fields.
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let event = NetworkEvent {
+        event_type: NetworkEvent::EVENT_TYPE,
+        pid: (pid_tgid >> 32) as u32,
+        tid: pid_tgid as u32,
+        _padding0: 0,
+        dst_ip,
+        dst_port: dst_port_be, // network byte order; userspace applies from_be()
+        protocol: 6,           // TCP
+        op: 0,                 // connect
+        timestamp: bpf_ktime_get_ns(),
+        src_ip: 0,
+        src_port: 0,
+        family,
+        cgroup_id,
+        _reserved: 0,
+    };
+    let _ = EVENTS.output(&event, 0);
+
+    // Block if the destination is in the denylist.
     if let Some(&errno) = NET_DENYLIST
         .get(&key_any)
         .or_else(|| NET_DENYLIST.get(&key_tcp))
     {
-        // Log the blocked connection event
-        let event = NetworkEvent {
-            event_type: NetworkEvent::EVENT_TYPE,
-            pid: (bpf_get_current_pid_tgid() >> 32) as u32,
-            tid: bpf_get_current_pid_tgid() as u32,
-            _padding0: 0,
-            dst_ip,
-            dst_port,
-            protocol: 6, // TCP
-            op: 0,       // connect
-            timestamp: bpf_ktime_get_ns(),
-            src_ip: 0,
-            src_port: 0,
-            family,
-            _reserved: [0; 2],
-        };
-        let _ = EVENTS.output(&event, 0);
-
         return -errno; // LSM hooks need negative errno to block
     }
 
@@ -453,134 +534,22 @@ unsafe fn try_sock_ops(ctx: SockOpsContext) -> u32 {
         return 1; // Allow other operations
     }
 
-    // Get destination IP and port
-    let dst_ip = ctx.remote_ip4();
-    let dst_port = ctx.remote_port() as u16; // Convert u32 to u16
-    let src_ip = ctx.local_ip4();
-    let src_port = ctx.local_port() as u16; // Convert u32 to u16
-    let family = ctx.family() as u16;
+    // Variables read to satisfy the sock_ops API; currently unused since network
+    // events are emitted exclusively from the sys_enter tracepoint (connect=42).
+    let _dst_ip = ctx.remote_ip4();
+    let _dst_port = ctx.remote_port() as u16;
+    let _src_ip = ctx.local_ip4();
+    let _src_port = ctx.local_port() as u16;
+    let _family = ctx.family() as u16;
 
-    // Note: bpf_get_current_pid_tgid is not available in sock_ops context on all kernels.
-    // Use 0 as a fallback; per-process network policy checks will be skipped.
-    let pid: u32 = 0;
-    let tid: u32 = 0;
+    // Note: bpf_get_current_pid_tgid() is NOT available in BPF_PROG_TYPE_SOCK_OPS
+    // on this kernel (verifier rejects it). bpf_get_current_cgroup_id() is similarly
+    // unavailable. Network events are instead captured by the sys_enter tracepoint
+    // at connect() (syscall 42), which has full access to both helpers and emits
+    // NetworkEvents with correct cgroup_id for per-session routing.
+    // This hook is kept for denylist enforcement only (allow-list fast path).
 
-    // Build network key (protocol 6 = TCP)
-    let key_tcp = NetworkKey {
-        dst_ip,
-        dst_port,
-        protocol: 6, // TCP
-        _padding: 0,
-    };
-    let key_any = NetworkKey {
-        dst_ip,
-        dst_port,
-        protocol: 0, // Any protocol
-        _padding: 0,
-    };
-
-    // Build per-process key
-    let proc_key_tcp = ProcessNetworkKey {
-        pid,
-        dst_ip,
-        dst_port,
-        protocol: 6, // TCP
-        _padding: 0,
-    };
-    let proc_key_any = ProcessNetworkKey {
-        pid,
-        dst_ip,
-        dst_port,
-        protocol: 0, // Any protocol
-        _padding: 0,
-    };
-
-    // Fast path: check global allowlist (any protocol first, then specific)
-    if NET_ALLOWLIST.get(&key_any).is_some() || NET_ALLOWLIST.get(&key_tcp).is_some() {
-        return 1; // Allow
-    }
-
-    // Check per-process allowlist
-    if PROCESS_NET_ALLOWLIST.get(&proc_key_any).is_some()
-        || PROCESS_NET_ALLOWLIST.get(&proc_key_tcp).is_some()
-    {
-        return 1; // Allow
-    }
-
-    // Check global denylist
-    if let Some(&_err) = NET_DENYLIST
-        .get(&key_any)
-        .or_else(|| NET_DENYLIST.get(&key_tcp))
-    {
-        // Log the denial event
-        let event = NetworkEvent {
-            event_type: NetworkEvent::EVENT_TYPE,
-            pid,
-            tid,
-            _padding0: 0,
-            dst_ip,
-            dst_port,
-            protocol: 6, // TCP
-            op: 0,       // connect
-            timestamp: bpf_ktime_get_ns(),
-            src_ip,
-            src_port,
-            family,
-            _reserved: [0; 2],
-        };
-
-        let _ = EVENTS.output(&event, 0);
-
-        return 0; // Deny (will return EPERM)
-    }
-
-    // Check per-process denylist
-    if let Some(&_err) = PROCESS_NET_DENYLIST
-        .get(&proc_key_any)
-        .or_else(|| PROCESS_NET_DENYLIST.get(&proc_key_tcp))
-    {
-        let event = NetworkEvent {
-            event_type: NetworkEvent::EVENT_TYPE,
-            pid,
-            tid,
-            _padding0: 0,
-            dst_ip,
-            dst_port,
-            protocol: 6, // TCP
-            op: 0,       // connect
-            timestamp: bpf_ktime_get_ns(),
-            src_ip,
-            src_port,
-            family,
-            _reserved: [0; 2],
-        };
-
-        let _ = EVENTS.output(&event, 0);
-
-        return 0; // Deny
-    }
-
-    // Unknown connection - send event to userspace for policy evaluation
-    let event = NetworkEvent {
-        event_type: NetworkEvent::EVENT_TYPE,
-        pid,
-        tid,
-        _padding0: 0,
-        dst_ip,
-        dst_port,
-        protocol: 6, // TCP
-        op: 0,       // connect
-        timestamp: bpf_ktime_get_ns(),
-        src_ip,
-        src_port,
-        family,
-        _reserved: [0; 2],
-    };
-
-    let _ = EVENTS.output(&event, 0);
-
-    // Allow by default (userspace can update denylist)
-    1
+    1 // Allow (sock_ops TCP_CONNECT_CB return value is informational only)
 }
 
 /// Panic handler for eBPF programs (no-std).

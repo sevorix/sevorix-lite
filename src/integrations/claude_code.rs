@@ -57,16 +57,25 @@ impl ClaudeCodeIntegration {
     }
 
     fn is_daemon_running(&self) -> bool {
-        let pid_path = self.state_dir.join("sevorix.pid");
-        if let Ok(content) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = content.trim().parse::<i32>() {
-                unsafe { libc::kill(pid, 0) == 0 }
-            } else {
-                false
+        // Check for any running session in the sessions/ subdirectory
+        let sessions_dir = self.state_dir.join("sessions");
+        if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let pid = info["pid"].as_i64().unwrap_or(0) as i32;
+                        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+                            return true;
+                        }
+                    }
+                }
             }
-        } else {
-            false
         }
+        false
     }
 
     fn is_sevsh_installed(&self) -> bool {
@@ -174,8 +183,21 @@ mod tests {
     }
 
     fn create_running_daemon(state_dir: &PathBuf) {
-        let pid_path = state_dir.join("sevorix.pid");
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        // Create a session metadata file in sessions/ subdirectory
+        let sessions_dir = state_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let meta = serde_json::json!({
+            "name": "test-session",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "port": 3000,
+            "role": null,
+            "pid": std::process::id()
+        });
+        std::fs::write(
+            sessions_dir.join("test-session.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

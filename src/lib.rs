@@ -38,8 +38,11 @@ pub mod scanner;
 pub mod settings;
 
 use assets::Assets;
-pub use cli::{Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands, SessionCommands};
-pub use daemon::{is_ebpf_daemon_running, is_watchtower_running, DaemonManager, EbpfDaemonManager};
+pub use cli::{Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands};
+pub use daemon::find_available_port;
+pub use daemon::{
+    is_ebpf_daemon_running, is_watchtower_running, DaemonManager, EbpfDaemonManager, SessionInfo,
+};
 pub use integrations::{
     claude_code::ClaudeCodeIntegration, codex::CodexIntegration, openclaw::OpenClawIntegration,
     InstallResult, Integration, IntegrationRegistry, IntegrationStatus, Manifest,
@@ -78,6 +81,9 @@ pub struct AppState {
     /// settings.json `default_role` at startup; updated live via
     /// `POST /api/session/set-role`. Fail-closed if None.
     pub current_role: Arc<RwLock<Option<String>>>,
+    /// Port this Watchtower session is listening on. Included in eBPF cgroup
+    /// registration messages so the eBPF daemon can route events to the correct session.
+    pub port: u16,
     /// Shared HTTP client for proxying requests. Built with `.no_proxy()` and
     /// `.redirect(Policy::none())` so the proxy never follows redirects itself —
     /// redirect responses are returned to the caller to handle.
@@ -186,8 +192,6 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
             let resolved = resolve_integration_name(&name);
             match resolved {
                 "Claude Code" => {
-                    // Exec the mount-namespace launcher, replacing the current process.
-                    // sudo is required; the launcher validates $SUDO_USER itself.
                     let mut cmd = std::process::Command::new("sudo");
                     cmd.arg("/usr/local/bin/sevorix-claude-launcher");
                     cmd.args(&args);
@@ -521,6 +525,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 pub async fn run_server(
     allowed_roles: Option<Vec<String>>,
     session_id: uuid::Uuid,
+    port: u16,
+    initial_role: Option<String>,
 ) -> anyhow::Result<()> {
     // Setup paths
     let proj_dirs = ProjectDirs::from("com", "sevorix", "sevorix")
@@ -632,18 +638,22 @@ pub async fn run_server(
 
     // Load (or generate) the Ed25519 signing key and compute the initial policy hash.
 
+    // initial_role (from --role flag) takes priority over settings.json default_role
+    let resolved_role = initial_role.or(default_role);
+
     let app_state = Arc::new(AppState {
         tx,
         policy_engine: Arc::new(RwLock::new(engine)),
         traffic_log_path,
         log_dir: log_dir.clone(),
         session_id: session_id_str,
+        port,
         enforcement_tier,
         active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
         pending_decisions: Arc::new(DashMap::new()),
         intervention_timeout_secs: intervention_settings.timeout_secs(),
         intervention_timeout_allow: intervention_settings.timeout_action_allow(),
-        current_role: Arc::new(RwLock::new(default_role)),
+        current_role: Arc::new(RwLock::new(resolved_role)),
         http_client: reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -654,12 +664,15 @@ pub async fn run_server(
     // Define the Routes
     let app = build_router(app_state.clone());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!("--------------------------------------------------");
     tracing::info!("🛡️  SEVORIX WATCHTOWER ACTIVE");
-    tracing::info!("📡 API: http://localhost:3000/analyze");
-    tracing::info!("📊 Dashboard: http://localhost:3000/dashboard/desktop.html");
+    tracing::info!("📡 API: http://localhost:{}/analyze", port);
+    tracing::info!(
+        "📊 Dashboard: http://localhost:{}/dashboard/desktop.html",
+        port
+    );
     tracing::info!("🔒 Enforcement tier: {}", enforcement_tier);
     if enforcement_tier == EnforcementTier::Standard {
         tracing::info!("   (BPF LSM unavailable — 'bpf' not in /sys/kernel/security/lsm)");
@@ -687,7 +700,8 @@ async fn session_register(
         // Synchronously notify the eBPF daemon so SEVORIX_CGROUP_IDS is updated
         // before sevsh runs the child process. Best-effort: if the daemon socket
         // is not available (e.g. non-ebpf build), we continue without blocking.
-        notify_ebpf_daemon_cgroup(path).await;
+        let watchtower_url = format!("http://localhost:{}", state.port);
+        notify_ebpf_daemon_cgroup(path, &watchtower_url).await;
     }
     StatusCode::OK
 }
@@ -698,13 +712,16 @@ async fn session_register(
 /// ensuring the BPF filter recognises the new session immediately.
 /// Timeout is 200ms — if the daemon is not running or the socket is unavailable,
 /// this returns promptly without blocking session startup.
-async fn notify_ebpf_daemon_cgroup(cgroup_path: &str) {
+async fn notify_ebpf_daemon_cgroup(cgroup_path: &str, watchtower_url: &str) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    let msg = format!("{}\n", json!({"cgroup_path": cgroup_path}));
+    let msg = format!(
+        "{}\n",
+        json!({"cgroup_path": cgroup_path, "watchtower_url": watchtower_url})
+    );
 
-    let result = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+    let result = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
         let stream = UnixStream::connect(EBPF_SOCK_PATH).await?;
         let (reader, mut writer) = stream.into_split();
         writer.write_all(msg.as_bytes()).await?;
@@ -715,9 +732,11 @@ async fn notify_ebpf_daemon_cgroup(cgroup_path: &str) {
     .await;
 
     match result {
-        Ok(Ok(())) => {} // ACK received — cgroup ID is in the BPF map
-        Ok(Err(e)) => tracing::debug!("eBPF socket notify failed: {}", e),
-        Err(_) => tracing::debug!("eBPF socket notify timed out — daemon may not be running"),
+        Ok(Ok(())) => tracing::info!("eBPF cgroup registered: {}", cgroup_path),
+        Ok(Err(e)) => tracing::warn!("eBPF socket notify failed: {}", e),
+        Err(_) => tracing::warn!(
+            "eBPF socket notify timed out after 2s — daemon may not be running or is overloaded"
+        ),
     }
 }
 
@@ -1555,8 +1574,46 @@ async fn get_recent_events(
         let reader = BufReader::new(file);
 
         for line in reader.lines().map_while(Result::ok) {
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            let Ok(raw) = serde_json::from_str::<Value>(&line) else {
                 continue;
+            };
+
+            // Pro builds wrap events in a receipt envelope:
+            // { "receipt_version": "1", "payload": { <event> }, "signature": "..." }
+            // Unwrap and normalize field names so the dashboard sees a uniform shape.
+            let event = if raw.get("receipt_version").is_some() {
+                let inner = match raw.get("payload").and_then(|v| v.as_object()).cloned() {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let mut m = serde_json::Map::new();
+                for (k, v) in &inner {
+                    m.insert(k.clone(), v.clone());
+                }
+                // Remap receipt-specific field names to the dashboard's expected names.
+                // Keep originals too so nothing breaks if both are accessed.
+                if let Some(v) = inner.get("decision") {
+                    m.insert("verdict".to_string(), v.clone());
+                    // Derive lane from decision when absent.
+                    if !inner.contains_key("lane") {
+                        let lane = match v.as_str().unwrap_or("") {
+                            "ALLOW" | "EVENT" => "GREEN",
+                            "BLOCK" | "KILL" => "RED",
+                            "FLAG" => "YELLOW",
+                            _ => "GREEN",
+                        };
+                        m.insert("lane".to_string(), Value::String(lane.to_string()));
+                    }
+                }
+                if let Some(v) = inner.get("action_payload") {
+                    m.insert("payload".to_string(), v.clone());
+                }
+                if let Some(v) = inner.get("latency_ms") {
+                    m.insert("latency".to_string(), v.clone());
+                }
+                Value::Object(m)
+            } else {
+                raw
             };
 
             // Layer filter.
@@ -1581,8 +1638,10 @@ async fn get_recent_events(
             // Full-text search
             if let Some(ref term) = search_term {
                 let haystack = [
+                    "action_payload",
                     "payload",
                     "verdict",
+                    "decision",
                     "lane",
                     "layer",
                     "reason",
@@ -1708,6 +1767,19 @@ struct StatsQuery {
 
 /// List all traffic log sessions found in the log directory.
 async fn get_sessions_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Build a lookup map: session_id UUID → SessionInfo (name, port, role, is_running).
+    // This enriches traffic log entries with the metadata written by DaemonManager.
+    let mut meta_by_uuid: std::collections::HashMap<String, SessionInfo> =
+        std::collections::HashMap::new();
+    let running_count = if let Ok(running) = DaemonManager::list_sessions() {
+        for (info, _running) in running {
+            meta_by_uuid.insert(info.session_id.clone(), info);
+        }
+        meta_by_uuid.len()
+    } else {
+        0
+    };
+
     let mut sessions: Vec<Value> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&state.log_dir) {
@@ -1727,9 +1799,16 @@ async fn get_sessions_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             let is_current = uuid_part == state.session_id;
             let (event_count, first_ts, last_ts) = summarize_traffic_file(&path);
             let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+            // Enrich with session metadata if available
+            let meta = meta_by_uuid.get(uuid_part);
             sessions.push(json!({
                 "session_id": uuid_part,
+                "name": meta.map(|m| m.name.as_str()),
+                "port": meta.map(|m| m.port),
+                "role": meta.and_then(|m| m.role.as_deref()),
                 "is_current": is_current,
+                "is_running": meta.is_some(),
                 "event_count": event_count,
                 "started_at": first_ts,
                 "last_event_at": last_ts,
@@ -1752,7 +1831,11 @@ async fn get_sessions_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
                     .unwrap_or(0);
                 sessions.push(json!({
                     "session_id": "legacy",
+                    "name": Value::Null,
+                    "port": Value::Null,
+                    "role": Value::Null,
                     "is_current": false,
+                    "is_running": false,
                     "event_count": event_count,
                     "started_at": first_ts,
                     "last_event_at": last_ts,
@@ -1762,15 +1845,32 @@ async fn get_sessions_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         }
     }
 
-    // Sort newest-first by last_event_at.
+    // Sort: current first, then running sessions, then by newest last_event_at.
     sessions.sort_by(|a, b| {
+        let a_current = a["is_current"].as_bool().unwrap_or(false);
+        let b_current = b["is_current"].as_bool().unwrap_or(false);
+        if a_current != b_current {
+            return b_current.cmp(&a_current);
+        }
+        let a_running = a["is_running"].as_bool().unwrap_or(false);
+        let b_running = b["is_running"].as_bool().unwrap_or(false);
+        if a_running != b_running {
+            return b_running.cmp(&a_running);
+        }
         let ta = a["last_event_at"].as_str().unwrap_or("");
         let tb = b["last_event_at"].as_str().unwrap_or("");
         tb.cmp(ta)
     });
 
+    // Provide current session metadata for the header.
+    let current_meta = meta_by_uuid.get(&state.session_id);
+
     Json(json!({
         "current_session": state.session_id,
+        "current_session_name": current_meta.map(|m| m.name.as_str()),
+        "current_session_port": current_meta.map(|m| m.port),
+        "current_session_role": current_meta.and_then(|m| m.role.as_deref()),
+        "running_sessions_count": running_count,
         "sessions": sessions,
     }))
 }
@@ -1869,6 +1969,7 @@ mod tests {
             traffic_log_path: PathBuf::from("/tmp/test_traffic.jsonl"),
             log_dir: PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_decisions: Arc::new(DashMap::new()),
@@ -1891,6 +1992,7 @@ mod tests {
             traffic_log_path: path,
             log_dir: PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_decisions: Arc::new(DashMap::new()),
@@ -1913,6 +2015,7 @@ mod tests {
             traffic_log_path: PathBuf::from("/tmp/test_traffic.jsonl"),
             log_dir: PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_decisions: Arc::new(DashMap::new()),
