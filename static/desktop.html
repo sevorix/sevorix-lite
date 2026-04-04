@@ -32,6 +32,10 @@
                 sessions: [],
                 selectedSession: null,
                 sessionsLoading: false,
+                currentSessionName: '',
+                currentSessionPort: 3000,
+                currentSessionRole: '',
+                runningSessionsCount: 0,
 
                 // ── Intervention panel ──────────────────────────────────────
                 pendingRequests: [],
@@ -81,12 +85,30 @@
                         .then(r => r.json())
                         .then(data => {
                             this.sessions = data.sessions || [];
+                            this.currentSessionName = data.current_session_name || '';
+                            this.currentSessionPort = data.current_session_port || 3000;
+                            this.currentSessionRole = data.current_session_role || '';
+                            this.runningSessionsCount = data.running_sessions_count || 0;
                             if (this.selectedSession === null && data.current_session) {
                                 this.selectedSession = data.current_session;
+                                // Re-query history now that we have the correct session UUID —
+                                // the initial queryHistory fired before this resolved.
+                                this.queryHistory(1);
                             }
                             this.sessionsLoading = false;
                         })
                         .catch(() => { this.sessionsLoading = false; });
+                },
+
+                // Human-readable label for a session entry in the dropdown.
+                sessionLabel(s) {
+                    const name = s.name || s.session_id.substring(0, 8) + '…';
+                    const indicator = s.is_current ? '● ' : (s.is_running ? '◉ ' : '○ ');
+                    const role = s.role ? ` [${s.role}]` : '';
+                    const port = s.port ? `:${s.port}` : '';
+                    const count = ` (${s.event_count} events`;
+                    const ts = s.started_at ? `, ${(s.started_at || '').replace('T', ' ').substring(0, 16)}` : '';
+                    return `${indicator}${name}${port}${role}${count}${ts})`;
                 },
 
                 // ── History query ───────────────────────────────────────────
@@ -137,11 +159,13 @@
                         })
                         .catch(err => console.warn("Could not load version info:", err));
 
-                    // Initial history load
+                    // Initial load — loadSessions triggers queryHistory(1) once the
+                    // session UUID is known, so no need to call queryHistory here.
                     this.loadSessions();
-                    this.queryHistory(1);
                     this.loadStats();
                     setInterval(() => this.loadStats(), 5000);
+                    // Auto-refresh history every 10 s when the history tab is active.
+                    setInterval(() => { if (this.activeTab === 'history') this.queryHistory(this.historyPage); }, 10000);
 
                     // Countdown ticker — decrements non-paused, non-decided pending requests
                     setInterval(() => {
@@ -152,7 +176,8 @@
                         );
                     }, 1000);
 
-                    const ws = new WebSocket("ws://localhost:3000/ws");
+                    const wsPort = window.location.port || 3000;
+                    const ws = new WebSocket(`ws://${window.location.hostname}:${wsPort}/ws`);
                     ws.onopen = () => console.log("CONNECTED TO SERVER!");
                     ws.onmessage = (msg) => {
                         const data = JSON.parse(msg.data);
@@ -187,6 +212,11 @@
 
                         this._addLive(data);
                         if (data.lane === 'RED') this.selected = data;
+                        // Keep history tab in sync — debounced so rapid events don't spam.
+                        if (this.activeTab === 'history') {
+                            clearTimeout(this._historyRefreshDebounce);
+                            this._historyRefreshDebounce = setTimeout(() => this.queryHistory(this.historyPage), 500);
+                        }
                     };
                     ws.onclose = () => {
                         console.log("Disconnected. Retrying...");
@@ -249,6 +279,21 @@
             </div>
         </div>
         <div class="flex items-center gap-6">
+            <!-- Current session metadata -->
+            <div x-show="currentSessionName" class="flex flex-col items-end">
+                <span class="text-[10px] text-slate-500 uppercase tracking-widest">Session</span>
+                <div class="flex items-center gap-1">
+                    <span class="text-xs text-cyan-300 font-mono font-bold" x-text="currentSessionName"></span>
+                    <span class="text-[10px] text-slate-600">:</span>
+                    <span class="text-xs text-slate-400 font-mono" x-text="currentSessionPort"></span>
+                </div>
+                <div x-show="currentSessionRole" class="text-[10px] text-amber-400 font-mono uppercase tracking-wide" x-text="'role: ' + currentSessionRole"></div>
+            </div>
+            <!-- Running sessions count badge (when multiple) -->
+            <div x-show="runningSessionsCount > 1" class="flex flex-col items-end">
+                <span class="text-[10px] text-slate-500 uppercase tracking-widest">Running</span>
+                <span class="text-xs text-cyan-500 font-mono" x-text="runningSessionsCount + ' sessions'"></span>
+            </div>
             <div class="flex flex-col items-end">
                 <span class="text-[10px] text-slate-500 uppercase">System Status</span>
                 <div class="flex items-center gap-2">
@@ -434,7 +479,7 @@
                         class="flex-1 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:ring-1 focus:ring-cyan-600 disabled:opacity-40">
                     <template x-for="s in sessions" :key="s.session_id">
                         <option :value="s.session_id"
-                                x-text="(s.is_current ? '● ' : '○ ') + s.session_id.substring(0,8) + '…  (' + s.event_count + ' events' + (s.started_at ? ', ' + (s.started_at || '').replace('T', ' ').substring(0, 19) : '') + ')'">
+                                x-text="sessionLabel(s)">
                         </option>
                     </template>
                 </select>

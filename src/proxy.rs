@@ -443,6 +443,7 @@ mod tests {
             traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
             log_dir: std::path::PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            port: 3000,
             enforcement_tier: sevorix_core::EnforcementTier::Standard,
             active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
@@ -495,6 +496,7 @@ mod tests {
             pending_decisions: Arc::new(DashMap::new()),
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
+            port: 3000,
             current_role: std::sync::Arc::new(std::sync::RwLock::new(Some("default".to_string()))),
             http_client: reqwest::Client::builder()
                 .no_proxy()

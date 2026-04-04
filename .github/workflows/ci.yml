@@ -69,6 +69,7 @@ jobs:
       - name: Lint with Clippy
         run: cargo clippy --workspace --exclude sevorix-ebpf ${{ matrix.features }} -- -D warnings
 
+
   coverage:
     name: Coverage (${{ matrix.edition }} edition)
     runs-on: ubuntu-latest
