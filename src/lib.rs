@@ -49,10 +49,12 @@ pub use integrations::{
 };
 use policy::{Action, Engine, PolicyContext, PolicyType};
 use proxy::proxy_handler;
-use scanner::{
-    log_kill, log_threat, scan_content, scan_for_poison, scan_syscall_with_engine, PoisonPill,
-};
-use sevorix_core::{detect_enforcement_tier, EnforcementTier, SeccompDecision, SyscallEvent};
+#[cfg(target_os = "linux")]
+use scanner::scan_syscall_with_engine;
+use scanner::{log_kill, log_threat, scan_content, scan_for_poison, PoisonPill};
+#[cfg(target_os = "linux")]
+use sevorix_core::SeccompDecision;
+use sevorix_core::{detect_enforcement_tier, EnforcementTier, SyscallEvent};
 
 /// Holds both channel halves for one pending intervention decision.
 pub struct PendingEntry {
@@ -497,7 +499,6 @@ pub fn validate_startup_config() -> anyhow::Result<()> {
 pub fn build_router(state: Arc<AppState>) -> Router {
     let app = Router::new()
         .route("/analyze", post(analyze_intent))
-        .route("/analyze-syscall", post(analyze_syscall))
         .route("/syscall-policy", get(syscall_policy_handler))
         .route("/policies/ebpf", get(ebpf_policies_handler))
         .route("/api/ebpf-event", post(ebpf_event_handler))
@@ -515,6 +516,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/session/unregister", post(session_unregister))
         .route("/api/session/set-role", post(session_set_role))
         .route("/api/active-sessions", get(active_sessions_handler));
+
+    #[cfg(target_os = "linux")]
+    let app = app.route("/analyze-syscall", post(analyze_syscall));
 
     app.route("/health", get(health_handler))
         .route("/api/version", get(get_version))
@@ -1154,6 +1158,7 @@ async fn analyze_intent(
 /// This endpoint is used by seccomp-unotify handlers to get policy decisions
 /// for intercepted syscalls. The response includes the action to take
 /// (allow, block, or kill) and the errno to return if blocking.
+#[cfg(target_os = "linux")]
 async fn analyze_syscall(
     State(state): State<Arc<AppState>>,
     Json(event): Json<SyscallEvent>,
@@ -2100,6 +2105,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_scan_syscall_with_engine_integration() {
         let mut engine = Engine::new();
         engine.roles.insert(
@@ -2584,6 +2590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_seccomp_decision_variants() {
         // Test SeccompDecision variants
         let allow = SeccompDecision::Allow;

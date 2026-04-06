@@ -315,7 +315,8 @@ impl BashPty {
                 let _ = setsid();
 
                 // Set controlling terminal
-                let _ = unsafe { libc::ioctl(pty_pair.slave_fd, libc::TIOCSCTTY, 0) };
+                let _ =
+                    unsafe { libc::ioctl(pty_pair.slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
 
                 // Dup slave to stdin/stdout/stderr
                 let _ = dup2(pty_pair.slave_fd, 0);

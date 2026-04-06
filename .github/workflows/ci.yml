@@ -70,6 +70,20 @@ jobs:
         run: cargo clippy --workspace --exclude sevorix-ebpf ${{ matrix.features }} -- -D warnings
 
 
+  check-macos:
+    name: Check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "macos"
+      - name: Check (no ebpf, no libseccomp)
+        run: cargo check --release --workspace --exclude sevorix-ebpf
+
   coverage:
     name: Coverage (${{ matrix.edition }} edition)
     runs-on: ubuntu-latest

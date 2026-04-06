@@ -8,24 +8,30 @@ on:
 jobs:
   build:
     name: Build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x86_64
-          # To add more targets in the future, append entries here, e.g.:
-          # - target: aarch64-unknown-linux-gnu
-          #   arch: aarch64
-          #   use_cross: true
-          # - target: x86_64-apple-darwin
-          #   arch: x86_64
-          #   os: macos
-          #   runs_on: macos-latest
+            os: ubuntu-latest
+            artifact_suffix: linux
+
+          - target: aarch64-apple-darwin
+            arch: aarch64
+            os: macos-latest
+            artifact_suffix: darwin
+
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            os: macos-latest
+            artifact_suffix: darwin
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
 
       - name: Install Rust
@@ -34,44 +40,63 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --features ebpf --target ${{ matrix.target }}
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo build --release --features ebpf --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Verify binaries
         run: |
-          test -f target/${{ matrix.target }}/release/sevorix_watchtower  || (echo "❌ sevorix_watchtower not found" && exit 1)
-          test -f target/${{ matrix.target }}/release/sevsh                || (echo "❌ sevsh not found" && exit 1)
-          test -f target/${{ matrix.target }}/release/sevorix-ebpf-daemon  || (echo "❌ sevorix-ebpf-daemon not found" && exit 1)
+          test -f target/${{ matrix.target }}/release/sevorix_watchtower || (echo "❌ sevorix_watchtower not found" && exit 1)
+          test -f target/${{ matrix.target }}/release/sevsh               || (echo "❌ sevsh not found" && exit 1)
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            test -f target/${{ matrix.target }}/release/sevorix-ebpf-daemon || (echo "❌ sevorix-ebpf-daemon not found" && exit 1)
+          fi
 
       - name: Package
         run: |
           VERSION="${{ github.ref_name }}"
-          BUNDLE_DIR="sevorix-${VERSION}-${{ matrix.arch }}-linux"
+          BUNDLE_DIR="sevorix-${VERSION}-${{ matrix.arch }}-${{ matrix.artifact_suffix }}"
           ARCHIVE="${BUNDLE_DIR}.tar.gz"
 
-          mkdir -p "${BUNDLE_DIR}/scripts"
+          mkdir -p "${BUNDLE_DIR}"
 
-          cp target/${{ matrix.target }}/release/sevorix_watchtower  "${BUNDLE_DIR}/sevorix"
-          cp target/${{ matrix.target }}/release/sevsh                "${BUNDLE_DIR}/sevsh"
-          cp target/${{ matrix.target }}/release/sevorix-ebpf-daemon  "${BUNDLE_DIR}/sevorix-ebpf-daemon"
-          cp install-binary.sh                                         "${BUNDLE_DIR}/install-binary.sh"
-          cp scripts/sevorix-cgroup-helper                             "${BUNDLE_DIR}/scripts/sevorix-cgroup-helper"
-          cp scripts/sevorix-claude-launcher                           "${BUNDLE_DIR}/scripts/sevorix-claude-launcher"
+          cp target/${{ matrix.target }}/release/sevorix_watchtower "${BUNDLE_DIR}/sevorix"
+          cp target/${{ matrix.target }}/release/sevsh              "${BUNDLE_DIR}/sevsh"
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            mkdir -p "${BUNDLE_DIR}/scripts"
+            cp target/${{ matrix.target }}/release/sevorix-ebpf-daemon "${BUNDLE_DIR}/sevorix-ebpf-daemon"
+            cp install-binary.sh                                        "${BUNDLE_DIR}/install-binary.sh"
+            cp scripts/sevorix-cgroup-helper                            "${BUNDLE_DIR}/scripts/sevorix-cgroup-helper"
+            cp scripts/sevorix-claude-launcher                          "${BUNDLE_DIR}/scripts/sevorix-claude-launcher"
+            chmod +x "${BUNDLE_DIR}/scripts/sevorix-cgroup-helper"
+            chmod +x "${BUNDLE_DIR}/scripts/sevorix-claude-launcher"
+          else
+            cp install-binary-macos.sh "${BUNDLE_DIR}/install-binary.sh"
+          fi
 
           chmod +x "${BUNDLE_DIR}/sevorix"
           chmod +x "${BUNDLE_DIR}/sevsh"
-          chmod +x "${BUNDLE_DIR}/sevorix-ebpf-daemon"
           chmod +x "${BUNDLE_DIR}/install-binary.sh"
-          chmod +x "${BUNDLE_DIR}/scripts/sevorix-cgroup-helper"
-          chmod +x "${BUNDLE_DIR}/scripts/sevorix-claude-launcher"
 
           tar czf "${ARCHIVE}" "${BUNDLE_DIR}"
-          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+          # sha256sum is GNU coreutils (Linux); shasum is macOS
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          fi
+
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.arch }}
+          name: binary-${{ matrix.arch }}-${{ matrix.artifact_suffix }}
           path: |
             *.tar.gz
             *.tar.gz.sha256
