@@ -5,7 +5,9 @@ use crate::policy::{Action, Engine, PolicyContext};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sevorix_core::{SeccompDecision, SyscallEvent};
+#[cfg(target_os = "linux")]
+use sevorix_core::SeccompDecision;
+use sevorix_core::SyscallEvent;
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -200,6 +202,7 @@ pub fn scan_syscall(
 /// # Returns
 ///
 /// A `SeccompDecision` indicating what action to take.
+#[cfg(target_os = "linux")]
 pub fn scan_syscall_with_engine(event: &SyscallEvent, engine: &Engine) -> SeccompDecision {
     // Format syscall event as a string for pattern matching
     let args_str = event.args.join(", ");
@@ -501,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_scan_syscall_with_engine_blocks() {
         let mut engine = Engine::new();
         engine.policies.insert(
@@ -536,6 +540,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_scan_syscall_with_engine_kills() {
         let mut engine = Engine::new();
         engine.policies.insert(
@@ -571,6 +576,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_scan_syscall_with_engine_allows() {
         let mut engine = Engine::new();
         engine.policies.insert(
@@ -606,6 +612,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_scan_syscall_with_engine_flags_as_allow() {
         let mut engine = Engine::new();
         engine.policies.insert(

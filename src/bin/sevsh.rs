@@ -3,10 +3,12 @@
 
 use clap::Parser;
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use sevorix_core::{
     apply_syscall_deny_filter, apply_syscall_notify_filter, run_seccomp_notify_supervisor,
-    PtyMultiplexer, PtyMultiplexerConfig, SyscallInfo,
+    SyscallInfo,
 };
+use sevorix_core::{PtyMultiplexer, PtyMultiplexerConfig};
 use std::env;
 use std::os::unix::process::CommandExt;
 use std::process::{exit, Command, Stdio};
@@ -1032,19 +1034,19 @@ async fn handle_bash_invocation(
         // Add session ID to environment for eBPF tagging
         env_vars.push(("SEVORIX_SESSION_ID".to_string(), session_id.to_string()));
 
-        // Fetch syscall deny list and apply as a per-child seccomp filter.
-        // This provides synchronous kernel-level enforcement: syscalls named here
-        // will fail with EPERM inside the child and all its descendants.
-        // Non-fatal: if the fetch fails we proceed without the filter (eBPF still
-        // monitors and the PtyMultiplexer validates commands for interactive mode).
-        let deny_names: Vec<String> = fetch_syscall_deny_list().await;
-
         let mut command = Command::new(&shell);
         command.args(&final_cmd_args);
         for (key, value) in env_vars {
             command.env(key, value);
         }
 
+        // On Linux: fetch the syscall deny list and apply a per-child seccomp filter
+        // for synchronous kernel-level enforcement. On macOS seccomp is unavailable
+        // so we skip the fetch and go straight to command execution.
+        #[cfg(target_os = "linux")]
+        let deny_names: Vec<String> = fetch_syscall_deny_list().await;
+
+        #[cfg(target_os = "linux")]
         let status = if !deny_names.is_empty() {
             // Create a pipe so the child's pre_exec can pass the seccomp notify_fd
             // number back to us. Both ends inherit across fork; O_CLOEXEC closes them
@@ -1196,6 +1198,9 @@ async fn handle_bash_invocation(
             command.status()?
         };
 
+        #[cfg(not(target_os = "linux"))]
+        let status = command.status()?;
+
         Ok(status.code().unwrap_or(1))
     } else {
         eprintln!("SEVORIX BLOCKED: {}", verdict.reason);
@@ -1286,6 +1291,7 @@ fn real_shell() -> String {
 
 /// Fetch the list of syscall names to deny from Watchtower's /syscall-policy endpoint.
 /// Returns an empty list on any error (non-fatal: enforcement degrades gracefully).
+#[cfg(target_os = "linux")]
 async fn fetch_syscall_deny_list() -> Vec<String> {
     let client = reqwest::Client::new();
     let url = format!("{}/syscall-policy", proxy_url());
