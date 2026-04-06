@@ -72,6 +72,11 @@ pub enum Commands {
         /// Agent type to prime: policy-manager (pm) or guarded-agent (guard)
         agent_type: String,
     },
+    /// CA certificate management (TLS MITM)
+    Ca {
+        #[command(subcommand)]
+        subcmd: CaCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -238,4 +243,14 @@ pub enum IntegrationsCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum CaCommands {
+    /// Print the CA certificate PEM to stdout (pipe into trust-store tooling)
+    Print,
+    /// Print the path to the CA certificate file
+    Path,
+    /// Regenerate the CA certificate and key (invalidates all previously issued leaf certs)
+    Regenerate,
 }

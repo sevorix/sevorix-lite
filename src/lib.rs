@@ -36,9 +36,10 @@ pub mod prime;
 pub mod proxy;
 pub mod scanner;
 pub mod settings;
+pub mod tls;
 
 use assets::Assets;
-pub use cli::{Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands};
+pub use cli::{CaCommands, Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands};
 pub use daemon::find_available_port;
 pub use daemon::{
     is_ebpf_daemon_running, is_watchtower_running, DaemonManager, EbpfDaemonManager, SessionInfo,
@@ -90,6 +91,9 @@ pub struct AppState {
     /// `.redirect(Policy::none())` so the proxy never follows redirects itself —
     /// redirect responses are returned to the caller to handle.
     pub http_client: reqwest::Client,
+    /// TLS MITM context (CA + per-hostname server config cache). `None` when
+    /// TLS MITM is disabled in settings.
+    pub tls_context: Option<Arc<crate::tls::TlsContext>>,
 }
 
 pub fn handle_config(cmd: ConfigCommands) {
@@ -106,6 +110,37 @@ pub fn handle_config(cmd: ConfigCommands) {
                 }
             } else {
                 println!("Could not determine config directory.");
+            }
+        }
+    }
+}
+
+pub fn handle_ca(cmd: crate::cli::CaCommands) {
+    let ca_dir = match dirs::home_dir() {
+        Some(h) => h.join(".sevorix/ca"),
+        None => {
+            eprintln!("Cannot determine home directory");
+            return;
+        }
+    };
+    match cmd {
+        crate::cli::CaCommands::Print => match std::fs::read_to_string(ca_dir.join("ca.crt")) {
+            Ok(pem) => print!("{}", pem),
+            Err(_) => {
+                eprintln!("No CA cert found. Enable tls_mitm in settings and start Sevorix first.")
+            }
+        },
+        crate::cli::CaCommands::Path => {
+            println!("{}", ca_dir.join("ca.crt").display());
+        }
+        crate::cli::CaCommands::Regenerate => {
+            let _ = std::fs::remove_file(ca_dir.join("ca.crt"));
+            let _ = std::fs::remove_file(ca_dir.join("ca.key"));
+            match crate::tls::CaStore::load_or_create(&ca_dir) {
+                Ok(_) => {
+                    println!("CA regenerated. Re-inject the certificate into your trust stores.")
+                }
+                Err(e) => eprintln!("Failed to regenerate CA: {}", e),
             }
         }
     }
@@ -645,6 +680,24 @@ pub async fn run_server(
     // initial_role (from --role flag) takes priority over settings.json default_role
     let resolved_role = initial_role.or(default_role);
 
+    // Initialise TLS MITM context if enabled in settings.
+    let tls_context = if loaded_settings
+        .tls_mitm
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false)
+    {
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        let ca_dir = home_dir.join(".sevorix/ca");
+        std::fs::create_dir_all(&ca_dir)?;
+        let ca = crate::tls::CaStore::load_or_create(&ca_dir)?;
+        tracing::info!("[TLS-MITM] CA certificate loaded from {}", ca_dir.display());
+        Some(Arc::new(crate::tls::TlsContext::new(ca)))
+    } else {
+        None
+    };
+
     let app_state = Arc::new(AppState {
         tx,
         policy_engine: Arc::new(RwLock::new(engine)),
@@ -663,6 +716,7 @@ pub async fn run_server(
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default(),
+        tls_context,
     });
 
     // Define the Routes
@@ -1986,6 +2040,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            tls_context: None,
         })
     }
 
@@ -2009,6 +2064,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            tls_context: None,
         })
     }
 
@@ -2032,6 +2088,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            tls_context: None,
         })
     }
 

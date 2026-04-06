@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub struct Settings {
     pub intervention: Option<InterventionSettings>,
     pub sevsh: Option<SevshSettings>,
+    pub tls_mitm: Option<TlsMitmSettings>,
 }
 
 impl Settings {
@@ -23,6 +24,18 @@ impl Settings {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct TlsMitmSettings {
+    /// If true, CONNECT tunnels are intercepted and decrypted.
+    pub enabled: Option<bool>,
+}
+
+impl TlsMitmSettings {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
     }
 }
 
