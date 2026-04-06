@@ -121,6 +121,19 @@ impl Integration for ClaudeCodeIntegration {
             );
         }
 
+        // Check if MITM CA cert exists and inform user
+        let ca_cert_path = dirs::home_dir().map(|h| h.join(".sevorix/ca/ca.crt"));
+
+        if let Some(ref path) = ca_cert_path {
+            if path.exists() {
+                println!("[TLS-MITM] CA certificate detected at: {}", path.display());
+                println!(
+                    "[TLS-MITM] To enable HTTPS inspection for Claude Code, add to your shell profile:"
+                );
+                println!("  export NODE_EXTRA_CA_CERTS=\"{}\"", path.display());
+            }
+        }
+
         Ok(InstallResult {
             files_modified: vec![],
             config_changes: vec![],

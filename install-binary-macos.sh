@@ -162,6 +162,40 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     echo "   export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
+# ---------------------------------------------------------------
+# TLS MITM CA certificate trust setup
+# ---------------------------------------------------------------
+setup_mitm_ca() {
+    local ca_cert="$HOME/.sevorix/ca/ca.crt"
+
+    echo ""
+    echo "=== TLS MITM Certificate Setup ==="
+
+    if [ ! -f "$ca_cert" ]; then
+        echo "  CA cert not yet generated."
+        echo "  Enable TLS MITM by adding to ~/.sevorix/settings.json:"
+        echo '    { "tls_mitm": { "enabled": true } }'
+        echo "  Then start Sevorix — the CA cert will be generated automatically."
+        echo "  Re-run this installer after first start to trust it."
+        return
+    fi
+
+    echo "  CA cert found at: $ca_cert"
+
+    # macOS Keychain
+    sudo security add-trusted-cert -d -r trustRoot \
+        -k /Library/Keychains/System.keychain "$ca_cert"
+    echo "  ✓ CA cert added to macOS System Keychain (trusted root)"
+
+    # Claude Code guidance
+    echo ""
+    echo "  For Claude Code HTTPS inspection, add to your shell profile (~/.zshrc):"
+    echo "    export NODE_EXTRA_CA_CERTS=\"$ca_cert\""
+    echo ""
+}
+
+setup_mitm_ca
+
 echo ""
 echo "✅ Installation complete!"
 echo "   Run 'sevorix start' to launch the daemon."
