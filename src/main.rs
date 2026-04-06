@@ -5,7 +5,7 @@ use clap::{CommandFactory, Parser};
 use sevorix_watchtower::find_available_port;
 use sevorix_watchtower::prime::print_prime;
 use sevorix_watchtower::{
-    handle_config, handle_integrations, handle_validate,
+    handle_ca, handle_config, handle_integrations, handle_validate,
     logging::{init_logging, init_logging_with_session},
     run_server, validate_startup_config, Cli, Commands, DaemonManager, HubCommands,
 };
@@ -159,6 +159,7 @@ fn main() -> anyhow::Result<()> {
             context,
         }) => handle_validate(command, role, context),
         Some(Commands::Prime { agent_type }) => print_prime(&agent_type),
+        Some(Commands::Ca { subcmd }) => handle_ca(subcmd),
         Some(Commands::Run) => {
             // Explicit foreground run
             let (_guard, session_id) = init_logging();

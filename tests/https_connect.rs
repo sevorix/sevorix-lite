@@ -35,6 +35,7 @@ async fn test_real_connect_handshake() {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default(),
+        tls_context: None,
     });
 
     // 2. Setup Router

@@ -64,6 +64,7 @@ impl TestHarness {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            tls_context: None,
         });
 
         let app = build_router(state.clone());
@@ -156,6 +157,7 @@ impl TestHarness {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            tls_context: None,
         });
 
         let app = build_router(state.clone());

@@ -65,12 +65,28 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             let on_upgrade = hyper::upgrade::on(req);
 
             // Spawn a task to handle the upgraded connection
+            let state_clone = state.clone();
+            let host_owned = host.to_string();
             tokio::task::spawn(async move {
                 match on_upgrade.await {
                     Ok(upgraded) => {
-                        // tracing::debug!("[PROXY] Upgrade successful for {}", addr);
-                        if let Err(e) = tunnel(upgraded, addr_for_tunnel).await {
-                            tracing::error!("[PROXY] Tunnel error: {}", e);
+                        if let Some(ref tls_ctx) = state_clone.tls_context {
+                            if let Err(e) = mitm_tls_tunnel(
+                                upgraded,
+                                host_owned,
+                                port,
+                                addr_for_tunnel,
+                                state_clone.clone(),
+                                tls_ctx.clone(),
+                            )
+                            .await
+                            {
+                                tracing::error!("[PROXY] MITM tunnel error: {}", e);
+                            }
+                        } else {
+                            if let Err(e) = tunnel(upgraded, addr_for_tunnel).await {
+                                tracing::error!("[PROXY] Tunnel error: {}", e);
+                            }
                         }
                     }
                     Err(e) => tracing::error!("[PROXY] Upgrade error: {}", e),
@@ -416,6 +432,339 @@ async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
     Ok(())
 }
 
+fn is_valid_mitm_hostname(hostname: &str) -> bool {
+    if hostname.is_empty() || hostname.len() > 253 {
+        return false;
+    }
+    // Allow IP addresses (handled by IP SAN logic in tls.rs)
+    if hostname.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    // DNS hostname: labels separated by dots, each label alphanumeric + hyphens
+    hostname.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
+// NOTE: HTTP/2 and WebSocket tunnels are not currently intercepted and will fall through
+// gracefully — only HTTP/1.1 traffic is MITM'd inside the TLS tunnel.
+async fn mitm_tls_tunnel(
+    upgraded: hyper::upgrade::Upgraded,
+    hostname: String,
+    port: u16,
+    _addr: String,
+    state: std::sync::Arc<crate::AppState>,
+    tls_ctx: std::sync::Arc<crate::tls::TlsContext>,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::TokioIo;
+    use tokio_rustls::TlsAcceptor;
+
+    // Validate hostname before cert generation to prevent cache exhaustion attacks
+    if !is_valid_mitm_hostname(&hostname) {
+        tracing::warn!(
+            "[MITM] Rejected invalid hostname for interception: {:?}",
+            hostname
+        );
+        return Err(anyhow::anyhow!("Invalid hostname for MITM: {:?}", hostname));
+    }
+
+    // 1. Accept TLS from the client using our CA-signed cert for this hostname
+    let server_cfg = tls_ctx
+        .server_config_for(&hostname)
+        .map_err(|e| anyhow::anyhow!("Failed to generate cert for '{}': {}", hostname, e))?;
+    let acceptor = TlsAcceptor::from(server_cfg);
+    let client_tls = acceptor
+        .accept(TokioIo::new(upgraded))
+        .await
+        .map_err(|e| anyhow::anyhow!("TLS handshake failed for '{}': {}", hostname, e))?;
+
+    // 2. Serve HTTP/1.1 on the decrypted stream
+    let service = MitmService {
+        hostname: hostname.clone(),
+        port,
+        state,
+    };
+
+    // Non-HTTP protocols (WebSockets, gRPC, HTTP/2) will error here.
+    // Log and exit cleanly rather than propagating.
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(client_tls), service)
+        .await
+    {
+        tracing::debug!(
+            "[MITM] serve_connection error for {} (may be non-HTTP/1.1 protocol): {}",
+            hostname,
+            e
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct MitmService {
+    hostname: String,
+    port: u16,
+    state: std::sync::Arc<crate::AppState>,
+}
+
+impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmService {
+    type Response = hyper::Response<axum::body::Body>;
+    type Error = anyhow::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        let hostname = self.hostname.clone();
+        let port = self.port;
+        let state = self.state.clone();
+
+        Box::pin(async move {
+            let start_time = std::time::Instant::now();
+            let method = req.method().clone();
+            let path_and_query = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/")
+                .to_string();
+            let full_url = if port == 443 {
+                format!("https://{}{}", hostname, path_and_query)
+            } else {
+                format!("https://{}:{}{}", hostname, port, path_and_query)
+            };
+
+            // Buffer body (extract headers before consuming req)
+            use http_body_util::BodyExt;
+            let headers = req.headers().clone();
+            let bytes = req
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| anyhow::anyhow!("Body read error: {e}"))?
+                .to_bytes();
+
+            let body_str = String::from_utf8_lossy(&bytes).to_string();
+            let scan_payload = format!("{} {}\n\n{}", method, full_url, body_str);
+
+            // Poison pill check
+            let pill = crate::scanner::PoisonPill::default_canary();
+            if scan_payload.contains(pill.value) {
+                let event = serde_json::json!({
+                    "verdict": "BLOCK",
+                    "lane": "RED",
+                    "layer": "network",
+                    "payload": &scan_payload,
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "latency": start_time.elapsed().as_millis() as u64,
+                    "reason": "Poison pill detected in HTTPS payload",
+                    "confidence": "HIGH"
+                });
+                let event_str = event.to_string();
+                #[allow(deprecated)]
+                log_traffic_event(&state.traffic_log_path, &event_str);
+                let _ = state.tx.send(event_str);
+                let response = hyper::Response::builder()
+                    .status(403)
+                    .body(axum::body::Body::from("BLOCKED: Poison pill detected"))
+                    .unwrap();
+                return Ok(response);
+            }
+
+            // Policy scan
+            let result = {
+                let engine = state.policy_engine.read().unwrap();
+                let role_name = state.current_role.read().unwrap().clone();
+                crate::scanner::scan_content(
+                    &scan_payload,
+                    role_name.as_deref(),
+                    &engine,
+                    sevorix_core::PolicyContext::Network,
+                )
+            };
+
+            let verdict = result.verdict.as_str();
+
+            if verdict == "BLOCK" {
+                let event = serde_json::json!({
+                    "verdict": "BLOCK",
+                    "lane": "RED",
+                    "layer": "network",
+                    "payload": &scan_payload,
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "latency": start_time.elapsed().as_millis() as u64,
+                    "reason": result.log_msg,
+                    "confidence": "HIGH"
+                });
+                let event_str = event.to_string();
+                #[allow(deprecated)]
+                log_traffic_event(&state.traffic_log_path, &event_str);
+                let _ = state.tx.send(event_str);
+                let response = hyper::Response::builder()
+                    .status(403)
+                    .body(axum::body::Body::from("BLOCKED by Sevorix policy"))
+                    .unwrap();
+                return Ok(response);
+            }
+
+            // FLAG — operator intervention (HTTPS MITM path)
+            if verdict == "FLAG" {
+                let event_id = uuid::Uuid::new_v4().to_string();
+                let (decision_tx, decision_rx) = tokio::sync::oneshot::channel::<bool>();
+                let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+                state.pending_decisions.insert(
+                    event_id.clone(),
+                    crate::PendingEntry {
+                        decision_tx,
+                        pause_tx,
+                    },
+                );
+
+                let pending_event = serde_json::json!({
+                    "type": "PENDING",
+                    "event_id": event_id,
+                    "verdict": "FLAG",
+                    "lane": "YELLOW",
+                    "layer": "network",
+                    "payload": &scan_payload,
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "reason": result.log_msg,
+                    "context": "Network",
+                    "timeout_secs": state.intervention_timeout_secs,
+                    "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
+                });
+                #[allow(deprecated)]
+                log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
+                let _ = state.tx.send(pending_event.to_string());
+
+                let allowed = crate::await_decision_with_pause(
+                    decision_rx,
+                    pause_rx,
+                    state.intervention_timeout_secs,
+                    state.intervention_timeout_allow,
+                )
+                .await;
+
+                // Still in map → timeout fired (not resolved by decide_handler)
+                if state.pending_decisions.remove(&event_id).is_some() {
+                    let decided_event = serde_json::json!({
+                        "type": "DECIDED",
+                        "event_id": event_id,
+                        "action": if allowed { "allow" } else { "block" },
+                        "reason": "timeout",
+                        "timestamp": chrono::Local::now().to_rfc3339(),
+                    });
+                    let _ = state.tx.send(decided_event.to_string());
+                }
+
+                if !allowed {
+                    let elapsed = start_time.elapsed().as_millis() as u64;
+                    let block_event = serde_json::json!({
+                        "verdict": "BLOCK",
+                        "lane": "RED",
+                        "layer": "network",
+                        "payload": &scan_payload,
+                        "timestamp": chrono::Local::now().to_rfc3339(),
+                        "latency": elapsed,
+                        "reason": "Blocked by operator",
+                        "confidence": "Manual Override",
+                        "context": "Network",
+                    });
+                    let block_str = block_event.to_string();
+                    #[allow(deprecated)]
+                    log_traffic_event(&state.traffic_log_path, &block_str);
+                    let _ = state.tx.send(block_str);
+                    let response = hyper::Response::builder()
+                        .status(403)
+                        .body(axum::body::Body::from("Request blocked by operator."))
+                        .unwrap();
+                    return Ok(response);
+                }
+
+                // Operator allowed — log the allow decision and fall through to forward
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                let allow_event = serde_json::json!({
+                    "verdict": "ALLOW",
+                    "lane": "GREEN",
+                    "layer": "network",
+                    "payload": &scan_payload,
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "latency": elapsed,
+                    "reason": "Allowed by operator intervention",
+                    "confidence": "Manual Override",
+                    "context": "Network",
+                });
+                let allow_str = allow_event.to_string();
+                #[allow(deprecated)]
+                log_traffic_event(&state.traffic_log_path, &allow_str);
+                let _ = state.tx.send(allow_str);
+            } else {
+                // ALLOW — forward to upstream (non-FLAG path)
+                let event = serde_json::json!({
+                    "verdict": "ALLOW",
+                    "lane": "GREEN",
+                    "layer": "network",
+                    "payload": &scan_payload,
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "latency": start_time.elapsed().as_millis() as u64,
+                    "reason": result.log_msg,
+                    "confidence": "N/A"
+                });
+                let event_str = event.to_string();
+                #[allow(deprecated)]
+                log_traffic_event(&state.traffic_log_path, &event_str);
+                let _ = state.tx.send(event_str);
+            }
+
+            // Forward client request headers to upstream, skipping Host (reqwest sets it from URL).
+            let mut reqwest_headers = reqwest::header::HeaderMap::new();
+            for (k, v) in headers.iter() {
+                if k == hyper::header::HOST {
+                    continue;
+                }
+                if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()) {
+                    reqwest_headers.insert(name, v.clone());
+                }
+            }
+
+            let upstream_resp = state
+                .http_client
+                .request(
+                    reqwest::Method::from_bytes(method.as_str().as_bytes())
+                        .unwrap_or(reqwest::Method::GET),
+                    &full_url,
+                )
+                .headers(reqwest_headers)
+                .body(bytes.to_vec())
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Upstream request error: {e}"))?;
+
+            let status = upstream_resp.status().as_u16();
+            let resp_headers = upstream_resp.headers().clone();
+            let resp_bytes = upstream_resp
+                .bytes()
+                .await
+                .map_err(|e| anyhow::anyhow!("Upstream response read error: {e}"))?;
+
+            let mut response_builder = hyper::Response::builder().status(status);
+            for (k, v) in resp_headers.iter() {
+                response_builder = response_builder.header(k, v);
+            }
+            let response = response_builder
+                .body(axum::body::Body::from(resp_bytes))
+                .unwrap();
+
+            Ok(response)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +806,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            tls_context: None,
         })
     }
 
@@ -503,6 +853,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            tls_context: None,
         })
     }
 
@@ -630,5 +981,26 @@ mod tests {
         let hint = body.size_hint();
         assert_eq!(hint.lower(), 0);
         assert_eq!(hint.upper(), None);
+    }
+
+    #[test]
+    fn test_is_valid_mitm_hostname_valid() {
+        assert!(is_valid_mitm_hostname("example.com"));
+        assert!(is_valid_mitm_hostname("api.example.com"));
+        assert!(is_valid_mitm_hostname("my-host.example.co.uk"));
+        assert!(is_valid_mitm_hostname("localhost"));
+        assert!(is_valid_mitm_hostname("127.0.0.1"));
+        assert!(is_valid_mitm_hostname("::1"));
+    }
+
+    #[test]
+    fn test_is_valid_mitm_hostname_invalid() {
+        assert!(!is_valid_mitm_hostname(""));
+        assert!(!is_valid_mitm_hostname("../../../../etc"));
+        assert!(!is_valid_mitm_hostname("-bad.example.com"));
+        assert!(!is_valid_mitm_hostname("bad-.example.com"));
+        assert!(!is_valid_mitm_hostname("has space.com"));
+        assert!(!is_valid_mitm_hostname("has/slash.com"));
+        assert!(!is_valid_mitm_hostname(&"a".repeat(254)));
     }
 }

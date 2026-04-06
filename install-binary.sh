@@ -286,6 +286,49 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     echo "   export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
+# ---------------------------------------------------------------
+# TLS MITM CA certificate trust setup
+# ---------------------------------------------------------------
+setup_mitm_ca() {
+    local ca_cert="$HOME/.sevorix/ca/ca.crt"
+
+    echo ""
+    echo "=== TLS MITM Certificate Setup ==="
+
+    if [ ! -f "$ca_cert" ]; then
+        echo "  CA cert not yet generated."
+        echo "  Enable TLS MITM by adding to ~/.sevorix/settings.json:"
+        echo '    { "tls_mitm": { "enabled": true } }'
+        echo "  Then start Sevorix — the CA cert will be generated automatically."
+        echo "  Re-run this installer after first start to trust it."
+        return
+    fi
+
+    echo "  CA cert found at: $ca_cert"
+
+    # Try to install into system trust store
+    if command -v update-ca-certificates &>/dev/null; then
+        sudo cp "$ca_cert" /usr/local/share/ca-certificates/sevorix-mitm.crt
+        sudo update-ca-certificates
+        echo "  ✓ CA cert installed into system trust store (update-ca-certificates)"
+    elif command -v trust &>/dev/null; then
+        sudo trust anchor --store "$ca_cert"
+        echo "  ✓ CA cert installed via 'trust anchor'"
+    else
+        echo "  Could not detect system trust store. Manually install:"
+        echo "    sudo cp $ca_cert /usr/local/share/ca-certificates/sevorix-mitm.crt"
+        echo "    sudo update-ca-certificates"
+    fi
+
+    # Claude Code guidance
+    echo ""
+    echo "  For Claude Code HTTPS inspection, add to your shell profile (~/.bashrc or ~/.zshrc):"
+    echo "    export NODE_EXTRA_CA_CERTS=\"$ca_cert\""
+    echo ""
+}
+
+setup_mitm_ca
+
 echo ""
 echo "✅ Installation complete!"
 echo "   Run 'sevorix start' to launch the daemon."

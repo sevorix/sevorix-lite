@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "sevorix_watchtower"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "AGPL-3.0-only"
 
@@ -44,6 +44,14 @@ rpassword = "7.3"
 url = "2.5"
 dialoguer = "0.11"
 which = "6.0"
+
+# TLS MITM dependencies
+rcgen              = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls             = "0.23"
+tokio-rustls       = "0.26"
+rustls-pemfile     = "2"
+rustls-native-certs = "0.7"
+time               = "0.3"
 
 # eBPF dependencies (optional, for ebpf feature)
 aya = { version = "0.13", optional = true }
