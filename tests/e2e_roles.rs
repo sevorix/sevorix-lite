@@ -33,6 +33,7 @@ async fn test_5_1_role_with_subset_of_policies() {
         action: Action::Block,
         context: PolicyContext::Shell,
         kill: false,
+        syscall: vec![],
     });
     h.add_policy_direct(Policy {
         id: "block-b".to_string(),
@@ -40,6 +41,7 @@ async fn test_5_1_role_with_subset_of_policies() {
         action: Action::Block,
         context: PolicyContext::Shell,
         kill: false,
+        syscall: vec![],
     });
     h.add_policy_direct(Policy {
         id: "block-c".to_string(),
@@ -47,6 +49,7 @@ async fn test_5_1_role_with_subset_of_policies() {
         action: Action::Block,
         context: PolicyContext::Shell,
         kill: false,
+        syscall: vec![],
     });
 
     // "limited" role only includes block-a and block-b, NOT block-c.
@@ -93,6 +96,7 @@ async fn test_5_2_unknown_role_fails_closed() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
 
     // scan_content fails closed: role not in engine → BLOCK (not ALLOW).
@@ -130,6 +134,7 @@ async fn test_5_6_session_set_role_updates_role() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "admin".to_string(),
@@ -186,6 +191,7 @@ async fn test_5_7_session_set_role_rejects_unknown() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "admin".to_string(),

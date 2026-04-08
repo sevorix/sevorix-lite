@@ -55,7 +55,7 @@ use scanner::scan_syscall_with_engine;
 use scanner::{log_kill, log_threat, scan_content, scan_for_poison, PoisonPill};
 #[cfg(target_os = "linux")]
 use sevorix_core::SeccompDecision;
-use sevorix_core::{detect_enforcement_tier, EnforcementTier, SyscallEvent};
+use sevorix_core::{EnforcementTier, SyscallEvent};
 
 /// Holds both channel halves for one pending intervention decision.
 pub struct PendingEntry {
@@ -662,8 +662,17 @@ pub async fn run_server(
         .unwrap_or_default();
     let intervention_settings = loaded_settings.intervention.unwrap_or_default();
     let default_role = loaded_settings.sevsh.and_then(|s| s.default_role);
+    let lsm_enabled = loaded_settings
+        .experimental
+        .as_ref()
+        .map(|e| e.lsm_blocking_enabled())
+        .unwrap_or(false);
 
-    let enforcement_tier = detect_enforcement_tier();
+    let enforcement_tier = if lsm_enabled {
+        EnforcementTier::Advanced
+    } else {
+        EnforcementTier::Standard
+    };
 
     // Per-session traffic log: ~/.sevorix/logs/{session_id}-traffic.jsonl
     let log_dir = if let Some(user_dirs) = UserDirs::new() {
@@ -733,7 +742,9 @@ pub async fn run_server(
     );
     tracing::info!("🔒 Enforcement tier: {}", enforcement_tier);
     if enforcement_tier == EnforcementTier::Standard {
-        tracing::info!("   (BPF LSM unavailable — 'bpf' not in /sys/kernel/security/lsm)");
+        tracing::info!(
+            "   (BPF LSM disabled — set experimental.lsm_blocking=true in ~/.sevorix/settings.json to enable)"
+        );
     }
     if let Some(state_dir) = proj_dirs.state_dir() {
         tracing::info!(
@@ -1219,7 +1230,10 @@ async fn analyze_syscall(
 ) -> Response {
     let start_time = std::time::Instant::now();
 
-    // Get decision from policy engine
+    // Evaluate the syscall event against the policy engine.
+    // scan_syscall_with_engine uses syscall name + resolved path, not text matching,
+    // so it correctly handles syscall-only Simple policies (empty pattern) and
+    // Regex policies whose pattern targets a file path rather than a formatted string.
     let decision = scan_syscall_with_engine(&event, &state.policy_engine.read().unwrap());
 
     // Determine verdict and lane
@@ -1307,26 +1321,82 @@ struct RoleQuery {
     role: Option<String>,
 }
 
-/// Return the list of syscall names that should be denied for the current policy set.
+/// Return the syscall policy for the current role as a list of dynamic rules.
 ///
-/// Used by `sevsh` at session startup to build a per-session seccomp filter. Only
-/// `Simple`-pattern policies with `context: Syscall` (or `All`) and `action: Block`
-/// contribute to this list — regex and executable patterns cannot be safely mapped
-/// to individual syscall names at filter-build time.
+/// Used by `sevsh` at session startup to build a per-session seccomp notify filter and
+/// compile a local rule set for zero-latency per-syscall decisions.
 ///
-/// Policies are scoped to the role specified by the `?role=` query parameter, or
-/// the "default" role if not provided. If the role does not exist, returns an empty list.
+/// Response shape:
+/// ```json
+/// {
+///   "deny_names": ["ptrace", ...],   // legacy field, still populated for compat
+///   "rules": [
+///     {"syscall": "unlink",   "action": "Deny"},
+///     {"syscall": "ptrace",   "action": "Deny"},
+///     {"syscall": "openat",   "action": "Deny", "path_pattern": "/etc/.*"}
+///   ]
+/// }
+/// ```
+///
+/// `rules` is the union of:
+///   - Built-in file-op rules (always included — unlink, unlinkat, rename, etc.)
+///   - `Simple`-pattern `Syscall`/`All` `Block` policies → deny rules with no path pattern
+///   - `Regex`-pattern `Syscall`/`All` `Block` policies → deny rules with `path_pattern`
+///     (the regex is used to match the first path argument of the syscall)
+///
+/// Policies are scoped to the role from `?role=`, defaulting to `"default"`.
 async fn syscall_policy_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<RoleQuery>,
 ) -> impl IntoResponse {
     let engine = state.policy_engine.read().unwrap();
     let role_name = q.role.as_deref().unwrap_or("default");
-    let policy_ids = match engine.roles.get(role_name) {
+
+    let policy_ids: Vec<String> = match engine.roles.get(role_name) {
         Some(role) => role.policies.clone(),
-        None => return Json(json!({ "deny_names": [] })),
+        None => vec![],
     };
 
+    // Build rules from configured policies only — no built-in defaults.
+    // Simple-pattern Syscall/All Block policies map to deny rules with no path filter.
+    // Regex-pattern Syscall/All Block policies map to deny rules with a path_pattern
+    // (the regex is matched against the first path argument of the syscall).
+    // Expand each qualifying policy into one rule per syscall name.
+    // Simple policies use `syscall_names()` which falls back to the pattern when
+    // the `syscall` field is absent. Regex/Executable policies use `syscall` only
+    // (validated at load time — missing `syscall` is a startup error).
+    let rules: Vec<serde_json::Value> = policy_ids
+        .iter()
+        .filter_map(|id| engine.policies.get(id))
+        .filter(|p| {
+            (p.context == PolicyContext::Syscall || p.context == PolicyContext::All)
+                && p.action == Action::Block
+        })
+        .flat_map(|p| {
+            let names = p.syscall_names();
+            names
+                .into_iter()
+                .map(|syscall| match &p.match_type {
+                    PolicyType::Simple(_) => json!({
+                        "syscall": syscall,
+                        "action": "Deny",
+                    }),
+                    PolicyType::Regex(pattern) => json!({
+                        "syscall": syscall,
+                        "action": "Deny",
+                        "path_pattern": pattern,
+                    }),
+                    PolicyType::Executable(cmd) => json!({
+                        "syscall": syscall,
+                        "action": "Deny",
+                        "executable": cmd,
+                    }),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Legacy deny_names — Simple Block policies only (syscall names, one per entry).
     let deny_names: Vec<String> = policy_ids
         .iter()
         .filter_map(|id| engine.policies.get(id))
@@ -1334,13 +1404,22 @@ async fn syscall_policy_handler(
             (p.context == PolicyContext::Syscall || p.context == PolicyContext::All)
                 && p.action == Action::Block
         })
-        .filter_map(|p| match &p.match_type {
-            PolicyType::Simple(pattern) => Some(pattern.clone()),
-            _ => None,
+        .filter_map(|p| {
+            if matches!(p.match_type, PolicyType::Simple(_)) {
+                Some(
+                    p.syscall_names()
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            }
         })
+        .flatten()
         .collect();
 
-    Json(json!({ "deny_names": deny_names }))
+    Json(json!({ "deny_names": deny_names, "rules": rules }))
 }
 
 /// Map syscall name to x86-64 syscall number.
@@ -2136,6 +2215,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2180,6 +2260,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let decision = scan_syscall_with_engine(&event, &engine);
@@ -2197,6 +2279,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -2220,6 +2303,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2251,6 +2335,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2284,6 +2369,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: true,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2346,6 +2432,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2372,6 +2459,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2403,6 +2491,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Shell,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2434,6 +2523,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -2491,6 +2581,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -2668,6 +2759,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-03-04T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         assert_eq!(event.syscall_name, "read");

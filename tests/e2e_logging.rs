@@ -16,6 +16,7 @@ async fn harness_with_policies() -> TestHarness {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),

@@ -51,14 +51,15 @@ You are operating as a **Sevorix Policy Manager**. Your role is to author, valid
 }
 ```
 
-| Field     | Type    | Description |
-|-----------|---------|-------------|
-| `id`      | string  | Unique identifier (kebab-case recommended) |
-| `type`    | enum    | `Simple`, `Regex`, or `Executable` |
-| `pattern` | string  | The match pattern (see match types below) |
-| `action`  | enum    | `Block`, `Flag`, or `Allow` |
-| `context` | enum    | `Shell`, `Network`, `Syscall`, or `All` (default: `All`) |
-| `kill`    | bool    | If true, kill the traced process instead of returning EPERM. Use only for critical violations. |
+| Field     | Type             | Description |
+|-----------|------------------|-------------|
+| `id`      | string           | Unique identifier (kebab-case recommended) |
+| `type`    | enum             | `Simple`, `Regex`, or `Executable` |
+| `pattern` | string           | The match pattern (see match types below) |
+| `action`  | enum             | `Block`, `Flag`, or `Allow` |
+| `context` | enum             | `Shell`, `Network`, `Syscall`, or `All` (default: `All`) |
+| `kill`    | bool             | If true, kill the traced process instead of returning EPERM. Use only for critical violations. |
+| `syscall` | string \| array  | *(Syscall context only)* Syscall name(s) to intercept. Required for `Regex`/`Executable`; optional for `Simple`. See **Syscall Policies** below. |
 
 ### Match Types
 
@@ -94,10 +95,107 @@ Scope policies to specific interception layers:
 |-----------|-----------------|
 | `Shell`   | Agent shell commands intercepted via seccomp/PTY |
 | `Network` | Outbound HTTP requests through the proxy |
-| `Syscall` | Low-level syscall interception (eBPF feature) |
+| `Syscall` | Low-level syscall interception via seccomp-unotify (Linux/sevsh only) |
 | `All`     | All contexts (default) |
 
 Use `context` to avoid false positives — e.g., a policy blocking `DELETE` should use `context: "Network"` if you only want to block HTTP DELETE methods, not shell `delete` commands.
+
+### Syscall Policies (`context: "Syscall"`)
+
+Syscall policies intercept raw kernel calls from within a `sevsh` process tree using seccomp-unotify. The process is suspended mid-syscall until the policy engine returns a decision.
+
+#### The `syscall` field
+
+The `syscall` field names which syscall(s) to intercept. Its meaning differs by match type:
+
+| Match type    | `syscall` field | Behavior |
+|---------------|-----------------|----------|
+| `Simple`      | Optional        | If absent, `pattern` is the syscall name. If set, the named syscall(s) are intercepted and always blocked. |
+| `Regex`       | **Required**    | The regex is matched against the first path argument of the syscall. |
+| `Executable`  | **Required**    | The external command receives JSON syscall info on stdin; exit 0 = block. |
+
+> **Startup fails** if a `Regex` or `Executable` policy has `context: "Syscall"` but no `syscall` field.
+
+`syscall` accepts a single name or an array:
+```json
+{ "syscall": "unlink" }
+{ "syscall": ["unlink", "unlinkat", "rmdir"] }
+```
+
+#### Examples
+
+Block all file deletion (`rm` uses `unlinkat` on modern Linux, not `unlink` — always cover both):
+```json
+{
+  "id": "block-file-deletion",
+  "type": "Simple",
+  "action": "Block",
+  "context": "Syscall",
+  "syscall": ["unlink", "unlinkat", "rmdir"]
+}
+```
+
+> **Important:** On modern Linux, `rm` calls `unlinkat` (syscall 263), not `unlink` (syscall 87).
+> A policy with `"pattern": "unlink"` alone will NOT block `rm`. Always include both
+> `"unlink"` and `"unlinkat"` when you want to block file deletion.
+
+Block deletion and renaming of files under `/etc/`:
+```json
+{
+  "id": "protect-etc",
+  "type": "Regex",
+  "pattern": "^/etc/",
+  "action": "Block",
+  "context": "Syscall",
+  "syscall": ["unlink", "unlinkat", "rename", "renameat", "renameat2"]
+}
+```
+
+> **Important:** On modern Linux, `mv` calls `renameat2` (syscall 316), not `rename` (82) or `renameat` (264).
+> Omitting `"renameat2"` from the syscall list means `mv /etc/foo /etc/bar` will not be intercepted —
+> the kernel will fall through to its own permission check (EACCES) instead of returning EPERM.
+> Always include all three rename variants when protecting a path from being moved.
+
+Delegate to a custom checker binary (receives JSON on stdin, exit 0 = block):
+```json
+{
+  "id": "custom-unlink-check",
+  "type": "Executable",
+  "pattern": "/usr/local/bin/my-checker",
+  "action": "Block",
+  "context": "Syscall",
+  "syscall": "unlink"
+}
+```
+
+> **Security warning — `path` field is attacker-controlled**
+>
+> The `path` field in the stdin JSON is read directly from the supervised process's memory (the
+> filename the process passed to `unlink`, `rename`, etc.). The supervised process controls this
+> string and can craft it to contain shell metacharacters or injection payloads (e.g. a filename
+> like `$(rm -rf ~)`).
+>
+> **serde_json serialises the string safely**, but if your checker binary processes the JSON in a
+> shell context the injected payload will execute there. For example:
+>
+> ```sh
+> # UNSAFE — do not do this
+> path=$(echo "$INPUT" | jq -r .path)
+> rm $path   # injectable: path may contain shell metacharacters
+> ```
+>
+> Safe alternatives:
+> - Use `jq -r .path` piped to a script that references the variable with proper quoting:
+>   `path=$(jq -r .path); rm -- "$path"`
+> - Write the checker in a real language (Python, Go, Rust) and parse the JSON programmatically
+>   without ever interpolating `path` into a shell string.
+
+#### Limitations
+
+- Only applies within a `sevsh` session. Processes not spawned via `sevsh` are not covered.
+- The seccomp filter is installed at session start and cannot change mid-session — new policies take effect in new sessions only.
+- `Flag` is treated as `Block` for syscall policies (no mechanism to pause a suspended syscall for human review).
+- `Executable` rules spawn a subprocess per intercepted syscall; the traced process stays suspended for the duration. Use only when `Simple`/`Regex` cannot express the required logic.
 
 ### Role Schema
 

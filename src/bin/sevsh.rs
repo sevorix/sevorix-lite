@@ -1040,14 +1040,14 @@ async fn handle_bash_invocation(
             command.env(key, value);
         }
 
-        // On Linux: fetch the syscall deny list and apply a per-child seccomp filter
+        // On Linux: fetch the syscall policy and apply a per-child seccomp notify filter
         // for synchronous kernel-level enforcement. On macOS seccomp is unavailable
         // so we skip the fetch and go straight to command execution.
         #[cfg(target_os = "linux")]
-        let deny_names: Vec<String> = fetch_syscall_deny_list().await;
+        let (rule_set, session_role) = fetch_syscall_policy().await;
 
         #[cfg(target_os = "linux")]
-        let status = if !deny_names.is_empty() {
+        let status = if !rule_set.is_empty() {
             // Create a pipe so the child's pre_exec can pass the seccomp notify_fd
             // number back to us. Both ends inherit across fork; O_CLOEXEC closes them
             // on exec (after the pre_exec write is already done).
@@ -1057,12 +1057,13 @@ async fn handle_bash_invocation(
             if pipe_ok {
                 let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
 
-                // SAFETY: pre_exec runs after fork, before exec. deny_names is
+                // SAFETY: pre_exec runs after fork, before exec. syscall_names is
                 // moved into the closure. We use only async-signal-safe primitives.
+                let syscall_names = rule_set.syscall_names.clone();
                 unsafe {
                     command.pre_exec(move || {
                         libc::close(pipe_read); // child doesn't need read end
-                        match apply_syscall_notify_filter(&deny_names) {
+                        match apply_syscall_notify_filter(&syscall_names) {
                             Ok(notify_fd) => {
                                 let bytes = notify_fd.to_ne_bytes();
                                 libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
@@ -1075,7 +1076,7 @@ async fn handle_bash_invocation(
                                 let bytes = (-1i32).to_ne_bytes();
                                 libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
                                 libc::close(pipe_write);
-                                apply_syscall_deny_filter(&deny_names).map_err(|e| {
+                                apply_syscall_deny_filter(&syscall_names).map_err(|e| {
                                     std::io::Error::other(format!("seccomp fallback: {}", e))
                                 })
                             }
@@ -1137,34 +1138,53 @@ async fn handle_bash_invocation(
                         };
 
                         if parent_notify_fd >= 0 {
-                            // Spawn a blocking supervisor: intercepts each denied syscall,
-                            // reports it to Watchtower via /analyze-syscall (same path as
-                            // eBPF events), then responds to the kernel with EPERM.
+                            // Spawn a blocking supervisor: evaluates each intercepted syscall
+                            // locally against the compiled rule set (zero-latency, no HTTP),
+                            // then responds to the kernel. Denied syscalls are logged to
+                            // Watchtower asynchronously on a fire-and-forget thread.
+                            let log_url = proxy_url().to_string();
                             tokio::task::spawn_blocking(move || {
-                                let client = reqwest::blocking::Client::builder()
-                                    .timeout(std::time::Duration::from_millis(500))
-                                    .build()
-                                    .unwrap_or_default();
                                 run_seccomp_notify_supervisor(
                                     parent_notify_fd,
-                                    |info: &SyscallInfo| {
-                                        let name = sevorix_core::syscall_name(info.syscall_nr);
-                                        let args: Vec<String> = info
-                                            .args
-                                            .iter()
-                                            .map(|a| format!("0x{:x}", a))
-                                            .collect();
-                                        let _ = client
-                                            .post(format!("{}/analyze-syscall", proxy_url()))
-                                            .json(&serde_json::json!({
+                                    |info: &SyscallInfo| -> bool {
+                                        let allow = rule_set.evaluate(info);
+                                        if !allow {
+                                            // Resolve the path NOW while the process is still
+                                            // suspended by seccomp-unotify. After we return,
+                                            // the pointer in args is no longer valid.
+                                            let path = sevorix_core::resolve_syscall_path(info);
+                                            let name = sevorix_core::syscall_name(info.syscall_nr);
+                                            let args: Vec<String> = info
+                                                .args
+                                                .iter()
+                                                .map(|a| format!("0x{:x}", a))
+                                                .collect();
+                                            let payload = serde_json::json!({
                                                 "syscall_name": name,
                                                 "syscall_number": info.syscall_nr,
                                                 "args": args,
                                                 "pid": info.pid,
                                                 "ppid": 0u32,
                                                 "timestamp": chrono::Local::now().to_rfc3339(),
-                                            }))
-                                            .send();
+                                                "path": path,
+                                                "role": session_role,
+                                            });
+                                            // Log synchronously — we're already in spawn_blocking,
+                                            // and the child is about to receive EPERM and exit,
+                                            // so the added latency is acceptable. A fire-and-forget
+                                            // thread would be killed when sevsh exits before the
+                                            // HTTP call completes.
+                                            if let Ok(client) = reqwest::blocking::Client::builder()
+                                                .timeout(std::time::Duration::from_millis(50))
+                                                .build()
+                                            {
+                                                let _ = client
+                                                    .post(format!("{}/analyze-syscall", &log_url))
+                                                    .json(&payload)
+                                                    .send();
+                                            }
+                                        }
+                                        allow
                                     },
                                 );
                             });
@@ -1185,9 +1205,10 @@ async fn handle_bash_invocation(
                 child.wait()?
             } else {
                 // Pipe creation failed; fall back to EPERM-only filter (no logging).
+                let fallback_names = rule_set.syscall_names.clone();
                 unsafe {
                     command.pre_exec(move || {
-                        apply_syscall_deny_filter(&deny_names).map_err(|e| {
+                        apply_syscall_deny_filter(&fallback_names).map_err(|e| {
                             std::io::Error::other(format!("seccomp filter failed: {}", e))
                         })
                     });
@@ -1289,28 +1310,40 @@ fn real_shell() -> String {
         .unwrap_or_else(|_| "/usr/bin/bash".to_string())
 }
 
-/// Fetch the list of syscall names to deny from Watchtower's /syscall-policy endpoint.
-/// Returns an empty list on any error (non-fatal: enforcement degrades gracefully).
+/// Fetch the syscall policy from Watchtower and compile it into a local rule set.
+///
+/// Returns the compiled rule set together with the role name that was used for the
+/// policy fetch. The role is read from `settings.json` (`sevsh.default_role`) and
+/// defaults to `"default"` if unset. Both values are needed so that blocked-syscall
+/// events posted to `/analyze-syscall` carry the correct role.
+///
+/// Falls back to an empty rule set on any error (non-fatal: enforcement degrades
+/// gracefully to the eBPF tracepoint observe-only path).
 #[cfg(target_os = "linux")]
-async fn fetch_syscall_deny_list() -> Vec<String> {
+async fn fetch_syscall_policy() -> (sevorix_core::CompiledRuleSet, String) {
+    use sevorix_core::{CompiledRuleSet, SyscallRule};
+    let role = sevorix_watchtower::settings::Settings::load()
+        .sevsh
+        .and_then(|s| s.default_role)
+        .unwrap_or_else(|| "default".to_string());
     let client = reqwest::Client::new();
-    let url = format!("{}/syscall-policy", proxy_url());
+    let url = format!("{}/syscall-policy?role={}", proxy_url(), role);
     match client.get(&url).send().await {
-        Ok(resp) => resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| v["deny_names"].as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|n| n.as_str().map(str::to_string))
-            .collect(),
+        Ok(resp) => {
+            let rules: Vec<SyscallRule> = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| serde_json::from_value(v["rules"].clone()).ok())
+                .unwrap_or_default();
+            (CompiledRuleSet::from_rules(rules), role)
+        }
         Err(e) => {
             eprintln!(
                 "[SEVSH] Warning: Could not fetch syscall policy: {}. Seccomp filter not applied.",
                 e
             );
-            vec![]
+            (CompiledRuleSet::from_rules(vec![]), role)
         }
     }
 }

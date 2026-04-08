@@ -18,6 +18,7 @@ async fn harness_with_block_policy() -> TestHarness {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),
@@ -88,6 +89,7 @@ async fn test_6_3_pending_event_broadcast_on_flag() {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),
@@ -155,6 +157,7 @@ async fn test_6_4_decided_event_broadcast_after_decision() {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),

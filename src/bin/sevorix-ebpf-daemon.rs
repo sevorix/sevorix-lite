@@ -51,7 +51,7 @@ mod ebpf_impl {
     use aya::programs::lsm::LsmLink;
     use aya::programs::{CgroupAttachMode, Lsm, SockOps, TracePoint};
     use aya::{Btf, Ebpf};
-    use sevorix_core::{detect_enforcement_tier, EnforcementTier};
+    use sevorix_core::EnforcementTier;
     use sevorix_ebpf_common::{NetworkEvent, NetworkKey, PolicyKey, SyscallEvent};
     use tokio::sync::{broadcast, Mutex};
     use tracing::{error, info, warn};
@@ -1024,10 +1024,20 @@ mod ebpf_impl {
             .block_on(async {
                 info!("Sevorix eBPF Daemon starting...");
 
-                let tier = detect_enforcement_tier();
+                let settings = sevorix_watchtower::settings::Settings::load();
+                let tier = if settings
+                    .experimental
+                    .as_ref()
+                    .map(|e| e.lsm_blocking_enabled())
+                    .unwrap_or(false)
+                {
+                    EnforcementTier::Advanced
+                } else {
+                    EnforcementTier::Standard
+                };
                 info!("Enforcement tier: {}", tier);
                 if tier == EnforcementTier::Standard {
-                    info!("  (BPF LSM unavailable — 'bpf' not in /sys/kernel/security/lsm)");
+                    info!("  (BPF LSM disabled — set experimental.lsm_blocking=true in ~/.sevorix/settings.json to enable)");
                 }
 
                 let config = DaemonConfig::default();

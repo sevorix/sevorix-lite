@@ -47,10 +47,15 @@
                 edition: 'pro',
                 search: '',
                 filters: { shell: true, syscall: true, network: true },
+                showBlockedOnly: false,
                 _searchDebounce: null,
 
                 get displayEvents() {
-                    return this.activeTab === 'live' ? this.liveEvents : this.historyEvents;
+                    const events = this.activeTab === 'live' ? this.liveEvents : this.historyEvents;
+                    if (this.showBlockedOnly) {
+                        return events.filter(e => e.lane === 'RED' || e.verdict === 'BLOCK');
+                    }
+                    return events;
                 },
 
                 // ── Live helpers ────────────────────────────────────────────
@@ -124,6 +129,7 @@
                         params.set('layer', activeLayers);
                     }
                     if (this.search.trim()) params.set('search', this.search.trim());
+                    if (this.showBlockedOnly) params.set('lane', 'RED');
                     if (this.selectedSession) params.set('session', this.selectedSession);
 
                     fetch('/api/events?' + params)
@@ -464,6 +470,15 @@
                     <label class="flex items-center gap-1.5 cursor-pointer select-none">
                         <input type="checkbox" x-model="filters.network" @change="onFilterChange()" class="accent-yellow-500" />
                         <span class="text-yellow-400 font-semibold uppercase tracking-wide">Network</span>
+                    </label>
+                    <span class="text-slate-700 select-none">|</span>
+                    <label class="flex items-center gap-1.5 cursor-pointer select-none"
+                           title="Show only BLOCK (RED lane) events">
+                        <input type="checkbox" x-model="showBlockedOnly"
+                               @change="onFilterChange()"
+                               class="accent-red-500" />
+                        <span class="font-semibold uppercase tracking-wide"
+                              :class="showBlockedOnly ? 'text-red-400' : 'text-slate-400'">Blocked Only</span>
                     </label>
                 </div>
                 <span x-show="historyLoading" class="text-xs text-slate-500 animate-pulse">Loading…</span>

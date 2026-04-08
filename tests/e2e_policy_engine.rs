@@ -43,6 +43,7 @@ async fn test_4_1_simple_match_case_sensitive() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     })
     .await;
 
@@ -69,6 +70,7 @@ async fn test_4_2_regex_match() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     })
     .await;
 
@@ -98,6 +100,7 @@ async fn test_4_3_executable_match() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     })
     .await;
 
@@ -124,6 +127,7 @@ async fn test_4_4_invalid_regex_graceful() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     })
     .await;
 
@@ -158,6 +162,7 @@ async fn test_4_5_block_takes_precedence_over_flag() {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     };
     let block_policy = Policy {
         id: "block-both".to_string(),
@@ -165,6 +170,7 @@ async fn test_4_5_block_takes_precedence_over_flag() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     };
 
     h.add_policy_direct(flag_policy);
@@ -196,6 +202,7 @@ async fn test_4_6_kill_flag_in_policy() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: true,
+        syscall: vec![],
     })
     .await;
 

@@ -350,6 +350,7 @@ async fn test_mitm_https_post_drop_table_blocked() {
             action: Action::Block,
             context: PolicyContext::Network,
             kill: false,
+            syscall: vec![],
         });
         // Attach the policy to the role.
         engine.add_role(Role {

@@ -16,6 +16,7 @@ fn test_integration_policy_workflow() {
         action: Action::Block,
         context: PolicyContext::Shell, // Only for Shell? or All? Let's say Shell
         kill: false,
+        syscall: vec![],
     };
     engine.add_policy(block_sql);
 
@@ -25,6 +26,7 @@ fn test_integration_policy_workflow() {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     };
     engine.add_policy(flag_sensitive);
 

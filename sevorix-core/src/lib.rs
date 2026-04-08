@@ -29,6 +29,9 @@ pub use pty_multiplexer::{
 };
 
 #[cfg(target_os = "linux")]
+pub use seccomp::resolve_syscall_path;
+
+#[cfg(target_os = "linux")]
 pub use pty::{
     run_pty_shell_with_callback, spawn_pty_shell_with_seccomp, PtyError, PtyShellHandle,
     PtySyscallEvent,
@@ -38,8 +41,8 @@ pub use seccomp::{
     apply_syscall_deny_filter, apply_syscall_notify_filter, extract_args_from_seccomp,
     kernel_supports_seccomp_notify, run_seccomp_notify_supervisor, spawn_seccomp_shell,
     spawn_seccomp_shell_with_handler, syscall_event_from_request, syscall_name, AllowAllHandler,
-    CallbackPolicyHandler, SeccompDecision, SeccompNotifier, SeccompNotifierError,
-    SeccompPolicyHandler, SyscallCategory, SyscallInfo,
+    CallbackPolicyHandler, CompiledRuleSet, SeccompDecision, SeccompNotifier, SeccompNotifierError,
+    SeccompPolicyHandler, SyscallCategory, SyscallInfo, SyscallRule, SyscallRuleAction,
 };
 
 /// **DEPRECATED**: The `tracer` module is deprecated in favor of `seccomp-unotify`.
@@ -61,12 +64,41 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "pattern")]
 pub enum PolicyType {
     Simple(String),
     Regex(String),
     Executable(String),
+}
+
+impl<'de> serde::Deserialize<'de> for PolicyType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Helper {
+            #[serde(rename = "type")]
+            type_: String,
+            pattern: Option<String>,
+        }
+        let h = Helper::deserialize(deserializer)?;
+        match h.type_.as_str() {
+            "Simple" => Ok(PolicyType::Simple(h.pattern.unwrap_or_default())),
+            "Regex" => {
+                Ok(PolicyType::Regex(h.pattern.ok_or_else(|| {
+                    serde::de::Error::missing_field("pattern")
+                })?))
+            }
+            "Executable" => {
+                Ok(PolicyType::Executable(h.pattern.ok_or_else(|| {
+                    serde::de::Error::missing_field("pattern")
+                })?))
+            }
+            v => Err(serde::de::Error::unknown_variant(
+                v,
+                &["Simple", "Regex", "Executable"],
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +132,16 @@ pub struct SyscallEvent {
     pub ppid: u32,
     /// Timestamp of the event (ISO 8601 format)
     pub timestamp: String,
+    /// Resolved path argument for the syscall (e.g. the file being unlinked/renamed).
+    /// Populated by sevsh while the supervised process is still suspended by seccomp-unotify,
+    /// so the path pointer in `args` is still valid. Absent for eBPF-sourced events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The policy role that was active when this event was captured.
+    /// Set by sevsh from the session's configured role; absent for eBPF-sourced events
+    /// and legacy callers. Falls back to "default" when evaluating policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,12 +156,135 @@ pub struct Policy {
     /// Use for critical violations where EPERM return isn't sufficient.
     #[serde(default)]
     pub kill: bool,
+    /// For `Syscall`-context policies: the syscall(s) this policy applies to.
+    ///
+    /// Accepts a single name (`"unlink"`) or an array (`["unlink", "unlinkat"]`).
+    ///
+    /// - **`Simple`** — optional. If set, these names are used as the syscall(s) to
+    ///   intercept instead of `pattern`. If absent, `pattern` is used as the syscall name.
+    /// - **`Regex` / `Executable`** — **required** when `context` is `Syscall`. Sevorix
+    ///   cannot know which syscall to intercept from a path regex or command path alone.
+    ///   Startup will fail if this field is absent on a Regex/Executable policy with
+    ///   `context: "Syscall"`.
+    ///
+    /// Has no effect on `Shell` or `Network` context policies.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_syscall_field"
+    )]
+    pub syscall: Vec<String>,
+}
+
+/// Custom deserializer: accepts `"unlink"` (single string) or
+/// `["unlink", "unlinkat"]` (array) for the `syscall` field.
+fn deserialize_syscall_field<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) => Ok(v),
+    }
 }
 
 impl Policy {
+    /// Return the syscall name(s) this policy should intercept.
+    ///
+    /// For `Simple` policies: returns `syscall` if non-empty, otherwise returns
+    /// the `pattern` field wrapped in a single-element slice.
+    /// For `Regex`/`Executable` policies: returns `syscall` (may be empty if misconfigured).
+    pub fn syscall_names(&self) -> Vec<&str> {
+        if !self.syscall.is_empty() {
+            return self.syscall.iter().map(|s| s.as_str()).collect();
+        }
+        // Simple policies can fall back to pattern as the syscall name
+        if let PolicyType::Simple(pattern) = &self.match_type {
+            return vec![pattern.as_str()];
+        }
+        vec![]
+    }
+
+    /// Validate that this policy is correctly configured.
+    ///
+    /// Returns `Err` with a descriptive message if:
+    /// - A `Regex` or `Executable` policy has `context: Syscall` but no `syscall` field.
+    ///
+    /// Emits `tracing::warn!` (but does NOT return `Err`) if:
+    /// - A `Regex` or `Executable` policy has `context: All` but no `syscall` field — it will
+    ///   not intercept any syscalls in that path.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.context == PolicyContext::Syscall {
+            match &self.match_type {
+                PolicyType::Regex(_) | PolicyType::Executable(_) if self.syscall.is_empty() => {
+                    return Err(format!(
+                        "Policy '{}' has type {:?} with context Syscall but no 'syscall' field. \
+                         Sevorix cannot determine which syscall to intercept. \
+                         Add a 'syscall' field (e.g. \"syscall\": \"unlinkat\") or \
+                         use an array for multiple syscalls.",
+                        self.id,
+                        match &self.match_type {
+                            PolicyType::Regex(_) => "Regex",
+                            PolicyType::Executable(_) => "Executable",
+                            PolicyType::Simple(_) => unreachable!(),
+                        }
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if self.context == PolicyContext::All && self.syscall.is_empty() {
+            match &self.match_type {
+                PolicyType::Regex(_) | PolicyType::Executable(_) => {
+                    tracing::warn!(
+                        "Policy '{}' has type {} with context All but no 'syscall' field — \
+                         it will not intercept any syscalls. Add a 'syscall' field or change \
+                         context to Shell/Network if syscall interception is not intended.",
+                        self.id,
+                        match &self.match_type {
+                            PolicyType::Regex(_) => "Regex",
+                            PolicyType::Executable(_) => "Executable",
+                            PolicyType::Simple(_) => unreachable!(),
+                        }
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit warnings for policy configurations that are likely mistakes but not hard errors.
+    ///
+    /// Currently warns when a `Simple` policy with no `syscall` field has a `pattern` that
+    /// does not look like a valid syscall name (contains spaces or is longer than 20 characters),
+    /// as such a pattern will never match any syscall event.
+    pub fn warn_if_suspicious(&self) {
+        if let PolicyType::Simple(pattern) = &self.match_type {
+            if self.syscall.is_empty() && (pattern.contains(' ') || pattern.len() > 20) {
+                tracing::warn!(
+                    "Policy '{}' has type Simple with pattern '{}' used as syscall name — \
+                     this will not match any syscall. Set the 'syscall' field explicitly.",
+                    self.id,
+                    pattern
+                );
+            }
+        }
+    }
+
     pub fn matches(&self, content: &str, regex_cache: &HashMap<String, Regex>) -> bool {
         match &self.match_type {
-            PolicyType::Simple(pattern) => content.contains(pattern.as_str()),
+            PolicyType::Simple(pattern) => {
+                // An empty pattern means the policy is syscall-name-only (no text to match).
+                // Treat it as non-matching in text evaluation; it only applies via seccomp.
+                !pattern.is_empty() && content.contains(pattern.as_str())
+            }
             PolicyType::Regex(_) => {
                 if let Some(re) = regex_cache.get(&self.id) {
                     re.is_match(content)
@@ -307,6 +472,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         assert_eq!(event.syscall_name, "open");
@@ -325,6 +492,8 @@ mod tests {
             pid: 100,
             ppid: 99,
             timestamp: "2024-01-01T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -363,6 +532,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -378,6 +548,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -393,6 +564,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -408,12 +580,13 @@ mod tests {
             action: Action::Flag,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
-        // Empty pattern matches everything (contains always returns true for empty)
-        assert!(policy.matches("anything", &cache));
-        assert!(policy.matches("", &cache));
+        // Empty pattern means syscall-name-only — does not match in text evaluation.
+        assert!(!policy.matches("anything", &cache));
+        assert!(!policy.matches("", &cache));
     }
 
     #[test]
@@ -424,6 +597,7 @@ mod tests {
             action: Action::Flag,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -440,6 +614,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let mut cache = HashMap::new();
@@ -459,6 +634,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new(); // Empty cache
@@ -474,6 +650,7 @@ mod tests {
             action: Action::Flag,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let mut cache = HashMap::new();
@@ -494,6 +671,7 @@ mod tests {
             action: Action::Flag,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let mut cache = HashMap::new();
@@ -513,6 +691,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -528,6 +707,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -543,6 +723,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -559,6 +740,7 @@ mod tests {
             action: Action::Allow,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -577,6 +759,7 @@ mod tests {
             action: Action::Allow,
             context: PolicyContext::default(),
             kill: false,
+            syscall: vec![],
         };
 
         let cache = HashMap::new();
@@ -596,6 +779,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::Shell,
             kill: false,
+            syscall: vec![],
         };
 
         let json = serde_json::to_string(&policy).unwrap();
@@ -722,6 +906,8 @@ mod tests {
             pid: 1,
             ppid: 0,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         assert!(event.args.is_empty());
@@ -752,6 +938,7 @@ mod tests {
             action: Action::Flag,
             context: PolicyContext::Network,
             kill: true,
+            syscall: vec![],
         };
 
         let cloned = policy.clone();
@@ -759,5 +946,51 @@ mod tests {
         assert_eq!(policy.action, cloned.action);
         assert_eq!(policy.context, cloned.context);
         assert_eq!(policy.kill, cloned.kill);
+    }
+
+    // ========================================
+    // Policy::validate() Tests
+    // ========================================
+
+    #[test]
+    fn test_validate_regex_context_all_no_syscall_is_ok() {
+        let policy = Policy {
+            id: "regex-all-no-syscall".to_string(),
+            match_type: PolicyType::Regex("/sensitive/.*".to_string()),
+            action: Action::Block,
+            context: PolicyContext::All,
+            kill: false,
+            syscall: vec![],
+        };
+        // Should succeed (only emits a warning, not an error)
+        assert_eq!(policy.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_executable_context_all_no_syscall_is_ok() {
+        let policy = Policy {
+            id: "exec-all-no-syscall".to_string(),
+            match_type: PolicyType::Executable("/usr/local/bin/check.sh".to_string()),
+            action: Action::Block,
+            context: PolicyContext::All,
+            kill: false,
+            syscall: vec![],
+        };
+        // Should succeed (only emits a warning, not an error)
+        assert_eq!(policy.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_regex_context_syscall_no_syscall_is_err() {
+        let policy = Policy {
+            id: "regex-syscall-no-syscall".to_string(),
+            match_type: PolicyType::Regex("/sensitive/.*".to_string()),
+            action: Action::Block,
+            context: PolicyContext::Syscall,
+            kill: false,
+            syscall: vec![],
+        };
+        // Should return Err — Regex with context:Syscall requires a syscall field
+        assert!(policy.validate().is_err());
     }
 }

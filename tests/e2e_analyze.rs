@@ -44,6 +44,7 @@ async fn test_2_1_block_verdict_for_dangerous_command() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     }])
     .await;
 
@@ -62,6 +63,7 @@ async fn test_2_2_allow_verdict_for_safe_command() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     }])
     .await;
 
@@ -80,6 +82,7 @@ async fn test_2_4_shell_policy_does_not_trigger_on_network_context() {
         action: Action::Block,
         context: PolicyContext::Shell,
         kill: false,
+        syscall: vec![],
     }])
     .await;
 
@@ -100,6 +103,7 @@ async fn test_2_5_network_policy_triggers_on_network_context() {
         action: Action::Block,
         context: PolicyContext::Network,
         kill: false,
+        syscall: vec![],
     }])
     .await;
 
@@ -117,6 +121,7 @@ async fn test_2_6_all_context_policy_applies_everywhere() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     }])
     .await;
 
@@ -146,6 +151,7 @@ async fn test_2_7_role_scoped_evaluation() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     };
     h_admin.add_policy_direct(block_policy);
     h_admin.add_role_direct(Role {
@@ -177,6 +183,7 @@ async fn test_2_7_role_scoped_evaluation() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h_readonly.add_role_direct(Role {
         name: "readonly".to_string(),
