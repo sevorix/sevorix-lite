@@ -17,6 +17,7 @@ async fn harness_with_flag_policy() -> TestHarness {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_policy_direct(Policy {
         id: "block-p".to_string(),
@@ -24,6 +25,7 @@ async fn harness_with_flag_policy() -> TestHarness {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),
@@ -146,6 +148,7 @@ async fn test_3_4_timeout_expires_with_block_action() {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),
@@ -196,6 +199,7 @@ async fn test_3_5_timeout_expires_with_allow_action() {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),
@@ -261,6 +265,7 @@ async fn test_3_9_red_lane_not_held() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),

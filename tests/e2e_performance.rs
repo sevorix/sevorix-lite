@@ -17,6 +17,7 @@ async fn setup_harness() -> TestHarness {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),
@@ -92,6 +93,7 @@ async fn test_14_3_yellow_lane_holds_until_decision() {
         action: Action::Flag,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "test".to_string(),

@@ -121,6 +121,7 @@ async fn test_7_3_events_pagination() {
         action: Action::Block,
         context: PolicyContext::Shell,
         kill: false,
+        syscall: vec![],
     }])
     .await;
 
@@ -224,6 +225,7 @@ async fn test_7_7_stats_endpoint() {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     }])
     .await;
 

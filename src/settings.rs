@@ -10,6 +10,30 @@ pub struct Settings {
     pub intervention: Option<InterventionSettings>,
     pub sevsh: Option<SevshSettings>,
     pub tls_mitm: Option<TlsMitmSettings>,
+    pub experimental: Option<ExperimentalSettings>,
+}
+
+/// Opt-in experimental features. Off by default; intended for users who have
+/// explicitly verified their environment meets the prerequisites.
+#[derive(Deserialize, Default, Clone)]
+pub struct ExperimentalSettings {
+    /// Enable BPF LSM hooks for synchronous exec and network blocking.
+    ///
+    /// Requires the kernel to be booted with `lsm=...,bpf` in its command line
+    /// (i.e. `bpf` must appear in `/sys/kernel/security/lsm`). Auto-detection
+    /// of this capability has been removed — it was unreliable on kernels that
+    /// compile with `CONFIG_BPF_LSM=y` but do not activate it (e.g. WSL2,
+    /// most stock cloud VM kernels). Set this to `true` only after confirming
+    /// BPF LSM is active on your kernel.
+    ///
+    /// Default: `false`.
+    pub lsm_blocking: Option<bool>,
+}
+
+impl ExperimentalSettings {
+    pub fn lsm_blocking_enabled(&self) -> bool {
+        self.lsm_blocking.unwrap_or(false)
+    }
 }
 
 impl Settings {

@@ -12,6 +12,7 @@
 
 use libseccomp::error::SeccompError;
 use libseccomp::*;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -55,6 +56,8 @@ pub enum SyscallCategory {
     Process,
     /// Privilege syscalls: setuid, setgid, capset, ptrace, prctl
     Privilege,
+    /// Destructive file operation syscalls: unlink, unlinkat, rename, renameat, renameat2, rmdir, truncate, ftruncate
+    FileOps,
 }
 
 impl SyscallCategory {
@@ -64,7 +67,133 @@ impl SyscallCategory {
             SyscallCategory::Network => &["socket", "connect", "bind", "accept", "accept4"],
             SyscallCategory::Process => &["execve", "execveat", "clone", "clone3", "fork", "vfork"],
             SyscallCategory::Privilege => &["setuid", "setgid", "capset", "ptrace", "prctl"],
+            SyscallCategory::FileOps => &[
+                "unlink",
+                "unlinkat",
+                "rename",
+                "renameat",
+                "renameat2",
+                "rmdir",
+                "truncate",
+                "ftruncate",
+            ],
         }
+    }
+}
+
+/// Action for a dynamic syscall rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SyscallRuleAction {
+    Deny,
+    Allow,
+}
+
+/// A rule for dynamic syscall evaluation, as served by Watchtower's `/syscall-policy` endpoint.
+///
+/// Rules with `path_pattern = None` and no `executable` match all invocations of the syscall.
+/// Rules with a `path_pattern` match only when the first path argument (read from
+/// `/proc/<pid>/mem`) matches the regex.
+/// Rules with an `executable` pipe syscall info as JSON to an external command and
+/// apply the action if it exits 0 (matches).
+///
+/// At most one of `path_pattern` and `executable` should be set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyscallRule {
+    pub syscall: String,
+    pub action: SyscallRuleAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_pattern: Option<String>,
+    /// External command to evaluate the syscall. Receives JSON on stdin:
+    /// `{"syscall":"unlink","path":"/etc/foo","pid":1234,"args":["0x...","0x...",...]}`.
+    /// Exit code 0 = rule matches (action is applied); non-zero = no match (next rule tried).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+}
+
+struct CompiledRule {
+    syscall_nr: i64,
+    action: SyscallRuleAction,
+    path_regex: Option<regex::Regex>,
+    executable: Option<String>,
+}
+
+/// A compiled set of syscall rules for fast local evaluation in the seccomp supervisor.
+///
+/// Built from `SyscallRule` items fetched from Watchtower at session start.
+/// Evaluation is entirely local — no HTTP round-trip per syscall.
+pub struct CompiledRuleSet {
+    rules: Vec<CompiledRule>,
+    /// Syscall names that must be added to the seccomp notify filter.
+    pub syscall_names: Vec<String>,
+}
+
+impl CompiledRuleSet {
+    /// Build a compiled rule set from a list of `SyscallRule` items.
+    /// Rules for unknown syscall names are silently skipped.
+    pub fn from_rules(rules: Vec<SyscallRule>) -> Self {
+        let mut compiled = Vec::new();
+        let mut syscall_names: Vec<String> = Vec::new();
+
+        for rule in rules {
+            let Some(nr) = ScmpSyscall::from_name(&rule.syscall)
+                .ok()
+                .map(|s| i64::from(s.as_raw_syscall()))
+            else {
+                tracing::warn!(syscall = %rule.syscall, "unknown syscall name in policy rule, skipping");
+                continue;
+            };
+            let path_regex = rule
+                .path_pattern
+                .as_deref()
+                .and_then(|p| regex::Regex::new(p).ok());
+            if !syscall_names.contains(&rule.syscall) {
+                syscall_names.push(rule.syscall.clone());
+            }
+            compiled.push(CompiledRule {
+                syscall_nr: nr,
+                action: rule.action,
+                path_regex,
+                executable: rule.executable,
+            });
+        }
+
+        CompiledRuleSet {
+            rules: compiled,
+            syscall_names,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Evaluate whether a syscall should be allowed (`true`) or denied (`false`).
+    ///
+    /// Rules are evaluated in order; the first matching rule wins.
+    /// If no rule matches, the syscall is allowed by default.
+    ///
+    /// Executable rules invoke an external process synchronously — the supervised
+    /// process remains suspended until the command exits.
+    pub fn evaluate(&self, info: &SyscallInfo) -> bool {
+        for rule in &self.rules {
+            if rule.syscall_nr != info.syscall_nr {
+                continue;
+            }
+            let matched = if let Some(cmd) = &rule.executable {
+                run_executable_rule(cmd, info)
+            } else {
+                match &rule.path_regex {
+                    None => true,
+                    Some(re) => read_path_arg(info.pid, info.syscall_nr, &info.args)
+                        .map(|p| re.is_match(&p))
+                        .unwrap_or(false),
+                }
+            };
+            if matched {
+                return rule.action == SyscallRuleAction::Allow;
+            }
+        }
+        true // no rule matched — allow by default
     }
 }
 
@@ -667,6 +796,108 @@ mod syscall_nr {
     pub const RECVFROM: i64 = 45;
     pub const BIND: i64 = 49;
     pub const ACCEPT4: i64 = 288;
+    // File ops (dirfd-relative syscalls whose path is at args[1])
+    pub const UNLINKAT: i64 = 263;
+    pub const RENAMEAT: i64 = 264;
+    pub const RENAMEAT2: i64 = 316;
+}
+
+/// Run an external command to evaluate whether a syscall matches a policy rule.
+///
+/// The command receives a JSON object on stdin:
+/// `{"syscall":"unlink","path":"/etc/foo","pid":1234,"args":[140737354240000,...]}`
+///
+/// Returns `true` if the command exits with code 0 (rule matches, action is applied),
+/// `false` otherwise (no match, next rule is tried).
+///
+/// The supervised process remains suspended (via seccomp-unotify) for the duration
+/// of this call. Commands should be fast to avoid stalling the process under scrutiny.
+fn run_executable_rule(cmd: &str, info: &SyscallInfo) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Read the first path argument if available (best-effort).
+    let path = read_path_arg(info.pid, info.syscall_nr, &info.args).unwrap_or_default();
+
+    let args_json = serde_json::json!({
+        "syscall": syscall_name(info.syscall_nr),
+        "syscall_nr": info.syscall_nr,
+        "path": path,
+        "pid": info.pid,
+        "args": info.args,
+    });
+    let payload = args_json.to_string();
+
+    // Split cmd into program + args (simple shell-word split: first token is program)
+    let mut parts = cmd.split_whitespace();
+    let Some(program) = parts.next() else {
+        return false;
+    };
+    let prog_args: Vec<&str> = parts.collect();
+
+    let mut child = match Command::new(program)
+        .args(&prog_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if let Some(stdin) = child.stdin.take() {
+        let mut stdin = stdin;
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut child_for_thread = child;
+    std::thread::spawn(move || {
+        let status = child_for_thread.wait();
+        let _ = tx.send(status);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(result) => result.map(|s| s.success()).unwrap_or(false),
+        Err(_) => {
+            eprintln!(
+                "sevorix-core: executable policy checker timed out after 5s (cmd: {cmd}); treating as non-blocking"
+            );
+            false
+        }
+    }
+}
+
+/// Read the first path argument from a file syscall via `/proc/<pid>/mem`.
+///
+/// For dirfd-relative syscalls (`unlinkat`, `renameat`, `renameat2`), `args[1]` is the path.
+/// For all other file syscalls, `args[0]` is the path.
+/// Resolve the primary path argument of a syscall while the process is suspended.
+///
+/// Reads the path string from `/proc/<pid>/mem` using the pointer in the appropriate
+/// argument register. Must be called while the process is still suspended by seccomp-unotify;
+/// the pointer is meaningless after the process resumes.
+pub fn resolve_syscall_path(info: &SyscallInfo) -> Option<String> {
+    read_path_arg(info.pid, info.syscall_nr, &info.args)
+}
+
+fn read_path_arg(pid: u32, nr: i64, args: &[u64; 6]) -> Option<String> {
+    let path_idx = match nr {
+        n if n == syscall_nr::UNLINKAT
+            || n == syscall_nr::RENAMEAT
+            || n == syscall_nr::RENAMEAT2 =>
+        {
+            1
+        }
+        _ => 0,
+    };
+    let addr = args[path_idx];
+    if addr == 0 {
+        return None;
+    }
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut mem = File::open(&mem_path).ok()?;
+    read_string_from_mem(&mut mem, addr)
 }
 
 /// Read a null-terminated string from process memory via /proc/<pid>/mem.
@@ -996,6 +1227,8 @@ pub fn syscall_event_from_request(req: &ScmpNotifReq) -> crate::SyscallEvent {
         pid: req.pid,
         ppid,
         timestamp,
+        path: None,
+        role: None,
     }
 }
 
@@ -1460,6 +1693,8 @@ pub(crate) fn build_syscall_event(
         pid,
         ppid,
         timestamp,
+        path: None,
+        role: None,
     }
 }
 
@@ -1585,20 +1820,24 @@ pub fn apply_syscall_notify_filter(
 
 /// Run a blocking supervisor loop for a seccomp-unotify notify fd.
 ///
-/// Receives notifications on `notify_fd`, calls `on_intercepted` for each
-/// blocked syscall (for logging/reporting), then responds with EPERM denial.
+/// For each intercepted syscall, calls `evaluate` with the `SyscallInfo`. If `evaluate`
+/// returns `true` the syscall is allowed to continue; if `false` it is denied with EPERM.
 /// Exits when the supervised process terminates (receive returns an error).
 ///
 /// This function blocks the calling thread and is intended to be run inside
 /// `tokio::task::spawn_blocking`. It closes `notify_fd` when done.
-pub fn run_seccomp_notify_supervisor<F>(notify_fd: RawFd, mut on_intercepted: F)
+pub fn run_seccomp_notify_supervisor<F>(notify_fd: RawFd, mut evaluate: F)
 where
-    F: FnMut(&SyscallInfo),
+    F: FnMut(&SyscallInfo) -> bool,
 {
     while let Ok(req) = ScmpNotifReq::receive(notify_fd) {
         let info = SyscallInfo::from(&req);
-        on_intercepted(&info);
-        let resp = SeccompNotifier::deny_eperm(&req);
+        let allow = evaluate(&info);
+        let resp = if allow {
+            SeccompNotifier::allow(&req)
+        } else {
+            SeccompNotifier::deny_eperm(&req)
+        };
         if resp.respond(notify_fd).is_err() {
             break;
         }
@@ -2278,6 +2517,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         // AllowAllHandler should always return Allow decision
@@ -2300,6 +2541,8 @@ mod tests {
             pid: 1,
             ppid: 0,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let decision = handler.evaluate(&event);
@@ -2318,6 +2561,8 @@ mod tests {
             pid: 1,
             ppid: 0,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let decision = handler.evaluate(&event);
@@ -2346,6 +2591,8 @@ mod tests {
             pid: 1,
             ppid: 0,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
         let decision = handler.evaluate(&execve_event);
         assert!(matches!(decision, SeccompDecision::Block { .. }));
@@ -2357,6 +2604,8 @@ mod tests {
             pid: 1,
             ppid: 0,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
         let decision = handler.evaluate(&read_event);
         assert!(matches!(decision, SeccompDecision::Allow));
@@ -2373,6 +2622,8 @@ mod tests {
             pid: 1,
             ppid: 0,
             timestamp: "2024-01-01T00:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let decision = handler.evaluate(&event);
@@ -3320,5 +3571,187 @@ mod tests {
     #[test]
     fn test_syscall_name_quotactl_fd() {
         assert_eq!(syscall_name(443), "quotactl_fd");
+    }
+
+    // =========================================================================
+    // CompiledRuleSet tests
+    // =========================================================================
+
+    fn make_info(syscall_nr: i64) -> SyscallInfo {
+        SyscallInfo {
+            syscall_nr,
+            arch: ScmpArch::Native,
+            pid: std::process::id(),
+            args: [0u64; 6],
+            instr_pointer: 0,
+        }
+    }
+
+    #[test]
+    fn test_compiled_ruleset_empty_allows_everything() {
+        let rs = CompiledRuleSet::from_rules(vec![]);
+        assert!(rs.evaluate(&make_info(87))); // unlink
+        assert!(rs.evaluate(&make_info(59))); // execve
+        assert!(rs.evaluate(&make_info(0))); // read
+    }
+
+    #[test]
+    fn test_compiled_ruleset_deny_blocks_matching_syscall() {
+        let rs = CompiledRuleSet::from_rules(vec![SyscallRule {
+            syscall: "unlink".to_string(),
+            action: SyscallRuleAction::Deny,
+            path_pattern: None,
+            executable: None,
+        }]);
+        assert!(!rs.evaluate(&make_info(87))); // unlink — denied
+        assert!(rs.evaluate(&make_info(84))); // rmdir — no rule, allowed
+    }
+
+    #[test]
+    fn test_compiled_ruleset_allow_rule_passes() {
+        let rs = CompiledRuleSet::from_rules(vec![SyscallRule {
+            syscall: "ptrace".to_string(),
+            action: SyscallRuleAction::Allow,
+            path_pattern: None,
+            executable: None,
+        }]);
+        assert!(rs.evaluate(&make_info(101))); // ptrace — explicitly allowed
+    }
+
+    #[test]
+    fn test_compiled_ruleset_no_match_defaults_to_allow() {
+        let rs = CompiledRuleSet::from_rules(vec![SyscallRule {
+            syscall: "unlink".to_string(),
+            action: SyscallRuleAction::Deny,
+            path_pattern: None,
+            executable: None,
+        }]);
+        assert!(rs.evaluate(&make_info(59))); // execve — no rule, allowed
+    }
+
+    #[test]
+    fn test_compiled_ruleset_first_rule_wins_deny() {
+        let rs = CompiledRuleSet::from_rules(vec![
+            SyscallRule {
+                syscall: "unlink".to_string(),
+                action: SyscallRuleAction::Deny,
+                path_pattern: None,
+                executable: None,
+            },
+            SyscallRule {
+                syscall: "unlink".to_string(),
+                action: SyscallRuleAction::Allow,
+                path_pattern: None,
+                executable: None,
+            },
+        ]);
+        assert!(!rs.evaluate(&make_info(87)));
+    }
+
+    #[test]
+    fn test_compiled_ruleset_first_rule_wins_allow() {
+        let rs = CompiledRuleSet::from_rules(vec![
+            SyscallRule {
+                syscall: "unlink".to_string(),
+                action: SyscallRuleAction::Allow,
+                path_pattern: None,
+                executable: None,
+            },
+            SyscallRule {
+                syscall: "unlink".to_string(),
+                action: SyscallRuleAction::Deny,
+                path_pattern: None,
+                executable: None,
+            },
+        ]);
+        assert!(rs.evaluate(&make_info(87)));
+    }
+
+    #[test]
+    fn test_compiled_ruleset_unknown_name_skipped() {
+        let rs = CompiledRuleSet::from_rules(vec![SyscallRule {
+            syscall: "not_a_real_syscall".to_string(),
+            action: SyscallRuleAction::Deny,
+            path_pattern: None,
+            executable: None,
+        }]);
+        assert!(rs.is_empty());
+    }
+
+    #[test]
+    fn test_compiled_ruleset_syscall_names_populated() {
+        let rs = CompiledRuleSet::from_rules(vec![
+            SyscallRule {
+                syscall: "unlink".to_string(),
+                action: SyscallRuleAction::Deny,
+                path_pattern: None,
+                executable: None,
+            },
+            SyscallRule {
+                syscall: "rename".to_string(),
+                action: SyscallRuleAction::Deny,
+                path_pattern: None,
+                executable: None,
+            },
+        ]);
+        assert!(rs.syscall_names.contains(&"unlink".to_string()));
+        assert!(rs.syscall_names.contains(&"rename".to_string()));
+        assert_eq!(rs.syscall_names.len(), 2);
+    }
+
+    #[test]
+    fn test_compiled_ruleset_duplicate_names_deduplicated() {
+        let rs = CompiledRuleSet::from_rules(vec![
+            SyscallRule {
+                syscall: "unlink".to_string(),
+                action: SyscallRuleAction::Deny,
+                path_pattern: None,
+                executable: None,
+            },
+            SyscallRule {
+                syscall: "unlink".to_string(),
+                action: SyscallRuleAction::Allow,
+                path_pattern: None,
+                executable: None,
+            },
+        ]);
+        assert_eq!(rs.syscall_names.len(), 1);
+    }
+
+    #[test]
+    fn test_fileops_category_all_names_resolve() {
+        // Every name in SyscallCategory::FileOps must map to a syscall number,
+        // otherwise it would be silently dropped from the notify filter.
+        let rules: Vec<SyscallRule> = SyscallCategory::FileOps
+            .syscalls()
+            .iter()
+            .map(|name| SyscallRule {
+                syscall: name.to_string(),
+                action: SyscallRuleAction::Deny,
+                path_pattern: None,
+                executable: None,
+            })
+            .collect();
+        let expected = SyscallCategory::FileOps.syscalls().len();
+        let rs = CompiledRuleSet::from_rules(rules);
+        assert_eq!(
+            rs.syscall_names.len(),
+            expected,
+            "not all FileOps syscall names resolved to numbers"
+        );
+    }
+
+    #[test]
+    fn test_compiled_ruleset_regex_invalid_pattern_skipped() {
+        // An invalid regex should not cause a panic — the rule is silently dropped.
+        let rs = CompiledRuleSet::from_rules(vec![SyscallRule {
+            syscall: "unlink".to_string(),
+            action: SyscallRuleAction::Deny,
+            path_pattern: Some("[invalid regex".to_string()),
+            executable: None,
+        }]);
+        // When path_pattern contains an invalid regex, it compiles to None.
+        // path_regex = None means "no path filter" → rule matches any path → Deny applies.
+        assert!(!rs.evaluate(&make_info(87)));
     }
 }

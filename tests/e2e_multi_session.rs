@@ -68,6 +68,7 @@ async fn harness_with_block_policy(keyword: &str) -> TestHarness {
         action: Action::Block,
         context: PolicyContext::All,
         kill: false,
+        syscall: vec![],
     });
     h.add_role_direct(Role {
         name: "default".to_string(),
@@ -378,6 +379,7 @@ async fn test_ms14_two_sessions_enforce_different_roles() {
         action: Action::Block,
         context: PolicyContext::Shell,
         kill: false,
+        syscall: vec![],
     });
     session_a.add_role_direct(Role {
         name: "strict".to_string(),
@@ -467,6 +469,7 @@ async fn test_ms17_heavy_session_a_does_not_affect_session_b() {
             action: Action::Block,
             context: PolicyContext::All,
             kill: false,
+            syscall: vec![],
         });
         policy_ids.push(id);
     }

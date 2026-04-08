@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Sevorix
 
-use crate::policy::{Action, Engine, PolicyContext};
+use crate::policy::{Action, Engine, PolicyContext, PolicyType};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -191,39 +191,122 @@ pub fn scan_syscall(
 
 /// Scans a syscall event against a policy engine.
 ///
-/// This is a more efficient version of `scan_syscall` that takes an
-/// existing engine reference instead of creating a new one each time.
+/// Evaluates syscall policies by syscall name and resolved path — NOT by
+/// substring matching on a formatted string. This mirrors the logic in
+/// `CompiledRuleSet::evaluate()` used by sevsh locally.
 ///
-/// # Arguments
+/// Evaluation order for each policy with context Syscall or All:
+///  1. The policy's `syscall_names()` must include `event.syscall_name`.
+///  2. `Simple` (empty pattern): match — blocked by syscall name alone.
+///  3. `Simple` (non-empty pattern): match if pattern is a substring of the path.
+///  4. `Regex`: match if the regex matches the resolved path.
+///  5. `Executable`: run command with JSON syscall info on stdin; exit 0 = match.
 ///
-/// * `event` - The syscall event to analyze
-/// * `engine` - The policy engine to check against
-///
-/// # Returns
-///
-/// A `SeccompDecision` indicating what action to take.
+/// The first matching Block policy wins. Flag is treated as Allow (no seccomp
+/// mechanism to surface it). Returns Allow if no policy matches.
 #[cfg(target_os = "linux")]
 pub fn scan_syscall_with_engine(event: &SyscallEvent, engine: &Engine) -> SeccompDecision {
-    // Format syscall event as a string for pattern matching
-    let args_str = event.args.join(", ");
-    let content = format!(
-        "{}({}) [pid={}, ppid={}]",
-        event.syscall_name, args_str, event.pid, event.ppid
-    );
+    let role_name = event.role.as_deref().unwrap_or("default");
+    let policy_ids = match engine.roles.get(role_name) {
+        Some(role) => role.policies.clone(),
+        None => return SeccompDecision::Allow,
+    };
 
-    // Check against the engine with Syscall context
-    let result = scan_content(&content, Some("default"), engine, PolicyContext::Syscall);
+    let path = event.path.as_deref().unwrap_or("");
 
-    // Convert SecurityScanResult to SeccompDecision
-    if result.verdict == "BLOCK" {
-        if result.kill {
-            SeccompDecision::Kill
-        } else {
-            SeccompDecision::Block { errno: libc::EPERM }
+    for id in &policy_ids {
+        let Some(policy) = engine.policies.get(id) else {
+            continue;
+        };
+
+        // Only consider syscall-scoped policies.
+        if policy.context != PolicyContext::Syscall && policy.context != PolicyContext::All {
+            continue;
         }
-    } else {
-        // ALLOW or FLAG both mean allow
-        SeccompDecision::Allow
+
+        // Policy must cover this syscall name.
+        if !policy
+            .syscall_names()
+            .contains(&event.syscall_name.as_str())
+        {
+            continue;
+        }
+
+        // Check path filter.
+        let matched = match &policy.match_type {
+            PolicyType::Simple(pattern) => {
+                // If syscall field is empty, the pattern IS the syscall name and
+                // was already matched above — no further path filter applies.
+                // If syscall field is set, pattern is either empty (block all paths
+                // for this syscall) or a substring path filter.
+                policy.syscall.is_empty() || pattern.is_empty() || path.contains(pattern.as_str())
+            }
+            PolicyType::Regex(_) => engine
+                .get_regex(id)
+                .map(|re| re.is_match(path))
+                .unwrap_or(false),
+            PolicyType::Executable(cmd) => run_executable_syscall_check(cmd, event),
+        };
+
+        if matched {
+            return match policy.action {
+                Action::Block if policy.kill => SeccompDecision::Kill,
+                Action::Block => SeccompDecision::Block { errno: libc::EPERM },
+                _ => continue, // Flag/Allow — keep evaluating
+            };
+        }
+    }
+
+    SeccompDecision::Allow
+}
+
+/// Run an executable policy check for a syscall event.
+/// The command receives a JSON object on stdin; exit 0 means "match" (block).
+#[cfg(target_os = "linux")]
+fn run_executable_syscall_check(cmd: &str, event: &SyscallEvent) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // path is attacker-controlled; checker binary must treat it as untrusted
+    let payload = serde_json::json!({
+        "syscall": event.syscall_name,
+        "syscall_nr": event.syscall_number,
+        "path": event.path,
+        "pid": event.pid,
+        "args": event.args,
+    });
+    let mut parts = cmd.split_whitespace();
+    let Some(program) = parts.next() else {
+        return false;
+    };
+    let prog_args: Vec<&str> = parts.collect();
+    let Ok(mut child) = Command::new(program)
+        .args(prog_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.to_string().as_bytes());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut child_for_thread = child;
+    std::thread::spawn(move || {
+        let status = child_for_thread.wait();
+        let _ = tx.send(status);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(result) => result.map(|s| s.success()).unwrap_or(false),
+        Err(_) => {
+            tracing::warn!(
+                cmd = cmd,
+                "executable syscall checker timed out after 5s (scanner); treating as non-blocking"
+            );
+            false
+        }
     }
 }
 
@@ -304,6 +387,7 @@ mod tests {
                     action,
                     context: PolicyContext::All,
                     kill: false,
+                    syscall: vec![],
                 },
             );
             policy_ids.push(id.to_string());
@@ -439,6 +523,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::Syscall,
             kill: false,
+            syscall: vec![],
         }];
 
         let event = SyscallEvent {
@@ -448,6 +533,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-02-25T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let result = scan_syscall(&event, &policies);
@@ -463,6 +550,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::Syscall,
             kill: false,
+            syscall: vec![],
         }];
 
         let event = SyscallEvent {
@@ -472,6 +560,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-02-25T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let result = scan_syscall(&event, &policies);
@@ -487,6 +577,7 @@ mod tests {
             action: Action::Flag,
             context: PolicyContext::Syscall,
             kill: false,
+            syscall: vec![],
         }];
 
         let event = SyscallEvent {
@@ -496,6 +587,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-02-25T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let result = scan_syscall(&event, &policies);
@@ -515,6 +608,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Syscall,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -533,6 +627,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-02-25T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let decision = scan_syscall_with_engine(&event, &engine);
@@ -551,6 +647,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Syscall,
                 kill: true,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -569,6 +666,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-02-25T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let decision = scan_syscall_with_engine(&event, &engine);
@@ -587,6 +686,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Syscall,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -605,6 +705,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-02-25T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let decision = scan_syscall_with_engine(&event, &engine);
@@ -623,6 +725,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::Syscall,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -641,6 +744,8 @@ mod tests {
             pid: 1234,
             ppid: 1,
             timestamp: "2026-02-25T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         // FLAG verdict should be treated as Allow in seccomp context
@@ -659,6 +764,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: true,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -717,6 +823,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -773,6 +880,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Shell,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine
@@ -812,6 +920,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::Network,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine
@@ -851,6 +960,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.policies.insert(
@@ -861,6 +971,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -888,6 +999,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.policies.insert(
@@ -898,6 +1010,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -967,6 +1080,8 @@ mod tests {
             pid: 42,
             ppid: 1,
             timestamp: "2026-03-04T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let result = scan_syscall(&event, &policies);
@@ -982,6 +1097,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::Syscall,
             kill: false,
+            syscall: vec![],
         }];
 
         let event = SyscallEvent {
@@ -991,9 +1107,218 @@ mod tests {
             pid: 42,
             ppid: 1,
             timestamp: "2026-03-04T12:00:00Z".to_string(),
+            path: None,
+            role: None,
         };
 
         let result = scan_syscall(&event, &policies);
         assert_eq!(result.verdict, "BLOCK");
+    }
+
+    // ========================================
+    // Gap 2: Path-filtered Simple policy with path: None returns Allow
+    // ========================================
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_syscall_simple_path_filter_blocks_when_path_matches() {
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "block_sensitive".to_string(),
+            Policy {
+                id: "block_sensitive".to_string(),
+                match_type: PolicyType::Simple("/sensitive/".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: false,
+                syscall: vec!["unlinkat".to_string()],
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["block_sensitive".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let event = SyscallEvent {
+            syscall_name: "unlinkat".to_string(),
+            syscall_number: 263,
+            args: vec![],
+            pid: 1234,
+            ppid: 1,
+            timestamp: "2026-04-07T00:00:00Z".to_string(),
+            path: Some("/sensitive/secret.txt".to_string()),
+            role: None,
+        };
+
+        let decision = scan_syscall_with_engine(&event, &engine);
+        assert_eq!(decision, SeccompDecision::Block { errno: libc::EPERM });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_syscall_simple_path_filter_allows_when_path_absent() {
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "block_sensitive".to_string(),
+            Policy {
+                id: "block_sensitive".to_string(),
+                match_type: PolicyType::Simple("/sensitive/".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: false,
+                syscall: vec!["unlinkat".to_string()],
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["block_sensitive".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let event = SyscallEvent {
+            syscall_name: "unlinkat".to_string(),
+            syscall_number: 263,
+            args: vec![],
+            pid: 1234,
+            ppid: 1,
+            timestamp: "2026-04-07T00:00:00Z".to_string(),
+            path: None,
+            role: None,
+        };
+
+        // path is None (eBPF event) — path filter cannot match, should Allow
+        let decision = scan_syscall_with_engine(&event, &engine);
+        assert_eq!(decision, SeccompDecision::Allow);
+    }
+
+    // ========================================
+    // Gap 3: Non-default role routing in scan_syscall_with_engine
+    // ========================================
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_syscall_uses_event_role() {
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "p1".to_string(),
+            Policy {
+                id: "p1".to_string(),
+                match_type: PolicyType::Simple("unlinkat".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: false,
+                syscall: vec![],
+            },
+        );
+        engine.roles.insert(
+            "restricted".to_string(),
+            Role {
+                name: "restricted".to_string(),
+                policies: vec!["p1".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let event = SyscallEvent {
+            syscall_name: "unlinkat".to_string(),
+            syscall_number: 263,
+            args: vec![],
+            pid: 1234,
+            ppid: 1,
+            timestamp: "2026-04-07T00:00:00Z".to_string(),
+            path: None,
+            role: Some("restricted".to_string()),
+        };
+
+        // Event role is "restricted" which has the blocking policy — should Block
+        let decision = scan_syscall_with_engine(&event, &engine);
+        assert_eq!(decision, SeccompDecision::Block { errno: libc::EPERM });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_syscall_wrong_role_returns_allow() {
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "p1".to_string(),
+            Policy {
+                id: "p1".to_string(),
+                match_type: PolicyType::Simple("unlinkat".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: false,
+                syscall: vec![],
+            },
+        );
+        engine.roles.insert(
+            "restricted".to_string(),
+            Role {
+                name: "restricted".to_string(),
+                policies: vec!["p1".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let event = SyscallEvent {
+            syscall_name: "unlinkat".to_string(),
+            syscall_number: 263,
+            args: vec![],
+            pid: 1234,
+            ppid: 1,
+            timestamp: "2026-04-07T00:00:00Z".to_string(),
+            path: None,
+            role: Some("other-role".to_string()),
+        };
+
+        // "other-role" does not exist in engine — should Allow
+        let decision = scan_syscall_with_engine(&event, &engine);
+        assert_eq!(decision, SeccompDecision::Allow);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_syscall_no_role_defaults_to_default() {
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "p1".to_string(),
+            Policy {
+                id: "p1".to_string(),
+                match_type: PolicyType::Simple("unlinkat".to_string()),
+                action: Action::Block,
+                context: PolicyContext::Syscall,
+                kill: false,
+                syscall: vec![],
+            },
+        );
+        engine.roles.insert(
+            "default".to_string(),
+            Role {
+                name: "default".to_string(),
+                policies: vec!["p1".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let event = SyscallEvent {
+            syscall_name: "unlinkat".to_string(),
+            syscall_number: 263,
+            args: vec![],
+            pid: 1234,
+            ppid: 1,
+            timestamp: "2026-04-07T00:00:00Z".to_string(),
+            path: None,
+            role: None,
+        };
+
+        // role: None falls back to "default" — should Block
+        let decision = scan_syscall_with_engine(&event, &engine);
+        assert_eq!(decision, SeccompDecision::Block { errno: libc::EPERM });
     }
 }

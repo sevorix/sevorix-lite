@@ -231,14 +231,15 @@ Permissions are created using two constructs: roles and policies. A policy is a 
 }
 ```
 
-| Field     | Type    | Description |
-|-----------|---------|-------------|
-| `id`      | string  | Unique identifier (kebab-case recommended) |
-| `type`    | enum    | `Simple`, `Regex`, or `Executable` |
-| `pattern` | string  | The match pattern (see match types below) |
-| `action`  | enum    | `Block`, `Flag`, or `Allow` |
-| `context` | enum    | `Shell`, `Network`, `Syscall`, or `All` (default: `All`) |
-| `kill`    | bool    | If true, kill the traced process instead of returning EPERM. Use only for critical violations. |
+| Field     | Type             | Description |
+|-----------|------------------|-------------|
+| `id`      | string           | Unique identifier (kebab-case recommended) |
+| `type`    | enum             | `Simple`, `Regex`, or `Executable` |
+| `pattern` | string           | The match pattern (see match types below) |
+| `action`  | enum             | `Block`, `Flag`, or `Allow` |
+| `context` | enum             | `Shell`, `Network`, `Syscall`, or `All` (default: `All`) |
+| `kill`    | bool             | If true, kill the traced process instead of returning EPERM. Use only for critical violations. |
+| `syscall` | string \| array  | *(Syscall context only)* Syscall name(s) to intercept. See **Syscall-context policies** below. |
 
 #### Match Types
 
@@ -257,6 +258,8 @@ Permissions are created using two constructs: roles and policies. A policy is a 
   { "type": "Executable", "pattern": "grep -qi 'wire.*funds'" }
   ```
   > **Security warning**: Always review executable policies published on SevorixHub before pulling.
+  >
+  > **Security warning — `path` field is attacker-controlled**: For `Syscall`-context `Executable` policies, the `path` field in the stdin JSON is read from the supervised process's memory — the supervised process controls its value and can embed shell metacharacters or injection payloads (e.g. `$(rm -rf ~)`). Checker binaries must treat `path` as untrusted: parse JSON programmatically (e.g. `path=$(jq -r .path); rm -- "$path"`) and never interpolate it directly into a shell command.
 
 #### Actions
 
@@ -279,6 +282,58 @@ Scope policies to specific interception layers:
 | `All`     | All contexts (default) |
 
 Use `context` to avoid false positives — e.g., a policy blocking `DELETE` should use `context: "Network"` if you only want to block HTTP DELETE methods, not shell `delete` commands.
+
+#### Syscall-context policies
+
+Syscall policies intercept raw kernel calls from within a `sevsh` session using seccomp-unotify. The process is suspended mid-syscall, evaluated against the policy, and either allowed or denied before the kernel executes the call.
+
+**The `syscall` field** names which syscall(s) to intercept:
+
+| Match type    | `syscall` required? | What it does |
+|---------------|---------------------|--------------|
+| `Simple`      | No (optional)       | If absent, `pattern` is the syscall name. If set, the named syscall(s) are always blocked. |
+| `Regex`       | **Yes**             | Regex is matched against the path argument of the syscall (e.g., the file being deleted). |
+| `Executable`  | **Yes**             | External command receives JSON syscall info on stdin; exit 0 = block. |
+
+`syscall` accepts a single name or an array to cover multiple syscall variants:
+```json
+"syscall": "unlink"
+"syscall": ["unlink", "unlinkat", "rmdir"]
+```
+
+> ⚠️ **Startup fails** if a `Regex` or `Executable` policy has `context: "Syscall"` but no `syscall` field. This is intentional — Sevorix cannot silently drop a security rule.
+
+**Examples:**
+
+Block all file deletion (`rm` uses `unlinkat` on modern Linux — cover both variants):
+```json
+{ "id": "block-file-deletion", "type": "Simple", "action": "Block", "context": "Syscall", "syscall": ["unlink", "unlinkat", "rmdir"] }
+```
+
+> **Important:** `rm` calls `unlinkat` (syscall 263), not `unlink` (syscall 87), on modern Linux.
+> A policy with only `"pattern": "unlink"` will not block `rm`.
+
+Block deletion and renaming of files under `/etc/`:
+```json
+{
+  "id": "protect-etc",
+  "type": "Regex",
+  "pattern": "^/etc/",
+  "action": "Block",
+  "context": "Syscall",
+  "syscall": ["unlink", "unlinkat", "rename", "renameat", "renameat2"]
+}
+```
+
+> On modern Linux, `mv` calls `renameat2` (syscall 316) rather than `rename` or `renameat`.
+> Omitting `"renameat2"` means `mv /etc/foo /etc/bar` is not intercepted — always include all three
+> rename variants when protecting a path from being moved.
+
+**Limitations:**
+- Only active inside `sevsh` sessions. Processes not spawned via `sevsh` are not intercepted.
+- Filter is compiled at session start — policy changes take effect in new sessions only.
+- `Executable` rules block the traced process for the duration of the subprocess call. Use sparingly.
+- `Syscall`-context policies are accepted on macOS but never enforced (no seccomp on macOS).
 
 #### Role Schema
 

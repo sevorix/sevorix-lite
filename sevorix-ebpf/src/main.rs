@@ -349,21 +349,34 @@ unsafe fn try_bprm_check_security(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    // execve syscall number on x86-64
+    // execve (59) and execveat (322) syscall numbers on x86-64.
+    // Both must be checked — omitting execveat leaves a bypass path.
     let execve_nr: u64 = 59;
+    let execveat_nr: u64 = 322;
 
-    // Check global denylist first.
-    if let Some(&errno) = GLOBAL_DENYLIST.get(&execve_nr) {
+    // Check global denylist for execve and execveat.
+    if let Some(&errno) = GLOBAL_DENYLIST
+        .get(&execve_nr)
+        .or_else(|| GLOBAL_DENYLIST.get(&execveat_nr))
+    {
         return -errno; // LSM hooks need negative errno to block
     }
 
-    // Check per-process denylist.
-    let key = PolicyKey {
+    // Check per-process denylist for execve and execveat.
+    let key_execve = PolicyKey {
         pid,
         _padding: 0,
         id: execve_nr,
     };
-    if let Some(&errno) = SYSCALL_DENYLIST.get(&key) {
+    let key_execveat = PolicyKey {
+        pid,
+        _padding: 0,
+        id: execveat_nr,
+    };
+    if let Some(&errno) = SYSCALL_DENYLIST
+        .get(&key_execve)
+        .or_else(|| SYSCALL_DENYLIST.get(&key_execveat))
+    {
         return -errno;
     }
 

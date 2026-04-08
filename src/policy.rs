@@ -113,6 +113,11 @@ impl Engine {
         self.roles.insert(role.name.clone(), role);
     }
 
+    /// Look up a compiled regex for a policy by ID.
+    pub fn get_regex(&self, policy_id: &str) -> Option<&Regex> {
+        self.regex_cache.get(policy_id)
+    }
+
     pub fn load_from_file(path: &str) -> Result<Self, Box<dyn Error>> {
         let content = fs::read_to_string(path)?;
         let config: PolicyConfig = serde_json::from_str(&content)?;
@@ -142,9 +147,17 @@ impl Engine {
                 // Try Vec<Policy>
                 if let Ok(policies) = serde_json::from_str::<Vec<Policy>>(&content) {
                     for policy in policies {
+                        policy
+                            .validate()
+                            .map_err(|e| format!("{} (in {})", e, path.display()))?;
+                        policy.warn_if_suspicious();
                         self.add_policy(policy);
                     }
                 } else if let Ok(policy) = serde_json::from_str::<Policy>(&content) {
+                    policy
+                        .validate()
+                        .map_err(|e| format!("{} (in {})", e, path.display()))?;
+                    policy.warn_if_suspicious();
                     self.add_policy(policy);
                 } else {
                     tracing::warn!("Warning: Failed to parse policy file: {}", path.display());
@@ -273,6 +286,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Shell,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.policies.insert(
@@ -283,6 +297,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Network,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.policies.insert(
@@ -293,6 +308,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -370,6 +386,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -392,6 +409,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.policies.insert(
@@ -402,6 +420,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -437,6 +456,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine
@@ -461,6 +481,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -481,6 +502,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::All,
             kill: false,
+            syscall: vec![],
         };
 
         // Should not panic, just log error and not cache regex
@@ -498,6 +520,7 @@ mod tests {
             action: Action::Block,
             context: PolicyContext::All,
             kill: false,
+            syscall: vec![],
         };
 
         engine.add_policy(policy);
@@ -564,6 +587,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine1.roles.insert(
@@ -584,6 +608,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine2.roles.insert(
@@ -614,6 +639,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.policies.insert(
@@ -624,6 +650,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -644,6 +671,7 @@ mod tests {
                 action: Action::Flag,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -663,6 +691,7 @@ mod tests {
                 action: Action::Allow,
                 context: PolicyContext::All,
                 kill: false,
+                syscall: vec![],
             },
         );
 
@@ -689,6 +718,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All,
                 kill: true,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
@@ -716,6 +746,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::Shell,
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(

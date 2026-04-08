@@ -83,10 +83,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
                             {
                                 tracing::error!("[PROXY] MITM tunnel error: {}", e);
                             }
-                        } else {
-                            if let Err(e) = tunnel(upgraded, addr_for_tunnel).await {
-                                tracing::error!("[PROXY] Tunnel error: {}", e);
-                            }
+                        } else if let Err(e) = tunnel(upgraded, addr_for_tunnel).await {
+                            tracing::error!("[PROXY] Tunnel error: {}", e);
                         }
                     }
                     Err(e) => tracing::error!("[PROXY] Upgrade error: {}", e),
@@ -822,6 +820,7 @@ mod tests {
                 action: Action::Block,
                 context: PolicyContext::All, // Added context
                 kill: false,
+                syscall: vec![],
             },
         );
         engine.roles.insert(
