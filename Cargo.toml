@@ -9,8 +9,9 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [features]
-default = []
+default = ["seccomp"]
 pro = ["sevorix-core/pro"]
+seccomp = ["sevorix-core/seccomp"]
 ebpf = ["aya", "zerocopy", "dns-lookup", "dep:sevorix-ebpf-common", "dep:inotify"]
 
 [dependencies]

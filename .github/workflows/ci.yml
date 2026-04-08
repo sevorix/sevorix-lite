@@ -118,3 +118,23 @@ jobs:
         with:
           name: code-coverage-report-${{ matrix.edition }}
           path: cobertura.xml
+
+  hub-cloudbuild-dryrun:
+    name: sevorix-hub Docker build (cloudbuild dry-run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      # Mirrors the `build-image` step in cloudbuild.yaml exactly:
+      # same Dockerfile, same build context, no libseccomp-dev available.
+      # Catches linker errors that only surface in the cloud build environment.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: sevorix-hub/Dockerfile
+          push: false
+          tags: sevorix-hub:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -13,11 +13,11 @@ pub mod enforcement;
 pub mod input_buffer;
 pub mod pty_multiplexer;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
 pub mod pty;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
 pub mod seccomp;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
 pub mod tracer;
 
 // Re-export key types for convenience
@@ -28,15 +28,15 @@ pub use pty_multiplexer::{
     PtyMultiplexerError, Verdict,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
 pub use seccomp::resolve_syscall_path;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
 pub use pty::{
     run_pty_shell_with_callback, spawn_pty_shell_with_seccomp, PtyError, PtyShellHandle,
     PtySyscallEvent,
 };
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
 pub use seccomp::{
     apply_syscall_deny_filter, apply_syscall_notify_filter, extract_args_from_seccomp,
     kernel_supports_seccomp_notify, run_seccomp_notify_supervisor, spawn_seccomp_shell,
@@ -49,7 +49,7 @@ pub use seccomp::{
 /// Do not use these exports. They will be removed in a future release.
 ///
 /// See the `seccomp` module for the recommended approach to syscall interception.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "seccomp"))]
 #[deprecated(
     since = "0.7.0",
     note = "Use seccomp module instead. The tracer module is deprecated."
