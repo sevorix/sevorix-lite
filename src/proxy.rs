@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Sevorix
 
+use crate::hooks::{HookContext, HookEvent};
 #[allow(deprecated)]
 use crate::log_traffic_event;
 use crate::policy::PolicyContext;
@@ -197,6 +198,35 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         format!("{} {}\n\n{}", method, uri, body_str)
     };
 
+    // Point A — PreProxy hook: may modify payload before policy scan
+    let scan_payload = {
+        let mut ctx = HookContext {
+            event: HookEvent::PreProxy,
+            payload: scan_payload.clone(),
+            verdict: None,
+            role: {
+                let r = state.current_role.read().unwrap();
+                r.clone()
+            },
+            context_type: "Network".to_string(),
+            session_id: state.session_id.clone(),
+            metadata: Default::default(),
+        };
+        if let Err(e) = state
+            .hook_registry
+            .run_hooks(HookEvent::PreProxy, &mut ctx)
+            .await
+        {
+            tracing::warn!("hooks: pre_proxy hook failed (blocked): {}", e);
+            return (
+                StatusCode::FORBIDDEN,
+                "Request Blocked: hook failure".to_string(),
+            )
+                .into_response();
+        }
+        ctx.payload
+    };
+
     let mut scan = scan_content(
         &scan_payload,
         Some(role.as_str()),
@@ -336,6 +366,39 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         scan.log_msg = Some("Allowed by operator intervention".to_string());
     }
 
+    // Point D — PostProxy hook: can override final verdict
+    {
+        let mut ctx = HookContext {
+            event: HookEvent::PostProxy,
+            payload: scan_payload.clone(),
+            verdict: Some(scan.verdict.clone()),
+            role: {
+                let r = state.current_role.read().unwrap();
+                r.clone()
+            },
+            context_type: "Network".to_string(),
+            session_id: state.session_id.clone(),
+            metadata: Default::default(),
+        };
+        if let Err(e) = state
+            .hook_registry
+            .run_hooks(HookEvent::PostProxy, &mut ctx)
+            .await
+        {
+            tracing::warn!("hooks: post_proxy hook failed (blocked): {}", e);
+            return (
+                StatusCode::FORBIDDEN,
+                "Request Blocked: hook failure".to_string(),
+            )
+                .into_response();
+        }
+        if let Some(v) = ctx.verdict {
+            // Sync verdict back; lane stays as-is (hooks that override verdict
+            // take responsibility for consistency at the logging layer).
+            scan.verdict = v;
+        }
+    }
+
     // Broadcast allow event if needed (maybe too noisy? Main app does it)
     // Let's broadcast "ALLOW" events too so dashboard sees traffic.
     let elapsed = start_time.elapsed().as_millis() as u64;
@@ -364,6 +427,27 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         "context": "Network"
     });
     let event_str = event.to_string();
+
+    // Point E — PreLog hook: observe-only in v1
+    {
+        let mut ctx = HookContext {
+            event: HookEvent::PreLog,
+            payload: scan_payload.clone(),
+            verdict: Some(scan.verdict.clone()),
+            role: {
+                let r = state.current_role.read().unwrap();
+                r.clone()
+            },
+            context_type: "Network".to_string(),
+            session_id: state.session_id.clone(),
+            metadata: Default::default(),
+        };
+        let _ = state
+            .hook_registry
+            .run_hooks(HookEvent::PreLog, &mut ctx)
+            .await;
+    }
+
     #[allow(deprecated)]
     log_traffic_event(&state.traffic_log_path, &event_str);
     let _ = state.tx.send(event_str);
@@ -804,6 +888,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            hook_registry: std::sync::Arc::new(crate::hooks::HookRegistry::new()),
             tls_context: None,
         })
     }
@@ -852,6 +937,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
+            hook_registry: std::sync::Arc::new(crate::hooks::HookRegistry::new()),
             tls_context: None,
         })
     }

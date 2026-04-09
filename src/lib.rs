@@ -28,6 +28,7 @@ pub const EBPF_SOCK_PATH: &str = "/tmp/sevorix-ebpf.sock";
 pub mod assets;
 pub mod cli;
 pub mod daemon;
+pub mod hooks;
 pub mod hub;
 pub mod integrations;
 pub mod logging;
@@ -38,7 +39,9 @@ pub mod scanner;
 pub mod settings;
 pub mod tls;
 
+use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use assets::Assets;
+pub use cli::SessionCommands;
 pub use cli::{CaCommands, Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands};
 pub use daemon::find_available_port;
 pub use daemon::{
@@ -91,6 +94,8 @@ pub struct AppState {
     /// `.redirect(Policy::none())` so the proxy never follows redirects itself —
     /// redirect responses are returned to the caller to handle.
     pub http_client: reqwest::Client,
+    /// Hook registry for lifecycle extension points.
+    pub hook_registry: std::sync::Arc<HookRegistry>,
     /// TLS MITM context (CA + per-hostname server config cache). `None` when
     /// TLS MITM is disabled in settings.
     pub tls_context: Option<Arc<crate::tls::TlsContext>>,
@@ -689,6 +694,10 @@ pub async fn run_server(
     // initial_role (from --role flag) takes priority over settings.json default_role
     let resolved_role = initial_role.or(default_role);
 
+    #[cfg_attr(not(feature = "pro"), allow(unused_mut))]
+    let mut registry = HookRegistry::new();
+    let hook_registry = std::sync::Arc::new(registry);
+
     // Initialise TLS MITM context if enabled in settings.
     let tls_context = if loaded_settings
         .tls_mitm
@@ -725,6 +734,7 @@ pub async fn run_server(
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default(),
+        hook_registry,
         tls_context,
     });
 
@@ -1082,6 +1092,34 @@ async fn analyze_intent(
             .into_response();
     }
 
+    // PreAnalyze hook — may modify payload before policy scan
+    let text = {
+        let mut ctx = HookContext {
+            event: HookEvent::PreAnalyze,
+            payload: text.clone(),
+            verdict: None,
+            role: Some(resolved_role.clone()),
+            context_type: context_str.to_string(),
+            session_id: state.session_id.clone(),
+            metadata: Default::default(),
+        };
+        if let Err(e) = state
+            .hook_registry
+            .run_hooks(HookEvent::PreAnalyze, &mut ctx)
+            .await
+        {
+            tracing::warn!("hooks: pre_analyze hook failed (blocked): {}", e);
+            return Json(json!({
+                "status": "BLOCK",
+                "lane": "RED",
+                "latency_ms": 0,
+                "reason": "hook failure"
+            }))
+            .into_response();
+        }
+        ctx.payload
+    };
+
     // --- DECISION RULES ---
     let mut scan = scan_content(
         &text,
@@ -1176,6 +1214,42 @@ async fn analyze_intent(
         scan.delay = 0;
     }
 
+    // PostAnalyze hook — can override final verdict
+    {
+        let mut ctx = HookContext {
+            event: HookEvent::PostAnalyze,
+            payload: text.clone(),
+            verdict: Some(scan.verdict.clone()),
+            role: Some(resolved_role.clone()),
+            context_type: context_str.to_string(),
+            session_id: state.session_id.clone(),
+            metadata: Default::default(),
+        };
+        if let Err(e) = state
+            .hook_registry
+            .run_hooks(HookEvent::PostAnalyze, &mut ctx)
+            .await
+        {
+            tracing::warn!("hooks: post_analyze hook failed (blocked): {}", e);
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            return Json(json!({
+                "status": "BLOCK",
+                "lane": "RED",
+                "latency_ms": elapsed,
+                "reason": "hook failure"
+            }))
+            .into_response();
+        }
+        if let Some(v) = ctx.verdict {
+            scan.lane = match v.as_str() {
+                "BLOCK" => "RED".to_string(),
+                "ALLOW" => "GREEN".to_string(),
+                _ => scan.lane.clone(),
+            };
+            scan.verdict = v;
+        }
+    }
+
     if let Some(msg) = &scan.log_msg {
         log_threat(
             agent_id,
@@ -1204,6 +1278,24 @@ async fn analyze_intent(
         "role": resolved_role,
     });
     let event_str = event.to_string();
+
+    // PreLog hook — observe-only in v1
+    {
+        let mut ctx = HookContext {
+            event: HookEvent::PreLog,
+            payload: text.clone(),
+            verdict: Some(scan.verdict.clone()),
+            role: Some(resolved_role.clone()),
+            context_type: context_str.to_string(),
+            session_id: state.session_id.clone(),
+            metadata: Default::default(),
+        };
+        let _ = state
+            .hook_registry
+            .run_hooks(HookEvent::PreLog, &mut ctx)
+            .await;
+    }
+
     #[allow(deprecated)]
     log_traffic_event(&state.traffic_log_path, &event_str);
     let _ = state.tx.send(event_str);
@@ -2120,6 +2212,7 @@ mod tests {
                 .build()
                 .unwrap_or_default(),
             tls_context: None,
+            hook_registry: std::sync::Arc::new(HookRegistry::new()),
         })
     }
 
@@ -2144,6 +2237,7 @@ mod tests {
                 .build()
                 .unwrap_or_default(),
             tls_context: None,
+            hook_registry: std::sync::Arc::new(HookRegistry::new()),
         })
     }
 
@@ -2168,6 +2262,7 @@ mod tests {
                 .build()
                 .unwrap_or_default(),
             tls_context: None,
+            hook_registry: std::sync::Arc::new(HookRegistry::new()),
         })
     }
 

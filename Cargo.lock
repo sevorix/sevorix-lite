@@ -3108,6 +3108,7 @@ name = "sevorix_watchtower"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "aya",
  "aya-build",
