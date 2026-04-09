@@ -9,8 +9,9 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [features]
-default = []
+default = ["seccomp"]
 pro = ["sevorix-core/pro"]
+seccomp = ["sevorix-core/seccomp"]
 ebpf = ["aya", "zerocopy", "dns-lookup", "dep:sevorix-ebpf-common", "dep:inotify"]
 
 [dependencies]
@@ -31,6 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 anyhow = "1.0"
+async-trait = "0.1"
 libc = "0.2"
 regex = "1.10"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }

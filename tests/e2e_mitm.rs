@@ -165,6 +165,7 @@ impl MitmTestHarness {
                 .build()
                 .unwrap_or_default(),
             tls_context: Some(tls_ctx),
+            hook_registry: std::sync::Arc::new(sevorix_watchtower::hooks::HookRegistry::new()),
         });
 
         // Register an empty role so traffic is not blocked by "role not found".

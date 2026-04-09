@@ -36,6 +36,7 @@ async fn test_real_connect_handshake() {
             .build()
             .unwrap_or_default(),
         tls_context: None,
+        hook_registry: std::sync::Arc::new(sevorix_watchtower::hooks::HookRegistry::new()),
     });
 
     // 2. Setup Router
