@@ -50,6 +50,18 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
     let method = req.method().clone();
     let uri = req.uri().clone();
 
+    // Extract advisory pid/ppid injected by sevsh before req is consumed.
+    let pid: Option<u32> = req
+        .headers()
+        .get("x-sevorix-pid")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+    let ppid: Option<u32> = req
+        .headers()
+        .get("x-sevorix-ppid")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
     // Features: Logging: Log destination domain and method.
     // Extract host from URI
     tracing::info!("[PROXY] {} {}", method, uri);
@@ -76,9 +88,10 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
                                 upgraded,
                                 host_owned,
                                 port,
-                                addr_for_tunnel,
                                 state_clone.clone(),
                                 tls_ctx.clone(),
+                                pid,
+                                ppid,
                             )
                             .await
                             {
@@ -101,7 +114,9 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
                 "timestamp": chrono::Local::now().to_rfc3339(),
                 "latency": start_time.elapsed().as_millis() as u64,
                 "reason": "HTTPS Tunnel Established",
-                "confidence": "N/A"
+                "confidence": "N/A",
+                "pid": pid,
+                "ppid": ppid,
             });
             let event_str = event.to_string();
             #[allow(deprecated)]
@@ -269,7 +284,9 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             "latency": elapsed,
             "reason": msg,
             "confidence": score,
-            "context": "Network"
+            "context": "Network",
+            "pid": pid,
+            "ppid": ppid,
         });
         let event_str = event.to_string();
         #[allow(deprecated)]
@@ -313,6 +330,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             "timestamp": chrono::Local::now().to_rfc3339(),
             "reason": scan.log_msg,
             "context": "Network",
+            "pid": pid,
+            "ppid": ppid,
             "timeout_secs": state.intervention_timeout_secs,
             "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
         });
@@ -352,6 +371,8 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
                 "reason": "Blocked by operator",
                 "confidence": "Manual Override",
                 "context": "Network",
+                "pid": pid,
+                "ppid": ppid,
             });
             let block_str = block_event.to_string();
             #[allow(deprecated)]
@@ -424,7 +445,9 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         "latency": elapsed,
         "reason": scan.log_msg,
         "confidence": scan.log_score,
-        "context": "Network"
+        "context": "Network",
+        "pid": pid,
+        "ppid": ppid,
     });
     let event_str = event.to_string();
 
@@ -463,11 +486,13 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
 
     let mut req_builder = client.request(method, &url);
 
-    // Forward headers
+    // Forward headers, stripping internal Sevorix metadata headers.
     for (key, value) in parts.headers.iter() {
-        // Skip host header as reqwest sets it? Or keep it?
-        // Reqwest sets Host based on URL.
-        // Copying all headers is generally safe, but some are restricted.
+        let name = key.as_str();
+        if name.eq_ignore_ascii_case("x-sevorix-pid") || name.eq_ignore_ascii_case("x-sevorix-ppid")
+        {
+            continue;
+        }
         req_builder = req_builder.header(key, value);
     }
 
@@ -538,9 +563,10 @@ async fn mitm_tls_tunnel(
     upgraded: hyper::upgrade::Upgraded,
     hostname: String,
     port: u16,
-    _addr: String,
     state: std::sync::Arc<crate::AppState>,
     tls_ctx: std::sync::Arc<crate::tls::TlsContext>,
+    pid: Option<u32>,
+    ppid: Option<u32>,
 ) -> anyhow::Result<()> {
     use hyper_util::rt::TokioIo;
     use tokio_rustls::TlsAcceptor;
@@ -569,6 +595,8 @@ async fn mitm_tls_tunnel(
         hostname: hostname.clone(),
         port,
         state,
+        pid,
+        ppid,
     };
 
     // Non-HTTP protocols (WebSockets, gRPC, HTTP/2) will error here.
@@ -592,6 +620,8 @@ struct MitmService {
     hostname: String,
     port: u16,
     state: std::sync::Arc<crate::AppState>,
+    pid: Option<u32>,
+    ppid: Option<u32>,
 }
 
 impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmService {
@@ -605,6 +635,8 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
         let hostname = self.hostname.clone();
         let port = self.port;
         let state = self.state.clone();
+        let pid = self.pid;
+        let ppid = self.ppid;
 
         Box::pin(async move {
             let start_time = std::time::Instant::now();
@@ -645,7 +677,9 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                     "timestamp": chrono::Local::now().to_rfc3339(),
                     "latency": start_time.elapsed().as_millis() as u64,
                     "reason": "Poison pill detected in HTTPS payload",
-                    "confidence": "HIGH"
+                    "confidence": "HIGH",
+                    "pid": pid,
+                    "ppid": ppid,
                 });
                 let event_str = event.to_string();
                 #[allow(deprecated)]
@@ -681,7 +715,9 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                     "timestamp": chrono::Local::now().to_rfc3339(),
                     "latency": start_time.elapsed().as_millis() as u64,
                     "reason": result.log_msg,
-                    "confidence": "HIGH"
+                    "confidence": "HIGH",
+                    "pid": pid,
+                    "ppid": ppid,
                 });
                 let event_str = event.to_string();
                 #[allow(deprecated)]
@@ -717,6 +753,8 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                     "timestamp": chrono::Local::now().to_rfc3339(),
                     "reason": result.log_msg,
                     "context": "Network",
+                    "pid": pid,
+                    "ppid": ppid,
                     "timeout_secs": state.intervention_timeout_secs,
                     "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
                 });
@@ -756,6 +794,8 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                         "reason": "Blocked by operator",
                         "confidence": "Manual Override",
                         "context": "Network",
+                        "pid": pid,
+                        "ppid": ppid,
                     });
                     let block_str = block_event.to_string();
                     #[allow(deprecated)]
@@ -780,6 +820,8 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                     "reason": "Allowed by operator intervention",
                     "confidence": "Manual Override",
                     "context": "Network",
+                    "pid": pid,
+                    "ppid": ppid,
                 });
                 let allow_str = allow_event.to_string();
                 #[allow(deprecated)]
@@ -795,7 +837,9 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                     "timestamp": chrono::Local::now().to_rfc3339(),
                     "latency": start_time.elapsed().as_millis() as u64,
                     "reason": result.log_msg,
-                    "confidence": "N/A"
+                    "confidence": "N/A",
+                    "pid": pid,
+                    "ppid": ppid,
                 });
                 let event_str = event.to_string();
                 #[allow(deprecated)]
@@ -803,10 +847,14 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                 let _ = state.tx.send(event_str);
             }
 
-            // Forward client request headers to upstream, skipping Host (reqwest sets it from URL).
+            // Forward client request headers to upstream, stripping internal Sevorix metadata.
             let mut reqwest_headers = reqwest::header::HeaderMap::new();
             for (k, v) in headers.iter() {
-                if k == hyper::header::HOST {
+                let name = k.as_str();
+                if k == hyper::header::HOST
+                    || name.eq_ignore_ascii_case("x-sevorix-pid")
+                    || name.eq_ignore_ascii_case("x-sevorix-ppid")
+                {
                     continue;
                 }
                 if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()) {

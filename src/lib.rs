@@ -1152,6 +1152,8 @@ async fn analyze_intent(
             "reason": scan.log_msg,
             "context": context_str,
             "role": resolved_role,
+            "pid": payload["pid"],
+            "ppid": payload["ppid"],
             "timeout_secs": state.intervention_timeout_secs,
             "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
         });
@@ -1192,6 +1194,8 @@ async fn analyze_intent(
                 "confidence": null,
                 "context": context_str,
                 "role": resolved_role,
+                "pid": payload["pid"],
+                "ppid": payload["ppid"],
             });
             let block_str = block_event.to_string();
             #[allow(deprecated)]
@@ -1276,6 +1280,8 @@ async fn analyze_intent(
         "confidence": scan.log_score,
         "context": context_str,
         "role": resolved_role,
+        "pid": payload["pid"],
+        "ppid": payload["ppid"],
     });
     let event_str = event.to_string();
 
