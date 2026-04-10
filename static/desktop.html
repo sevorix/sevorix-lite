@@ -194,7 +194,15 @@
                                 _remainingSecs: data.timeout_secs || 30,
                                 _paused: false,
                                 _decided: false,
+                                _frozen: false,
+                                _frozenAt: null,
                             });
+                            return;
+                        }
+
+                        if (data.type === 'CGROUP_FROZEN') {
+                            const req = this.pendingRequests.find(r => r.event_id === data.event_id);
+                            if (req) { req._frozen = true; req._frozenAt = Date.now(); }
                             return;
                         }
 
@@ -203,10 +211,16 @@
                             if (req) {
                                 req._decided = true;
                                 req._decisionAction = data.action;
+                                req._frozen = false;
                                 setTimeout(() => {
                                     this.pendingRequests = this.pendingRequests.filter(r => r.event_id !== data.event_id);
                                 }, 2000);
                             }
+                            return;
+                        }
+
+                        if (data.type === 'SESSION_KILLED') {
+                            this.pendingRequests = [];
                             return;
                         }
 
@@ -353,7 +367,14 @@
 
                         <!-- Countdown + action buttons -->
                         <div class="flex flex-col items-end gap-1.5 shrink-0">
-                            <!-- Badge -->
+                            <!-- Frozen indicator -->
+                            <template x-if="req._frozen && !req._decided">
+                                <span class="text-[10px] font-mono px-2 py-0.5 rounded border border-cyan-600 text-cyan-400 bg-cyan-950/40"
+                                      title="Agent process suspended at kernel level">
+                                    ❄ FROZEN
+                                </span>
+                            </template>
+                            <!-- Countdown / status badge -->
                             <span class="text-xs font-mono px-2 py-0.5 rounded border transition-colors"
                                   :class="{
                                       'border-slate-600 text-slate-400': req._paused && !req._decided,
@@ -592,6 +613,14 @@
                             <span class="text-slate-500">ROLE</span>
                             <span class="text-cyan-400 text-lg font-mono" x-text="selected.role || 'N/A'"></span>
                         </div>
+                        <template x-if="selected.pid">
+                            <div class="flex justify-between mb-6 border-b border-slate-800 pb-3">
+                                <span class="text-slate-500">PID / PPID</span>
+                                <span class="text-slate-300 text-lg font-mono">
+                                    <span x-text="selected.pid"></span><template x-if="selected.ppid"><span> / <span x-text="selected.ppid"></span></span></template>
+                                </span>
+                            </div>
+                        </template>
                         <div class="mb-6">
                             <span class="text-slate-500 block mb-2">TIMESTAMP</span>
                             <span class="text-white text-lg" x-text="selected.timestamp"></span>
