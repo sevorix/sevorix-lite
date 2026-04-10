@@ -970,20 +970,26 @@ async fn proxy_unix_to_tcp(mut unix: UnixStream) -> std::io::Result<()> {
 
     let injected = format!("X-Sevorix-Pid: {}\r\nX-Sevorix-Ppid: {}\r\n", pid, ppid);
 
+    // Split at the blank line only (not the last header's \r\n).
+    // The terminator \r\n\r\n is: "\r\n" (end of last header) + "\r\n" (blank line).
+    // We keep the last header's "\r\n" in headers_part so the injected headers
+    // are appended as new header lines rather than concatenated onto the last value.
     let last4: &[u8] = &header_buf[header_buf.len().saturating_sub(4)..];
-    let (headers_without_term, terminator): (&[u8], &[u8]) = if last4 == b"\r\n\r\n" {
-        (&header_buf[..header_buf.len() - 4], b"\r\n\r\n")
+    let (headers_part, blank_line): (&[u8], &[u8]) = if last4 == b"\r\n\r\n" {
+        // Strip only the 2-byte blank line; keep the last header's "\r\n".
+        (&header_buf[..header_buf.len() - 2], b"\r\n")
     } else {
-        (&header_buf[..header_buf.len() - 2], b"\n\n")
+        // Bare-LF style: strip only the final "\n" blank line.
+        (&header_buf[..header_buf.len() - 1], b"\n")
     };
 
     // --- Connect to the Watchtower daemon and forward the modified request ---
     let addr = format!("127.0.0.1:{}", resolved_proxy_port());
     let mut tcp = TcpStream::connect(&addr).await?;
 
-    tcp.write_all(headers_without_term).await?;
+    tcp.write_all(headers_part).await?;
     tcp.write_all(injected.as_bytes()).await?;
-    tcp.write_all(terminator).await?;
+    tcp.write_all(blank_line).await?;
 
     // Proxy the remaining request body and response bidirectionally.
     tokio::io::copy_bidirectional(&mut unix, &mut tcp).await?;
@@ -1504,12 +1510,19 @@ async fn spawn_with_seccomp(command: &mut Command) -> std::io::Result<std::proce
                                             .iter()
                                             .map(|a| format!("0x{:x}", a))
                                             .collect();
+                                        let ppid_for_block = std::fs::read_to_string(format!(
+                                            "/proc/{}/stat",
+                                            info.pid
+                                        ))
+                                        .ok()
+                                        .map(|s| parse_ppid_from_stat(&s))
+                                        .unwrap_or(0);
                                         let payload = serde_json::json!({
                                             "syscall_name": name,
                                             "syscall_number": info.syscall_nr,
                                             "args": args,
                                             "pid": info.pid,
-                                            "ppid": 0u32,
+                                            "ppid": ppid_for_block,
                                             "timestamp": chrono::Local::now().to_rfc3339(),
                                             "path": path,
                                             "role": session_role,
@@ -1657,12 +1670,87 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
 // Tests
 // -----------------------------------------------------------------------------
 
+/// Parse the ppid (4th field) from a `/proc/<pid>/stat` file content.
+///
+/// The format is: `pid (comm) state ppid ...`
+/// where `comm` may contain spaces and parentheses, so we locate the
+/// *last* `)` to find where the fixed fields begin.
+fn parse_ppid_from_stat(stat: &str) -> u32 {
+    stat.rfind(')')
+        .and_then(|close| {
+            stat[close + 2..]
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Shared lock so proxy_unix_to_tcp tests that mutate RESOLVED_PROXY_URL
+    /// don't race against each other.
+    static PORT_LOCK: Mutex<()> = Mutex::new(());
+
+    // -------------------------------------------------------------------------
+    // parse_ppid_from_stat
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_ppid_normal() {
+        // Typical /proc/<pid>/stat line
+        let stat = "1234 (bash) S 5678 1234 1234 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1";
+        assert_eq!(parse_ppid_from_stat(stat), 5678);
+    }
+
+    #[test]
+    fn test_parse_ppid_comm_with_parens() {
+        // Process name that itself contains parentheses
+        let stat = "42 (my (weird) proc) S 99 42 42 0 -1 0";
+        assert_eq!(parse_ppid_from_stat(stat), 99);
+    }
+
+    #[test]
+    fn test_parse_ppid_comm_with_spaces() {
+        let stat = "7 (kworker/0:1H) I 2 0 0 0 -1 69238880";
+        assert_eq!(parse_ppid_from_stat(stat), 2);
+    }
+
+    #[test]
+    fn test_parse_ppid_no_closing_paren() {
+        assert_eq!(parse_ppid_from_stat("1234 (bash"), 0);
+    }
+
+    #[test]
+    fn test_parse_ppid_too_few_fields() {
+        // Only state field after ')' — ppid field missing
+        let stat = "1 (init) S";
+        assert_eq!(parse_ppid_from_stat(stat), 0);
+    }
+
+    #[test]
+    fn test_parse_ppid_non_numeric_ppid() {
+        let stat = "1 (init) S notanumber rest";
+        assert_eq!(parse_ppid_from_stat(stat), 0);
+    }
+
+    #[test]
+    fn test_parse_ppid_matches_getppid_for_self() {
+        // Smoke-test against the real /proc/self/stat on Linux.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let parsed = parse_ppid_from_stat(&stat);
+        let actual = unsafe { libc::getppid() } as u32;
+        assert_eq!(
+            parsed, actual,
+            "parsed ppid from /proc/self/stat should match libc::getppid()"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2047,12 +2135,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_unix_to_tcp_bare_lf_injection() {
-        use std::sync::Mutex;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
 
-        // Serialize env-var mutation across tests.
-        static PORT_LOCK: Mutex<()> = Mutex::new(());
         let _guard = PORT_LOCK.lock().unwrap();
 
         // Bind a TCP listener on a random port.
@@ -2132,8 +2217,104 @@ mod tests {
             "expected X-Sevorix-Ppid header in forwarded request, got:\n{}",
             forwarded
         );
+        // Structural check: Host header must be properly terminated before the
+        // injected headers (no concatenation like "example.comX-Sevorix-Pid:").
+        assert!(
+            forwarded.contains("Host: example.com\n"),
+            "Host header must be terminated with \\n before injected headers; got:\n{}",
+            forwarded
+        );
+        // Verify the injected headers don't bleed into the Host value.
+        assert!(
+            !forwarded.contains("example.comX-Sevorix"),
+            "injected headers must not be concatenated onto Host value; got:\n{}",
+            forwarded
+        );
 
         // Close the TCP connection so the bidirectional copy terminates.
+        drop(tcp_conn);
+        drop(client_unix);
+        let _ = proxy_task.await;
+    }
+
+    // -------------------------------------------------------------------------
+    // proxy_unix_to_tcp: CRLF header injection (standard HTTP/1.1)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_proxy_unix_to_tcp_crlf_injection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        // Serialize with the bare-LF test so they don't race on RESOLVED_PROXY_URL.
+        let _guard = PORT_LOCK.lock().unwrap();
+
+        // Reuse the same port-discovery pattern as the bare-LF test.
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp_listener.local_addr().unwrap().port();
+
+        RESOLVED_PROXY_URL.get_or_init(|| format!("http://localhost:{}", port));
+        let actual_port: u16 = {
+            let url = RESOLVED_PROXY_URL.get().unwrap();
+            url.split(':')
+                .nth(2)
+                .and_then(|s| s.split('/').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3000)
+        };
+        let tcp_listener = if actual_port == port {
+            tcp_listener
+        } else {
+            drop(tcp_listener);
+            tokio::net::TcpListener::bind(format!("127.0.0.1:{}", actual_port))
+                .await
+                .unwrap()
+        };
+
+        let (mut client_unix, server_unix) = UnixStream::pair().unwrap();
+        let proxy_task = tokio::spawn(proxy_unix_to_tcp(server_unix));
+
+        // Standard CRLF HTTP/1.1 POST with a small JSON body.
+        client_unix
+            .write_all(
+                b"POST /analyze HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+
+        let (mut tcp_conn, _) = tcp_listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = tcp_conn.read(&mut buf).await.unwrap();
+        let forwarded = std::str::from_utf8(&buf[..n]).unwrap();
+
+        // Injected headers must be present.
+        assert!(
+            forwarded.contains("X-Sevorix-Pid:"),
+            "expected X-Sevorix-Pid header; got:\n{forwarded}"
+        );
+        assert!(
+            forwarded.contains("X-Sevorix-Ppid:"),
+            "expected X-Sevorix-Ppid header; got:\n{forwarded}"
+        );
+        // The Content-Length header must retain its own \r\n terminator and must
+        // NOT be concatenated with the injected header name.
+        assert!(
+            forwarded.contains("Content-Length: 2\r\n"),
+            "Content-Length must be properly terminated before injected headers; got:\n{forwarded}"
+        );
+        assert!(
+            !forwarded.contains("2X-Sevorix"),
+            "injected headers must not be concatenated onto Content-Length value; got:\n{forwarded}"
+        );
+        // There must be exactly one \r\n\r\n separating headers from body.
+        let header_end = forwarded
+            .find("\r\n\r\n")
+            .expect("no \\r\\n\\r\\n found in forwarded request");
+        assert!(
+            !forwarded[header_end + 4..].contains("\r\n\r\n"),
+            "forwarded request must have exactly one header terminator; got:\n{forwarded}"
+        );
+
         drop(tcp_conn);
         drop(client_unix);
         let _ = proxy_task.await;
