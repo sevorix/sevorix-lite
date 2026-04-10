@@ -238,6 +238,13 @@ pub fn parse_bash_invocation(args: &[String]) -> BashInvocation {
                         inv.extra_options.push(args[i].clone());
                     }
                 }
+                _ if arg == "--no-sandbox"
+                    || arg == "--no-proxy"
+                    || arg.starts_with("--no-sandbox=")
+                    || arg.starts_with("--no-proxy=") =>
+                {
+                    // Sevsh modifier flags — consumed by sevsh, not passed to bash.
+                }
                 _ => {
                     // Unknown long option — pass through.
                     inv.extra_options.push(arg.clone());
@@ -289,14 +296,17 @@ pub fn parse_bash_invocation(args: &[String]) -> BashInvocation {
 /// Returns true if the arg list contains any sevsh-specific flags, meaning
 /// the invocation should be handled by clap rather than the bash-compat path.
 fn has_sevsh_flags(args: &[String]) -> bool {
+    // Only structural flags force the clap path. Modifier flags (--no-sandbox,
+    // --no-proxy) are also valid alongside bash-compat flags like -c, so they
+    // must not trigger the clap path — the bash-compat path reads them directly
+    // from raw_args when needed.
+    //
+    // `"--"` signals direct binary execution (sevsh -- cmd args); it must
+    // route through clap so args.command is populated correctly.
     args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "--no-proxy"
-                | "--no-sandbox"
-                | "--internal-sandbox"
-                | "--internal-forward-sock"
-                | "--session-id"
+            "--internal-sandbox" | "--internal-forward-sock" | "--session-id" | "--"
         ) || a.starts_with("--publish")
             || a == "-p"
     })
@@ -391,7 +401,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Non-interactive: validate and execute.
-        let exit_code = handle_bash_invocation(inv, true, &session_id).await?;
+        // For -c invocations, route through the namespace sandbox (unshare)
+        // to enforce network isolation, matching the sevsh-specific path.
+        let no_sandbox_flag = raw_args.iter().any(|a| a == "--no-sandbox");
+        let has_unshare = Command::new("unshare").arg("--version").output().is_ok();
+        let has_ip = Command::new("ip").arg("-V").output().is_ok();
+
+        let exit_code = if (inv.command.is_some() || inv.script_file.is_some())
+            && !no_sandbox_flag
+            && has_unshare
+            && has_ip
+        {
+            // Route through the namespace-isolated sandbox path.
+            let mut command_args = Vec::new();
+            if !raw_args.is_empty() {
+                command_args.push(raw_args[0].clone());
+            }
+            command_args.extend(inv.to_bash_args());
+            match run_parent_bridge(&command_args, &[], false, &session_id).await {
+                Ok(code) => code,
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("No space left on device")
+                        || err_str.contains("unshare failed")
+                        || err_str.contains("Resource temporarily unavailable")
+                    {
+                        eprintln!("[SEVSH] Warning: Namespace isolation unavailable ({}). Falling back to simple environment variable isolation. Port forwarding will be disabled.", err_str);
+                        handle_bash_invocation(inv, true, &session_id).await?
+                    } else {
+                        if cgroup_created {
+                            cleanup_session_cgroup(&session_id);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        } else if (inv.command.is_some() || inv.script_file.is_some())
+            && !no_sandbox_flag
+            && (!has_unshare || !has_ip)
+        {
+            // Fail-closed: sandbox tools unavailable and --no-sandbox not set.
+            eprintln!("[SEVSH] Error: Sandbox tools (unshare/ip) not available for -c/-script invocation.");
+            eprintln!("[SEVSH] Fail-closed: Use --no-sandbox to allow unsandboxed execution.");
+            if cgroup_created {
+                cleanup_session_cgroup(&session_id);
+            }
+            std::process::exit(1);
+        } else {
+            // --no-sandbox set, or script-file invocation: fall back to env-var isolation.
+            handle_bash_invocation(inv, true, &session_id).await?
+        };
         if cgroup_created {
             cleanup_session_cgroup(&session_id);
         }
@@ -845,9 +904,88 @@ fn resolved_proxy_port() -> u16 {
 }
 
 async fn proxy_unix_to_tcp(mut unix: UnixStream) -> std::io::Result<()> {
-    // Connect to Host Daemon using the resolved proxy port (not hardcoded 3000)
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Inject X-Sevorix-Pid / X-Sevorix-Ppid into the first HTTP request's
+    // headers so the proxy can tag network events with the sevsh process ID.
+    // Advisory only — not a security control.
+    const MAX_HEADER_BYTES: usize = 65_536;
+
+    // --- Read HTTP headers byte-by-byte, looking for the end-of-headers marker ---
+    let mut header_buf: Vec<u8> = Vec::with_capacity(4096);
+
+    // 4-byte window for \r\n\r\n detection
+    let mut window4 = [0u8; 4];
+    // 2-byte window for bare-LF \n\n detection (HTTP/1.0 style)
+    let mut last2 = [0u8; 2];
+
+    loop {
+        // Reject oversized headers: fail-closed with a proper HTTP error response.
+        if header_buf.len() >= MAX_HEADER_BYTES {
+            eprintln!(
+                "[SEVSH] proxy_unix_to_tcp: request headers exceed {} bytes; rejecting connection",
+                MAX_HEADER_BYTES
+            );
+            let _ = unix
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return Ok(());
+        }
+
+        let mut byte = [0u8; 1];
+        let n = unix.read(&mut byte).await?;
+        if n == 0 {
+            // Client closed connection before we saw end-of-headers.
+            return Ok(());
+        }
+
+        header_buf.push(byte[0]);
+
+        // Slide the 4-byte window
+        window4[0] = window4[1];
+        window4[1] = window4[2];
+        window4[2] = window4[3];
+        window4[3] = byte[0];
+
+        // Slide the 2-byte window
+        last2[0] = last2[1];
+        last2[1] = byte[0];
+
+        if window4 == *b"\r\n\r\n" {
+            break;
+        }
+        if last2 == *b"\n\n" {
+            break;
+        }
+    }
+
+    // --- Inject X-Sevorix-Pid / X-Sevorix-Ppid headers before the terminator ---
+    let pid = std::process::id();
+    #[cfg(unix)]
+    let ppid = unsafe { libc::getppid() } as u32;
+    #[cfg(not(unix))]
+    let ppid = 0u32;
+
+    let injected = format!("X-Sevorix-Pid: {}\r\nX-Sevorix-Ppid: {}\r\n", pid, ppid);
+
+    let last4: &[u8] = &header_buf[header_buf.len().saturating_sub(4)..];
+    let (headers_without_term, terminator): (&[u8], &[u8]) = if last4 == b"\r\n\r\n" {
+        (&header_buf[..header_buf.len() - 4], b"\r\n\r\n")
+    } else {
+        (&header_buf[..header_buf.len() - 2], b"\n\n")
+    };
+
+    // --- Connect to the Watchtower daemon and forward the modified request ---
     let addr = format!("127.0.0.1:{}", resolved_proxy_port());
     let mut tcp = TcpStream::connect(&addr).await?;
+
+    tcp.write_all(headers_without_term).await?;
+    tcp.write_all(injected.as_bytes()).await?;
+    tcp.write_all(terminator).await?;
+
+    // Proxy the remaining request body and response bidirectionally.
     tokio::io::copy_bidirectional(&mut unix, &mut tcp).await?;
     Ok(())
 }
@@ -939,8 +1077,8 @@ async fn run_internal_agent(
         if arg == "--internal-sandbox" || arg == "--internal-forward-sock" || arg == "--session-id"
         {
             i += 2;
-        } else if arg == "--no-proxy" {
-            // Filter out this flag as it's handled via bool param
+        } else if arg == "--no-proxy" || arg == "--no-sandbox" {
+            // Filter out these flags as they are handled via bool params
             i += 1;
         } else {
             real_args.push(arg.clone());
@@ -948,8 +1086,9 @@ async fn run_internal_agent(
         }
     }
 
-    // Re-check no-proxy based on raw args (before filtering)
+    // Re-check no-proxy / no-sandbox based on raw args (before filtering)
     let no_proxy = args.iter().any(|arg| arg == "--no-proxy");
+    let _no_sandbox = args.iter().any(|arg| arg == "--no-sandbox");
 
     // Extract session ID from args
     let session_id =
@@ -959,10 +1098,16 @@ async fn run_internal_agent(
     env::set_var("SEVORIX_SESSION_ID", &session_id);
 
     // Call logic (eBPF daemon handles syscall interception)
-    // PTY multiplexer is now the default and only interactive mode
     let code = if !real_args.is_empty() {
-        let inv = parse_bash_invocation(&real_args);
-        handle_bash_invocation(inv, !no_proxy, &session_id).await?
+        if real_args[0].starts_with('-') {
+            // Bash-style invocation inside sandbox (e.g. -c "cmd")
+            let inv = parse_bash_invocation(&real_args);
+            handle_bash_invocation(inv, !no_proxy, &session_id).await?
+        } else {
+            // Direct command exec from `sevsh -- cmd args` — exec the binary
+            // directly rather than via bash to avoid "cannot execute binary file".
+            handle_direct_exec(&real_args, !no_proxy, &session_id).await?
+        }
     } else {
         run_pty_interactive_shell_code(!no_proxy, &session_id)?
     };
@@ -976,8 +1121,64 @@ async fn handle_single_command(
     use_proxy: bool,
     session_id: &str,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.first().map(|a| !a.starts_with('-')).unwrap_or(false) {
+        // Direct binary (e.g. from `sevsh -- cmd` fallback path)
+        return handle_direct_exec(args, use_proxy, session_id).await;
+    }
     let inv = parse_bash_invocation(args);
     handle_bash_invocation(inv, use_proxy, session_id).await
+}
+
+/// Execute a binary directly (not via a shell) after Watchtower validation.
+/// Used when `sevsh -- cmd args...` passes a real binary (not bash options).
+async fn handle_direct_exec(
+    args: &[String],
+    use_proxy: bool,
+    session_id: &str,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        return Ok(0);
+    }
+
+    // Validation payload: join args for a human-readable command string.
+    let payload = args.join(" ");
+    let verdict = validate_command(&payload).await?;
+
+    if verdict.allowed {
+        if verdict.status == "FLAG" {
+            eprintln!(
+                "SEVORIX WARNING: {} (Confidence: {})",
+                verdict.reason, verdict.confidence
+            );
+        }
+
+        let mut cmd = Command::new(&args[0]);
+        cmd.args(&args[1..]);
+
+        if use_proxy {
+            cmd.env("HTTP_PROXY", proxy_url())
+                .env("http_proxy", proxy_url())
+                .env("HTTPS_PROXY", proxy_url())
+                .env("https_proxy", proxy_url())
+                .env("ALL_PROXY", proxy_url())
+                .env("all_proxy", proxy_url())
+                .env("NO_PROXY", "localhost,127.0.0.1,::1")
+                .env("no_proxy", "localhost,127.0.0.1,::1");
+        }
+        cmd.env("SEVORIX_SESSION_ID", session_id);
+
+        // On Linux: apply seccomp notify/deny filter via the shared helper.
+        #[cfg(target_os = "linux")]
+        let status = spawn_with_seccomp(&mut cmd).await?;
+
+        #[cfg(not(target_os = "linux"))]
+        let status = cmd.status()?;
+
+        Ok(status.code().unwrap_or(1))
+    } else {
+        eprintln!("SEVORIX BLOCKED: {}", verdict.reason);
+        Ok(1)
+    }
 }
 
 /// Core execution path for bash-compatible invocations.
@@ -1044,180 +1245,7 @@ async fn handle_bash_invocation(
         // for synchronous kernel-level enforcement. On macOS seccomp is unavailable
         // so we skip the fetch and go straight to command execution.
         #[cfg(target_os = "linux")]
-        let (rule_set, session_role) = fetch_syscall_policy().await;
-
-        #[cfg(target_os = "linux")]
-        let status = if !rule_set.is_empty() {
-            // Create a pipe so the child's pre_exec can pass the seccomp notify_fd
-            // number back to us. Both ends inherit across fork; O_CLOEXEC closes them
-            // on exec (after the pre_exec write is already done).
-            let mut pipe_fds = [0i32; 2];
-            let pipe_ok = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
-
-            if pipe_ok {
-                let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
-
-                // SAFETY: pre_exec runs after fork, before exec. syscall_names is
-                // moved into the closure. We use only async-signal-safe primitives.
-                let syscall_names = rule_set.syscall_names.clone();
-                unsafe {
-                    command.pre_exec(move || {
-                        libc::close(pipe_read); // child doesn't need read end
-                        match apply_syscall_notify_filter(&syscall_names) {
-                            Ok(notify_fd) => {
-                                let bytes = notify_fd.to_ne_bytes();
-                                libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
-                                libc::close(pipe_write);
-                                Ok(())
-                            }
-                            Err(_) => {
-                                // Notify filter unavailable — signal -1 to parent and
-                                // fall back to the deny filter so syscalls still get EPERM.
-                                let bytes = (-1i32).to_ne_bytes();
-                                libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
-                                libc::close(pipe_write);
-                                apply_syscall_deny_filter(&syscall_names).map_err(|e| {
-                                    std::io::Error::other(format!("seccomp fallback: {}", e))
-                                })
-                            }
-                        }
-                    });
-                }
-
-                let mut child = command.spawn()?;
-                let child_pid = child.id();
-
-                // Close parent's write end so the pipe read returns EOF after
-                // the child writes its 4 bytes and execs.
-                unsafe { libc::close(pipe_write) };
-
-                // Read the notify_fd number the child wrote (blocking, 4 bytes).
-                let mut fd_bytes = [0u8; 4];
-                let mut nread = 0usize;
-                while nread < 4 {
-                    let r = unsafe {
-                        libc::read(
-                            pipe_read,
-                            fd_bytes[nread..].as_mut_ptr() as *mut libc::c_void,
-                            4 - nread,
-                        )
-                    };
-                    if r <= 0 {
-                        break;
-                    }
-                    nread += r as usize;
-                }
-                unsafe { libc::close(pipe_read) };
-
-                if nread == 4 {
-                    let child_notify_fd = i32::from_ne_bytes(fd_bytes);
-                    // child_notify_fd == -1 means notify filter failed and deny filter
-                    // was loaded as fallback — no supervisor needed.
-                    if child_notify_fd >= 0 {
-                        // pidfd_open(2) = 434, pidfd_getfd(2) = 438 on x86_64.
-                        #[cfg(target_arch = "x86_64")]
-                        const SYS_PIDFD_OPEN: i64 = 434;
-                        #[cfg(target_arch = "x86_64")]
-                        const SYS_PIDFD_GETFD: i64 = 438;
-                        #[cfg(not(target_arch = "x86_64"))]
-                        const SYS_PIDFD_OPEN: i64 = libc::SYS_pidfd_open as i64;
-                        #[cfg(not(target_arch = "x86_64"))]
-                        const SYS_PIDFD_GETFD: i64 = libc::SYS_pidfd_getfd as i64;
-
-                        let pidfd = unsafe {
-                            libc::syscall(SYS_PIDFD_OPEN, child_pid as libc::pid_t, 0u32)
-                        } as i32;
-                        let parent_notify_fd = if pidfd >= 0 {
-                            let fd = unsafe {
-                                libc::syscall(SYS_PIDFD_GETFD, pidfd, child_notify_fd, 0u32)
-                            } as i32;
-                            unsafe { libc::close(pidfd) };
-                            fd
-                        } else {
-                            -1
-                        };
-
-                        if parent_notify_fd >= 0 {
-                            // Spawn a blocking supervisor: evaluates each intercepted syscall
-                            // locally against the compiled rule set (zero-latency, no HTTP),
-                            // then responds to the kernel. Denied syscalls are logged to
-                            // Watchtower asynchronously on a fire-and-forget thread.
-                            let log_url = proxy_url().to_string();
-                            tokio::task::spawn_blocking(move || {
-                                run_seccomp_notify_supervisor(
-                                    parent_notify_fd,
-                                    |info: &SyscallInfo| -> bool {
-                                        let allow = rule_set.evaluate(info);
-                                        if !allow {
-                                            // Resolve the path NOW while the process is still
-                                            // suspended by seccomp-unotify. After we return,
-                                            // the pointer in args is no longer valid.
-                                            let path = sevorix_core::resolve_syscall_path(info);
-                                            let name = sevorix_core::syscall_name(info.syscall_nr);
-                                            let args: Vec<String> = info
-                                                .args
-                                                .iter()
-                                                .map(|a| format!("0x{:x}", a))
-                                                .collect();
-                                            let payload = serde_json::json!({
-                                                "syscall_name": name,
-                                                "syscall_number": info.syscall_nr,
-                                                "args": args,
-                                                "pid": info.pid,
-                                                "ppid": 0u32,
-                                                "timestamp": chrono::Local::now().to_rfc3339(),
-                                                "path": path,
-                                                "role": session_role,
-                                            });
-                                            // Log synchronously — we're already in spawn_blocking,
-                                            // and the child is about to receive EPERM and exit,
-                                            // so the added latency is acceptable. A fire-and-forget
-                                            // thread would be killed when sevsh exits before the
-                                            // HTTP call completes.
-                                            if let Ok(client) = reqwest::blocking::Client::builder()
-                                                .timeout(std::time::Duration::from_millis(50))
-                                                .build()
-                                            {
-                                                let _ = client
-                                                    .post(format!("{}/analyze-syscall", &log_url))
-                                                    .json(&payload)
-                                                    .send();
-                                            }
-                                        }
-                                        allow
-                                    },
-                                );
-                            });
-                        } else {
-                            // pidfd_getfd failed — we can't attach a supervisor, but the
-                            // child's notify filter is already loaded. Without a supervisor,
-                            // the first monitored syscall would deadlock waiting for a
-                            // unotify response. Kill the child to surface the error cleanly.
-                            eprintln!(
-                                "[SEVSH] Error: could not attach seccomp supervisor (pidfd_getfd failed: {}). Aborting.",
-                                std::io::Error::last_os_error()
-                            );
-                            unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
-                        }
-                    }
-                }
-
-                child.wait()?
-            } else {
-                // Pipe creation failed; fall back to EPERM-only filter (no logging).
-                let fallback_names = rule_set.syscall_names.clone();
-                unsafe {
-                    command.pre_exec(move || {
-                        apply_syscall_deny_filter(&fallback_names).map_err(|e| {
-                            std::io::Error::other(format!("seccomp filter failed: {}", e))
-                        })
-                    });
-                }
-                command.status()?
-            }
-        } else {
-            command.status()?
-        };
+        let status = spawn_with_seccomp(&mut command).await?;
 
         #[cfg(not(target_os = "linux"))]
         let status = command.status()?;
@@ -1348,6 +1376,194 @@ async fn fetch_syscall_policy() -> (sevorix_core::CompiledRuleSet, String) {
     }
 }
 
+/// Spawn `command` with the full seccomp notify/deny filter applied.
+///
+/// Fetches the current syscall policy from Watchtower, then:
+/// 1. If the rule set is non-empty: installs a seccomp notify filter in the
+///    child via `pre_exec`, reads the notify fd back over a pipe, and starts a
+///    blocking supervisor task that evaluates each intercepted syscall and logs
+///    denials to Watchtower.
+/// 2. If the notify filter setup fails: falls back to a deny-only filter (no
+///    supervisor, syscalls receive EPERM but are not logged).
+/// 3. If the rule set is empty: spawns the command without any seccomp filter.
+///
+/// Returns the child's exit status.
+#[cfg(target_os = "linux")]
+async fn spawn_with_seccomp(command: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let (rule_set, session_role) = fetch_syscall_policy().await;
+
+    if !rule_set.is_empty() {
+        // Create a pipe so the child's pre_exec can pass the seccomp notify_fd
+        // number back to us. Both ends inherit across fork; O_CLOEXEC closes them
+        // on exec (after the pre_exec write is already done).
+        let mut pipe_fds = [0i32; 2];
+        let pipe_ok = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+
+        if pipe_ok {
+            let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
+
+            // SAFETY: pre_exec runs after fork, before exec. syscall_names is
+            // moved into the closure. We use only async-signal-safe primitives.
+            let syscall_names = rule_set.syscall_names.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    libc::close(pipe_read); // child doesn't need read end
+                    match apply_syscall_notify_filter(&syscall_names) {
+                        Ok(notify_fd) => {
+                            let bytes = notify_fd.to_ne_bytes();
+                            libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
+                            libc::close(pipe_write);
+                            Ok(())
+                        }
+                        Err(_) => {
+                            // Notify filter unavailable — signal -1 to parent and
+                            // fall back to the deny filter so syscalls still get EPERM.
+                            let bytes = (-1i32).to_ne_bytes();
+                            libc::write(pipe_write, bytes.as_ptr() as *const libc::c_void, 4);
+                            libc::close(pipe_write);
+                            apply_syscall_deny_filter(&syscall_names).map_err(|e| {
+                                std::io::Error::other(format!("seccomp fallback: {}", e))
+                            })
+                        }
+                    }
+                });
+            }
+
+            let mut child = command.spawn()?;
+            let child_pid = child.id();
+
+            // Close parent's write end so the pipe read returns EOF after
+            // the child writes its 4 bytes and execs.
+            unsafe { libc::close(pipe_write) };
+
+            // Read the notify_fd number the child wrote (blocking, 4 bytes).
+            let mut fd_bytes = [0u8; 4];
+            let mut nread = 0usize;
+            while nread < 4 {
+                let r = unsafe {
+                    libc::read(
+                        pipe_read,
+                        fd_bytes[nread..].as_mut_ptr() as *mut libc::c_void,
+                        4 - nread,
+                    )
+                };
+                if r <= 0 {
+                    break;
+                }
+                nread += r as usize;
+            }
+            unsafe { libc::close(pipe_read) };
+
+            if nread == 4 {
+                let child_notify_fd = i32::from_ne_bytes(fd_bytes);
+                // child_notify_fd == -1 means notify filter failed and deny filter
+                // was loaded as fallback — no supervisor needed.
+                if child_notify_fd >= 0 {
+                    // pidfd_open(2) = 434, pidfd_getfd(2) = 438 on x86_64.
+                    #[cfg(target_arch = "x86_64")]
+                    const SYS_PIDFD_OPEN: i64 = 434;
+                    #[cfg(target_arch = "x86_64")]
+                    const SYS_PIDFD_GETFD: i64 = 438;
+                    #[cfg(not(target_arch = "x86_64"))]
+                    const SYS_PIDFD_OPEN: i64 = libc::SYS_pidfd_open as i64;
+                    #[cfg(not(target_arch = "x86_64"))]
+                    const SYS_PIDFD_GETFD: i64 = libc::SYS_pidfd_getfd as i64;
+
+                    let pidfd =
+                        unsafe { libc::syscall(SYS_PIDFD_OPEN, child_pid as libc::pid_t, 0u32) }
+                            as i32;
+                    let parent_notify_fd = if pidfd >= 0 {
+                        let fd =
+                            unsafe { libc::syscall(SYS_PIDFD_GETFD, pidfd, child_notify_fd, 0u32) }
+                                as i32;
+                        unsafe { libc::close(pidfd) };
+                        fd
+                    } else {
+                        -1
+                    };
+
+                    if parent_notify_fd >= 0 {
+                        // Spawn a blocking supervisor: evaluates each intercepted syscall
+                        // locally against the compiled rule set (zero-latency, no HTTP),
+                        // then responds to the kernel. Denied syscalls are logged to
+                        // Watchtower asynchronously on a fire-and-forget thread.
+                        let log_url = proxy_url().to_string();
+                        tokio::task::spawn_blocking(move || {
+                            run_seccomp_notify_supervisor(
+                                parent_notify_fd,
+                                |info: &SyscallInfo| -> bool {
+                                    let allow = rule_set.evaluate(info);
+                                    if !allow {
+                                        // Resolve the path NOW while the process is still
+                                        // suspended by seccomp-unotify. After we return,
+                                        // the pointer in args is no longer valid.
+                                        let path = sevorix_core::resolve_syscall_path(info);
+                                        let name = sevorix_core::syscall_name(info.syscall_nr);
+                                        let args: Vec<String> = info
+                                            .args
+                                            .iter()
+                                            .map(|a| format!("0x{:x}", a))
+                                            .collect();
+                                        let payload = serde_json::json!({
+                                            "syscall_name": name,
+                                            "syscall_number": info.syscall_nr,
+                                            "args": args,
+                                            "pid": info.pid,
+                                            "ppid": 0u32,
+                                            "timestamp": chrono::Local::now().to_rfc3339(),
+                                            "path": path,
+                                            "role": session_role,
+                                        });
+                                        // Log synchronously — we're already in spawn_blocking,
+                                        // and the child is about to receive EPERM and exit,
+                                        // so the added latency is acceptable. A fire-and-forget
+                                        // thread would be killed when sevsh exits before the
+                                        // HTTP call completes.
+                                        if let Ok(client) = reqwest::blocking::Client::builder()
+                                            .timeout(std::time::Duration::from_millis(50))
+                                            .build()
+                                        {
+                                            let _ = client
+                                                .post(format!("{}/analyze-syscall", &log_url))
+                                                .json(&payload)
+                                                .send();
+                                        }
+                                    }
+                                    allow
+                                },
+                            );
+                        });
+                    } else {
+                        // pidfd_getfd failed — we can't attach a supervisor, but the
+                        // child's notify filter is already loaded. Without a supervisor,
+                        // the first monitored syscall would deadlock waiting for a
+                        // unotify response. Kill the child to surface the error cleanly.
+                        eprintln!(
+                            "[SEVSH] Error: could not attach seccomp supervisor (pidfd_getfd failed: {}). Aborting.",
+                            std::io::Error::last_os_error()
+                        );
+                        unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
+                    }
+                }
+            }
+
+            child.wait()
+        } else {
+            // Pipe creation failed; fall back to EPERM-only filter (no logging).
+            let fallback_names = rule_set.syscall_names.clone();
+            unsafe {
+                command.pre_exec(move || {
+                    apply_syscall_deny_filter(&fallback_names)
+                        .map_err(|e| std::io::Error::other(format!("seccomp filter failed: {}", e)))
+                });
+            }
+            command.status()
+        }
+    } else {
+        command.status()
+    }
+}
+
 async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Error>> {
     let settings = sevorix_watchtower::settings::Settings::load();
     // The validation timeout must exceed the intervention timeout so that flagged
@@ -1375,12 +1591,16 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
     // but returning error here lets the caller decide.
     // The plan says: "If Watchtower is unreachable, default to blocking execution".
 
+    let pid = std::process::id();
+    let ppid = unsafe { libc::getppid() } as u32;
     let resp = client
         .post(url)
         .json(&json!({
             "payload": cmd,
             "agent": "sevsh-repl",
-            "context": "Shell"
+            "context": "Shell",
+            "pid": pid,
+            "ppid": ppid,
         }))
         .send()
         .await;
@@ -1744,12 +1964,14 @@ mod tests {
 
     #[test]
     fn test_has_sevsh_flags_no_proxy() {
-        assert!(has_sevsh_flags(&args(&["--no-proxy", "-c", "cmd"])));
+        // --no-proxy is a modifier flag; does not force the clap path on its own
+        assert!(!has_sevsh_flags(&args(&["--no-proxy", "-c", "cmd"])));
     }
 
     #[test]
     fn test_has_sevsh_flags_no_sandbox() {
-        assert!(has_sevsh_flags(&args(&["--no-sandbox"])));
+        // --no-sandbox is a modifier flag; does not force the clap path on its own
+        assert!(!has_sevsh_flags(&args(&["--no-sandbox"])));
     }
 
     #[test]
@@ -1780,5 +2002,185 @@ mod tests {
     #[test]
     fn test_has_sevsh_flags_none_for_empty() {
         assert!(!has_sevsh_flags(&[]));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_double_dash() {
+        // `sevsh -- curl ...` must route through the clap path, not bash-compat
+        assert!(has_sevsh_flags(&args(&[
+            "--",
+            "curl",
+            "-s",
+            "http://example.com"
+        ])));
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_bash_invocation: --flag=value stripping
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_no_sandbox_eq_value_consumed() {
+        // --no-sandbox=value must be consumed by sevsh, NOT forwarded to bash.
+        let inv = parse_bash_invocation(&args(&["--no-sandbox=true", "-c", "echo hello"]));
+        assert_eq!(inv.command, Some("echo hello".to_string()));
+        assert!(
+            !inv.extra_options.iter().any(|o| o == "--no-sandbox=true"),
+            "expected --no-sandbox=true to be consumed, not in extra_options"
+        );
+    }
+
+    #[test]
+    fn test_parse_no_proxy_eq_value_consumed() {
+        // --no-proxy=value must be consumed by sevsh, NOT forwarded to bash.
+        let inv = parse_bash_invocation(&args(&["--no-proxy=1", "-c", "cmd"]));
+        assert_eq!(inv.command, Some("cmd".to_string()));
+        assert!(
+            !inv.extra_options.iter().any(|o| o == "--no-proxy=1"),
+            "expected --no-proxy=1 to be consumed, not in extra_options"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // proxy_unix_to_tcp: bare-LF header injection
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_proxy_unix_to_tcp_bare_lf_injection() {
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        // Serialize env-var mutation across tests.
+        static PORT_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = PORT_LOCK.lock().unwrap();
+
+        // Bind a TCP listener on a random port.
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp_listener.local_addr().unwrap().port();
+
+        // Point RESOLVED_PROXY_URL at our listener.  The OnceLock may already
+        // be initialised from a previous test run in this process; if so we
+        // need to overwrite it.  We do this by temporarily putting the port
+        // into SEVORIX_PORT and then calling resolved_proxy_port() which
+        // parses from the OnceLock — but since the OnceLock is already set we
+        // have to use a small workaround: override the OnceLock value with
+        // unsafe memory manipulation would be unsound, so instead we force the
+        // URL by using set_var and calling resolve_proxy_url() inline here,
+        // then patching the OnceLock.  Because OnceLock doesn't allow
+        // overwrite we use a different strategy: derive the port from the
+        // env-var inside a helper and verify the listener receives the request.
+        //
+        // The cleanest approach that avoids OnceLock conflicts: write the
+        // request to the unix socket directly, and inspect what arrives at the
+        // TCP listener after spawning the task.  We temporarily set
+        // SEVORIX_PORT so that resolved_proxy_port() picks up our port.
+        // resolved_proxy_port() reads proxy_url() which reads RESOLVED_PROXY_URL.
+        // If RESOLVED_PROXY_URL is uninitialised it falls back to env vars via
+        // resolve_proxy_url().  We ensure RESOLVED_PROXY_URL is initialised to
+        // our port by calling get_or_init before the task starts.
+        RESOLVED_PROXY_URL.get_or_init(|| format!("http://localhost:{}", port));
+
+        // If the OnceLock was already initialised to a different port we fall
+        // back to whatever port it holds and bind a new listener on that port.
+        let actual_port: u16 = {
+            let url = RESOLVED_PROXY_URL.get().unwrap();
+            url.split(':')
+                .nth(2)
+                .and_then(|s| s.split('/').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3000)
+        };
+
+        // Re-bind the listener on the actual port if it differs.
+        let tcp_listener: tokio::net::TcpListener = if actual_port == port {
+            tcp_listener
+        } else {
+            tokio::net::TcpListener::bind(format!("127.0.0.1:{}", actual_port))
+                .await
+                .unwrap()
+        };
+
+        // Create a Unix socket pair.  We pass the *server* side to
+        // proxy_unix_to_tcp; we write the request to the *client* side.
+        let (mut client_unix, server_unix) = UnixStream::pair().unwrap();
+
+        // Spawn the proxy task.
+        let proxy_task = tokio::spawn(proxy_unix_to_tcp(server_unix));
+
+        // Write an HTTP request with bare-LF line endings.
+        client_unix
+            .write_all(b"GET / HTTP/1.0\nHost: example.com\n\n")
+            .await
+            .unwrap();
+
+        // Accept the forwarded connection on the TCP listener.
+        let (mut tcp_conn, _) = tcp_listener.accept().await.unwrap();
+
+        // Read the forwarded request (up to 8 KiB).
+        let mut buf = vec![0u8; 8192];
+        let n = tcp_conn.read(&mut buf).await.unwrap();
+        let forwarded = std::str::from_utf8(&buf[..n]).unwrap();
+
+        assert!(
+            forwarded.contains("X-Sevorix-Pid:"),
+            "expected X-Sevorix-Pid header in forwarded request, got:\n{}",
+            forwarded
+        );
+        assert!(
+            forwarded.contains("X-Sevorix-Ppid:"),
+            "expected X-Sevorix-Ppid header in forwarded request, got:\n{}",
+            forwarded
+        );
+
+        // Close the TCP connection so the bidirectional copy terminates.
+        drop(tcp_conn);
+        drop(client_unix);
+        let _ = proxy_task.await;
+    }
+
+    // -------------------------------------------------------------------------
+    // proxy_unix_to_tcp: oversized headers → 431 rejection
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_proxy_unix_to_tcp_oversized_headers_431() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        // Create a Unix socket pair.
+        let (mut client_unix, server_unix) = UnixStream::pair().unwrap();
+
+        // Build a request whose headers exceed MAX_HEADER_BYTES (65536).
+        // The header value consists of 66000 'a' bytes (no \r or \n embedded),
+        // which pushes the buffer past 65536 before any terminator is seen.
+        let mut big_request = b"GET / HTTP/1.1\r\nX-Padding: ".to_vec();
+        big_request.extend(std::iter::repeat(b'a').take(66_000));
+        big_request.extend_from_slice(b"\r\n\r\n");
+
+        // Spawn the proxy function as a task first, then feed it data.
+        // We read from the client concurrently so we capture the 431 response
+        // before server_unix is dropped.
+        let proxy_task = tokio::spawn(proxy_unix_to_tcp(server_unix));
+
+        // Write the oversized request to the client side.
+        client_unix.write_all(&big_request).await.unwrap();
+        // Shut down the write half so the server sees EOF after writing the 431.
+        client_unix.shutdown().await.unwrap();
+
+        // Concurrently read back the 431 response from the server.
+        let mut response = Vec::new();
+        client_unix.read_to_end(&mut response).await.unwrap_or(0);
+
+        // Wait for the proxy task to finish.
+        let result = proxy_task.await.expect("proxy task panicked");
+        assert!(result.is_ok(), "expected Ok(()), got: {:?}", result);
+
+        let response_str = std::str::from_utf8(&response).unwrap_or("<non-utf8>");
+        assert!(
+            response_str.starts_with("HTTP/1.1 431"),
+            "expected HTTP/1.1 431 response, got: {:?}",
+            response_str
+        );
     }
 }
