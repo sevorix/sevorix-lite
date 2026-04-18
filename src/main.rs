@@ -4,6 +4,7 @@
 use clap::{CommandFactory, Parser};
 use sevorix_watchtower::find_available_port;
 use sevorix_watchtower::prime::print_prime;
+use sevorix_watchtower::SessionCommands;
 use sevorix_watchtower::{
     handle_ca, handle_config, handle_integrations, handle_validate,
     logging::{init_logging, init_logging_with_session},
@@ -159,6 +160,7 @@ fn main() -> anyhow::Result<()> {
             context,
         }) => handle_validate(command, role, context),
         Some(Commands::Prime { agent_type }) => print_prime(&agent_type),
+        Some(Commands::Session { subcmd }) => handle_session(subcmd),
         Some(Commands::Ca { subcmd }) => handle_ca(subcmd),
         Some(Commands::Run) => {
             // Explicit foreground run
@@ -361,6 +363,213 @@ fn print_all_sessions_status() {
     }
     #[cfg(feature = "ebpf")]
     print_ebpf_daemon_status();
+}
+
+fn resolve_session_port(name: Option<&str>) -> Option<u16> {
+    let sessions = DaemonManager::list_sessions().ok()?;
+    if let Some(n) = name {
+        sessions
+            .iter()
+            .find(|(info, _)| info.name == n)
+            .map(|(info, _)| info.port)
+    } else if sessions.len() == 1 {
+        Some(sessions[0].0.port)
+    } else {
+        None
+    }
+}
+
+fn handle_session(cmd: SessionCommands) {
+    match cmd {
+        SessionCommands::List => {
+            let sessions = DaemonManager::list_sessions().unwrap_or_default();
+            if sessions.is_empty() {
+                println!("No running Watchtower sessions.");
+            } else {
+                println!(
+                    "{:<20} {:<38} {:<10} {:<12} STATUS",
+                    "NAME", "SESSION_ID", "PORT", "ROLE"
+                );
+                println!("{}", "-".repeat(90));
+                for (info, running) in &sessions {
+                    let port_str = if info.port == 0 {
+                        "(unknown)".to_string()
+                    } else {
+                        info.port.to_string()
+                    };
+                    let id_str = if info.session_id.is_empty() {
+                        "(legacy)".to_string()
+                    } else {
+                        info.session_id.clone()
+                    };
+                    println!(
+                        "{:<20} {:<38} {:<10} {:<12} {}",
+                        info.name,
+                        id_str,
+                        port_str,
+                        info.role.as_deref().unwrap_or("(none)"),
+                        if *running { "running" } else { "stopped" }
+                    );
+                }
+            }
+        }
+        SessionCommands::Kill { name } => {
+            let port = match resolve_session_port(name.as_deref()) {
+                Some(p) => p,
+                None => {
+                    let sessions = DaemonManager::list_sessions().unwrap_or_default();
+                    if sessions.is_empty() {
+                        eprintln!("Error: no running Watchtower sessions.");
+                    } else {
+                        eprintln!(
+                            "Error: multiple sessions running. Specify one with --name. Running: {}",
+                            sessions.iter().map(|(i, _)| i.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+
+            rt.block_on(async move {
+                let url = format!("http://localhost:{}/api/session/kill", port);
+                let client = reqwest::Client::new();
+                match client.post(&url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        let body: serde_json::Value =
+                            r.json().await.unwrap_or(serde_json::json!({}));
+                        let killed = body["killed"].as_u64().unwrap_or(0);
+                        println!("Session killed. {} process(es) terminated.", killed);
+                    }
+                    Ok(r) => {
+                        eprintln!("Error: server returned {}", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: could not reach Watchtower: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
+        SessionCommands::Freeze { name } => {
+            let port = match resolve_session_port(name.as_deref()) {
+                Some(p) => p,
+                None => {
+                    let sessions = DaemonManager::list_sessions().unwrap_or_default();
+                    if sessions.is_empty() {
+                        eprintln!("Error: no running Watchtower sessions.");
+                    } else {
+                        eprintln!(
+                            "Error: multiple sessions running. Specify one with --name. Running: {}",
+                            sessions.iter().map(|(i, _)| i.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                    std::process::exit(1);
+                }
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+            rt.block_on(async move {
+                let url = format!("http://localhost:{}/api/session/freeze", port);
+                match reqwest::Client::new().post(&url).send().await {
+                    Ok(r) if r.status().is_success() => println!("Session frozen."),
+                    Ok(r) => {
+                        eprintln!("Error: server returned {}", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: could not reach Watchtower: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
+        SessionCommands::Unfreeze { name } => {
+            let port = match resolve_session_port(name.as_deref()) {
+                Some(p) => p,
+                None => {
+                    let sessions = DaemonManager::list_sessions().unwrap_or_default();
+                    if sessions.is_empty() {
+                        eprintln!("Error: no running Watchtower sessions.");
+                    } else {
+                        eprintln!(
+                            "Error: multiple sessions running. Specify one with --name. Running: {}",
+                            sessions.iter().map(|(i, _)| i.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                    std::process::exit(1);
+                }
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+            rt.block_on(async move {
+                let url = format!("http://localhost:{}/api/session/unfreeze", port);
+                match reqwest::Client::new().post(&url).send().await {
+                    Ok(r) if r.status().is_success() => println!("Session unfrozen."),
+                    Ok(r) => {
+                        eprintln!("Error: server returned {}", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: could not reach Watchtower: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
+        SessionCommands::SetRole { role, name } => {
+            let port = match resolve_session_port(name.as_deref()) {
+                Some(p) => p,
+                None => {
+                    let sessions = DaemonManager::list_sessions().unwrap_or_default();
+                    if sessions.is_empty() {
+                        eprintln!("Error: no running Watchtower sessions.");
+                    } else {
+                        eprintln!(
+                            "Error: multiple sessions running. Specify one with --name. Running: {}",
+                            sessions.iter().map(|(i, _)| i.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+
+            rt.block_on(async move {
+                let url = format!("http://localhost:{}/api/session/set-role", port);
+                let client = reqwest::Client::new();
+                match client
+                    .post(&url)
+                    .json(&serde_json::json!({"role": &role}))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => println!("Session role set to '{}'", role),
+                    Ok(r) => {
+                        eprintln!("Error: server returned {}", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: could not reach Watchtower: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]

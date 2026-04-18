@@ -72,6 +72,11 @@ pub enum Commands {
         /// Agent type to prime: policy-manager (pm) or guarded-agent (guard)
         agent_type: String,
     },
+    /// Session management commands
+    Session {
+        #[command(subcommand)]
+        subcmd: SessionCommands,
+    },
     /// CA certificate management (TLS MITM)
     Ca {
         #[command(subcommand)]
@@ -93,6 +98,18 @@ pub enum SessionCommands {
     },
     /// Atomically kill all agent processes in the session cgroup tree
     Kill {
+        /// Target session by name (required when multiple sessions are running)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Freeze all agent processes in the session cgroup (suspend without killing)
+    Freeze {
+        /// Target session by name (required when multiple sessions are running)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Unfreeze all agent processes in the session cgroup
+    Unfreeze {
         /// Target session by name (required when multiple sessions are running)
         #[arg(long)]
         name: Option<String>,

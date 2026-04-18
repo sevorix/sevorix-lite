@@ -298,6 +298,20 @@ else
 fi
 
 # ---------------------------------------------------------------
+# Install agent-wrap helper (reusable agent cgroup lifecycle)
+# ---------------------------------------------------------------
+AGENT_WRAP="/usr/local/bin/sevorix-agent-wrap"
+if [ -f "scripts/sevorix-agent-wrap" ]; then
+    if sudo cp "scripts/sevorix-agent-wrap" "$AGENT_WRAP" && sudo chmod 755 "$AGENT_WRAP"; then
+        echo "   ✅ sevorix-agent-wrap installed"
+    else
+        echo "   ⚠️  Failed to install sevorix-agent-wrap."
+    fi
+else
+    echo "ℹ️  scripts/sevorix-agent-wrap not found — skipping."
+fi
+
+# ---------------------------------------------------------------
 # Install Claude Code launcher (mount-namespace /bin/bash interception)
 # ---------------------------------------------------------------
 CLAUDE_LAUNCHER="/usr/local/bin/sevorix-claude-launcher"
