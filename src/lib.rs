@@ -19,6 +19,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, RwLock},
 };
+use tokio::process::Command as AsyncCommand;
 use tokio::sync::{broadcast, oneshot, watch, Mutex};
 
 /// Unix socket path used for synchronous cgroup registration between
@@ -555,6 +556,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/session/register", post(session_register))
         .route("/api/session/unregister", post(session_unregister))
         .route("/api/session/set-role", post(session_set_role))
+        .route("/api/session/kill", post(session_kill_handler))
         .route("/api/active-sessions", get(active_sessions_handler));
 
     #[cfg(target_os = "linux")]
@@ -832,6 +834,91 @@ async fn session_unregister(
         state.active_sessions.lock().await.remove(path);
     }
     StatusCode::OK
+}
+
+const CGROUP_HELPER: &str = "/usr/local/bin/sevorix-cgroup-helper";
+const CGROUP_BASE: &str = "/sys/fs/cgroup/sevorix";
+
+/// Find which registered session cgroup contains `pid`, freeze it, and return its path.
+///
+/// Reads `/proc/<pid>/cgroup` (cgroup v2 unified hierarchy: `0::<rel_path>`) and
+/// matches the full path against `active_sessions`. Returns `None` if the PID is not
+/// found in any registered session or if the freeze call fails.
+async fn freeze_cgroup_for_pid(
+    pid: Option<u32>,
+    sessions: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let pid = pid?;
+    let cgroup_content = tokio::fs::read_to_string(format!("/proc/{}/cgroup", pid))
+        .await
+        .ok()?;
+    // cgroup v2 unified hierarchy line: "0::<relative_path>"
+    let cgroup_path = cgroup_content.lines().find_map(|line| {
+        let rel = line.split(':').nth(2)?;
+        let full = format!("/sys/fs/cgroup{}", rel.trim_end_matches('/'));
+        sessions.contains(&full).then_some(full)
+    })?;
+    let session_id = cgroup_path.strip_prefix(&format!("{}/", CGROUP_BASE))?;
+    let status = AsyncCommand::new("sudo")
+        .args(["-n", CGROUP_HELPER, "freeze", session_id])
+        .status()
+        .await
+        .ok()?;
+    status.success().then_some(cgroup_path)
+}
+
+/// Unfreeze a session cgroup after a pending decision resolves.
+async fn unfreeze_cgroup(cgroup_path: &str) {
+    let Some(session_id) = cgroup_path.strip_prefix(&format!("{}/", CGROUP_BASE)) else {
+        return;
+    };
+    let _ = AsyncCommand::new("sudo")
+        .args(["-n", CGROUP_HELPER, "unfreeze", session_id])
+        .status()
+        .await;
+}
+
+/// Kill all agent processes across every cgroup registered with this Watchtower instance.
+///
+/// Sequence per cgroup: freeze → wait for frozen=1 → cgroup.kill (or per-PID SIGKILL fallback).
+/// Clears active_sessions and pending_decisions, then broadcasts SESSION_KILLED.
+async fn session_kill_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions: Vec<String> = state.active_sessions.lock().await.iter().cloned().collect();
+
+    let mut total_killed: u32 = 0;
+    for cgroup_path in &sessions {
+        // Extract session_id from path: /sys/fs/cgroup/sevorix/<session_id>
+        let session_id = cgroup_path
+            .strip_prefix(&format!("{}/", CGROUP_BASE))
+            .unwrap_or(cgroup_path);
+
+        let output = std::process::Command::new("sudo")
+            .args(["-n", CGROUP_HELPER, "kill", session_id])
+            .output();
+
+        if let Ok(out) = output {
+            let count_str = String::from_utf8_lossy(&out.stdout);
+            total_killed += count_str.trim().parse::<u32>().unwrap_or(0);
+        }
+
+        // Cleanup the cgroup directory after killing
+        let _ = std::process::Command::new("sudo")
+            .args(["-n", CGROUP_HELPER, "cleanup", session_id])
+            .output();
+    }
+
+    // Clear server state
+    state.active_sessions.lock().await.clear();
+    state.pending_decisions.clear();
+
+    let ev = json!({
+        "type": "SESSION_KILLED",
+        "killed_count": total_killed,
+        "timestamp": chrono::Local::now().to_rfc3339(),
+    });
+    let _ = state.tx.send(ev.to_string());
+
+    Json(json!({ "status": "ok", "killed": total_killed }))
 }
 
 async fn session_set_role(
@@ -1161,6 +1248,22 @@ async fn analyze_intent(
         log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
         let _ = state.tx.send(pending_event.to_string());
 
+        // Freeze the agent's cgroup before awaiting the decision so it cannot
+        // fork or exec while the operator reviews the flagged command.
+        let frozen_cgroup = {
+            let sessions = state.active_sessions.lock().await;
+            freeze_cgroup_for_pid(payload["pid"].as_u64().map(|p| p as u32), &sessions).await
+        };
+        if let Some(ref cgroup_path) = frozen_cgroup {
+            let frozen_ev = json!({
+                "type": "CGROUP_FROZEN",
+                "event_id": event_id,
+                "cgroup_path": cgroup_path,
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            });
+            let _ = state.tx.send(frozen_ev.to_string());
+        }
+
         let allowed = await_decision_with_pause(
             decision_rx,
             pause_rx,
@@ -1168,6 +1271,12 @@ async fn analyze_intent(
             state.intervention_timeout_allow,
         )
         .await;
+
+        // Always unfreeze after decision — the agent process resumes and handles
+        // the ALLOW or BLOCK response normally via its buffered TCP connection.
+        if let Some(ref cgroup_path) = frozen_cgroup {
+            unfreeze_cgroup(cgroup_path).await;
+        }
 
         // Still in map → timeout fired (not resolved by user via decide_handler)
         if state.pending_decisions.remove(&event_id).is_some() {

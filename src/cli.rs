@@ -91,6 +91,12 @@ pub enum SessionCommands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Atomically kill all agent processes in the session cgroup tree
+    Kill {
+        /// Target session by name (required when multiple sessions are running)
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
