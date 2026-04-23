@@ -557,6 +557,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/session/unregister", post(session_unregister))
         .route("/api/session/set-role", post(session_set_role))
         .route("/api/session/kill", post(session_kill_handler))
+        .route("/api/session/freeze", post(session_freeze_handler))
+        .route("/api/session/unfreeze", post(session_unfreeze_handler))
         .route("/api/active-sessions", get(active_sessions_handler));
 
     #[cfg(target_os = "linux")]
@@ -892,9 +894,10 @@ async fn session_kill_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
             .strip_prefix(&format!("{}/", CGROUP_BASE))
             .unwrap_or(cgroup_path);
 
-        let output = std::process::Command::new("sudo")
+        let output = AsyncCommand::new("sudo")
             .args(["-n", CGROUP_HELPER, "kill", session_id])
-            .output();
+            .output()
+            .await;
 
         if let Ok(out) = output {
             let count_str = String::from_utf8_lossy(&out.stdout);
@@ -902,9 +905,10 @@ async fn session_kill_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
         }
 
         // Cleanup the cgroup directory after killing
-        let _ = std::process::Command::new("sudo")
+        let _ = AsyncCommand::new("sudo")
             .args(["-n", CGROUP_HELPER, "cleanup", session_id])
-            .output();
+            .output()
+            .await;
     }
 
     // Clear server state
@@ -919,6 +923,44 @@ async fn session_kill_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
     let _ = state.tx.send(ev.to_string());
 
     Json(json!({ "status": "ok", "killed": total_killed }))
+}
+
+/// Freeze all registered session cgroups on demand (operator-initiated).
+async fn session_freeze_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions: Vec<String> = state.active_sessions.lock().await.iter().cloned().collect();
+    for cgroup_path in &sessions {
+        if let Some(session_id) = cgroup_path.strip_prefix(&format!("{}/", CGROUP_BASE)) {
+            let _ = AsyncCommand::new("sudo")
+                .args(["-n", CGROUP_HELPER, "freeze", session_id])
+                .status()
+                .await;
+        }
+    }
+    let ev = json!({
+        "type": "SESSION_FROZEN",
+        "timestamp": chrono::Local::now().to_rfc3339(),
+    });
+    let _ = state.tx.send(ev.to_string());
+    Json(json!({ "status": "ok", "frozen": sessions.len() }))
+}
+
+/// Unfreeze all registered session cgroups (operator-initiated).
+async fn session_unfreeze_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions: Vec<String> = state.active_sessions.lock().await.iter().cloned().collect();
+    for cgroup_path in &sessions {
+        if let Some(session_id) = cgroup_path.strip_prefix(&format!("{}/", CGROUP_BASE)) {
+            let _ = AsyncCommand::new("sudo")
+                .args(["-n", CGROUP_HELPER, "unfreeze", session_id])
+                .status()
+                .await;
+        }
+    }
+    let ev = json!({
+        "type": "SESSION_UNFROZEN",
+        "timestamp": chrono::Local::now().to_rfc3339(),
+    });
+    let _ = state.tx.send(ev.to_string());
+    Json(json!({ "status": "ok" }))
 }
 
 async fn session_set_role(
@@ -2089,11 +2131,7 @@ async fn get_stats_handler(
         }
     }
 
-    let avg_latency = if latency_count > 0 {
-        latency_sum / latency_count
-    } else {
-        0
-    };
+    let avg_latency = latency_sum.checked_div(latency_count).unwrap_or(0);
 
     Json(json!({
         "total": total,
