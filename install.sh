@@ -54,6 +54,8 @@ prompt_confirm() {
     esac
 }
 
+CARGO_FEATURES="ebpf"
+
 echo "--------------------------------------------------"
 echo "🛡️  Sevorix Watchtower Installer"
 if [ "$FORCE" -eq 1 ]; then
@@ -140,9 +142,9 @@ if [ -f "Cargo.toml" ]; then
     # ---------------------------------------------------------------
     if prompt_confirm \
         "Build Sevorix from source" \
-        "Compiles release binaries (sevorix, sevsh, sevorix-ebpf-daemon). Runs: cargo build --release --features ebpf"; then
+        "Compiles release binaries (sevorix, sevsh, sevorix-ebpf-daemon). Runs: cargo build --release --features $CARGO_FEATURES"; then
         echo "   Compiling release build (this may take a minute)..."
-        cargo build --release --features ebpf
+        cargo build --release --features "$CARGO_FEATURES"
 
         SOURCE_BIN="target/release/sevorix_watchtower"
         SHELL_BIN="target/release/sevsh"
