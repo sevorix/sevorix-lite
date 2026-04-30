@@ -360,12 +360,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !has_sevsh_flags(user_args) {
         let inv = parse_bash_invocation(user_args);
         let session_id = format!("sevsh-{}", Uuid::new_v4());
+        // Guard: if SEVORIX_SESSION_ID is already set we are nested inside an
+        // existing sevsh session — skip cgroup creation to prevent recursive spawning.
+        let already_in_session = env::var("SEVORIX_SESSION_ID").is_ok();
         env::set_var("SEVORIX_SESSION_ID", &session_id);
 
         // Set up cgroup for eBPF syscall tracking. Best-effort: if cgroup
         // creation fails (e.g. helper not installed), proceed without isolation.
-        let cgroup_created = create_session_cgroup(&session_id).unwrap_or_default();
+        let cgroup_created = if already_in_session {
+            false
+        } else {
+            create_session_cgroup(&session_id).unwrap_or_default()
+        };
         if cgroup_created {
+            if let Err(e) = add_process_to_cgroup(&session_id) {
+                eprintln!("[SEVSH] Warning: Could not add process to cgroup: {}", e);
+            }
             let path = format!("/sys/fs/cgroup/sevorix/{}", session_id);
             let url = proxy_url().to_string();
             let _ = reqwest::Client::builder()
@@ -385,6 +395,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Real interactive session: intercept typed commands via PTY.
                 let exit_code = run_pty_interactive_shell_code(true, &session_id)?;
                 if cgroup_created {
+                    let _ = reqwest::Client::builder().no_proxy().build().unwrap_or_default()
+                        .post(format!("{}/api/session/unregister", proxy_url()))
+                        .header("X-Sevorix-Internal", "true")
+                        .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+                        .send().await;
                     cleanup_session_cgroup(&session_id);
                 }
                 exit(exit_code);
@@ -394,6 +409,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let shell = real_shell();
                 let status = Command::new(&shell).args(inv.to_bash_args()).status()?;
                 if cgroup_created {
+                    let _ = reqwest::Client::builder().no_proxy().build().unwrap_or_default()
+                        .post(format!("{}/api/session/unregister", proxy_url()))
+                        .header("X-Sevorix-Internal", "true")
+                        .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+                        .send().await;
                     cleanup_session_cgroup(&session_id);
                 }
                 exit(status.code().unwrap_or(1));
@@ -430,6 +450,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         handle_bash_invocation(inv, true, &session_id).await?
                     } else {
                         if cgroup_created {
+                            let _ = reqwest::Client::builder().no_proxy().build().unwrap_or_default()
+                                .post(format!("{}/api/session/unregister", proxy_url()))
+                                .header("X-Sevorix-Internal", "true")
+                                .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+                                .send().await;
                             cleanup_session_cgroup(&session_id);
                         }
                         return Err(e);
@@ -444,6 +469,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("[SEVSH] Error: Sandbox tools (unshare/ip) not available for -c/-script invocation.");
             eprintln!("[SEVSH] Fail-closed: Use --no-sandbox to allow unsandboxed execution.");
             if cgroup_created {
+                let _ = reqwest::Client::builder().no_proxy().build().unwrap_or_default()
+                    .post(format!("{}/api/session/unregister", proxy_url()))
+                    .header("X-Sevorix-Internal", "true")
+                    .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+                    .send().await;
                 cleanup_session_cgroup(&session_id);
             }
             std::process::exit(1);
@@ -452,6 +482,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle_bash_invocation(inv, true, &session_id).await?
         };
         if cgroup_created {
+            let _ = reqwest::Client::builder().no_proxy().build().unwrap_or_default()
+                .post(format!("{}/api/session/unregister", proxy_url()))
+                .header("X-Sevorix-Internal", "true")
+                .json(&serde_json::json!({"cgroup_path": format!("/sys/fs/cgroup/sevorix/{}", session_id)}))
+                .send().await;
             cleanup_session_cgroup(&session_id);
         }
         exit(exit_code);
@@ -484,27 +519,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Guard: if SEVORIX_SESSION_ID is already set we are nested inside an
+    // existing sevsh session — skip cgroup creation to prevent recursive spawning.
+    let already_in_session = env::var("SEVORIX_SESSION_ID").is_ok();
+
     // Create cgroup for this session (for eBPF process filtering)
-    let cgroup_created = match create_session_cgroup(&session_id) {
-        Ok(created) => {
-            // Add current process to the cgroup
-            if let Err(e) = add_process_to_cgroup(&session_id) {
-                eprintln!("[SEVSH] Warning: Could not add process to cgroup: {}", e);
+    let cgroup_created = if already_in_session {
+        false
+    } else {
+        match create_session_cgroup(&session_id) {
+            Ok(created) => {
+                // Add current process to the cgroup
+                if let Err(e) = add_process_to_cgroup(&session_id) {
+                    eprintln!("[SEVSH] Warning: Could not add process to cgroup: {}", e);
+                    false
+                } else {
+                    created
+                }
+            }
+            Err(e) => {
+                // Non-fatal: cgroup creation may fail if we don't have permissions
+                // or cgroup v2 is not available
+                if !args.command.is_empty() {
+                    eprintln!(
+                        "[SEVSH] Warning: Could not create cgroup: {}. Process isolation limited.",
+                        e
+                    );
+                }
                 false
-            } else {
-                created
             }
-        }
-        Err(e) => {
-            // Non-fatal: cgroup creation may fail if we don't have permissions
-            // or cgroup v2 is not available
-            if !args.command.is_empty() {
-                eprintln!(
-                    "[SEVSH] Warning: Could not create cgroup: {}. Process isolation limited.",
-                    e
-                );
-            }
-            false
         }
     };
 
