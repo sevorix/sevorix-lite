@@ -526,6 +526,53 @@ fn handle_session(cmd: SessionCommands) {
                 }
             });
         }
+        SessionCommands::Reload { name } => {
+            let port = match resolve_session_port(name.as_deref()) {
+                Some(p) => p,
+                None => {
+                    let sessions = DaemonManager::list_sessions().unwrap_or_default();
+                    if sessions.is_empty() {
+                        eprintln!("Error: no running Watchtower sessions.");
+                    } else {
+                        eprintln!(
+                            "Error: multiple sessions running. Specify one with --name. Running: {}",
+                            sessions.iter().map(|(i, _)| i.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+
+            rt.block_on(async move {
+                let url = format!("http://localhost:{}/api/policies/reload", port);
+                let client = reqwest::Client::new();
+                match client.post(&url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(body) = r.json::<serde_json::Value>().await {
+                            let policies =
+                                body.get("policies").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let roles = body.get("roles").and_then(|v| v.as_u64()).unwrap_or(0);
+                            println!("Policies reloaded: {} policies, {} roles", policies, roles);
+                        } else {
+                            println!("Policies reloaded.");
+                        }
+                    }
+                    Ok(r) => {
+                        eprintln!("Error: server returned {}", r.status());
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: could not reach Watchtower: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
         SessionCommands::SetRole { role, name } => {
             let port = match resolve_session_port(name.as_deref()) {
                 Some(p) => p,

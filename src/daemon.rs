@@ -237,12 +237,19 @@ impl DaemonManager {
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| format!("(see {})", self.pid_path.display()));
 
-                // Write session metadata
+                // Write session metadata. If no role was passed via --role, fall back to
+                // settings.json sevsh.default_role so that sevorix status reflects the
+                // actual role the daemon will apply.
+                let meta_role = initial_role.clone().or_else(|| {
+                    crate::settings::Settings::load()
+                        .sevsh
+                        .and_then(|s| s.default_role)
+                });
                 let meta = SessionInfo {
                     name: self.session_name.clone(),
                     session_id: session_id.to_string(),
                     port,
-                    role: initial_role.clone(),
+                    role: meta_role,
                     pid: wt_pid_val,
                 };
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {

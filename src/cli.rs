@@ -114,6 +114,12 @@ pub enum SessionCommands {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Reload policies and roles from disk without restarting
+    Reload {
+        /// Target session by name (required when multiple sessions are running)
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
