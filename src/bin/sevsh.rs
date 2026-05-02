@@ -427,6 +427,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let has_unshare = Command::new("unshare").arg("--version").output().is_ok();
         let has_ip = Command::new("ip").arg("-V").output().is_ok();
 
+        // Record the real agent PID (our PPID) before the sandbox adds intermediaries.
+        // The sandbox (unshare) exec()s into the inner sevsh, making getppid() inside
+        // the sandbox return the outer sevsh's PID rather than the actual agent's PID.
+        let agent_pid = unsafe { libc::getppid() };
+        env::set_var("SEVORIX_AGENT_PID", agent_pid.to_string());
+
         let exit_code = if (inv.command.is_some() || inv.script_file.is_some())
             && !no_sandbox_flag
             && has_unshare
@@ -933,7 +939,20 @@ async fn run_parent_bridge(
         let _ = std::fs::remove_file(&s);
     }
 
-    Ok(status.code().unwrap_or(1))
+    // Re-raise any signal that killed the sandbox child so the sandbox is transparent
+    // to signal-based termination. Without this, a SIGKILL received by the inner process
+    // would be swallowed here and the real agent (our parent) would never see it.
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signal) = status.signal() {
+        let ppid = unsafe { libc::getppid() };
+        if ppid > 1 {
+            unsafe { libc::kill(ppid, signal as libc::c_int) };
+        }
+    }
+
+    Ok(status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
 }
 
 fn resolved_proxy_port() -> u16 {
@@ -1226,6 +1245,14 @@ async fn handle_direct_exec(
         Ok(status.code().unwrap_or(1))
     } else {
         eprintln!("SEVORIX BLOCKED: {}", verdict.reason);
+        if verdict.kill {
+            eprintln!("SEVORIX: kill=true — terminating agent process.");
+            let pid = agent_pid();
+            if pid > 1 {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            return Ok(137);
+        }
         Ok(1)
     }
 }
@@ -1302,6 +1329,14 @@ async fn handle_bash_invocation(
         Ok(status.code().unwrap_or(1))
     } else {
         eprintln!("SEVORIX BLOCKED: {}", verdict.reason);
+        if verdict.kill {
+            eprintln!("SEVORIX: kill=true — terminating agent process.");
+            let pid = agent_pid();
+            if pid > 1 {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            return Ok(137); // 128 + SIGKILL(9)
+        }
         Ok(1)
     }
 }
@@ -1372,6 +1407,8 @@ struct Verdict {
     status: String,
     reason: String,
     confidence: String,
+    /// If true, SIGKILL the parent process (the agent) in addition to blocking.
+    kill: bool,
 }
 
 /// Return the path to the real bash binary to use for executing commands.
@@ -1385,6 +1422,19 @@ fn real_shell() -> String {
     env::var("SEVORIX_REAL_SHELL")
         .or_else(|_| env::var("SHELL"))
         .unwrap_or_else(|_| "/usr/bin/bash".to_string())
+}
+
+/// Returns the PID of the real agent process to target for kill=true enforcement.
+///
+/// In the sandbox path (run_parent_bridge → unshare → inner sevsh), getppid() returns
+/// the outer sevsh wrapper rather than the actual agent. The outer sevsh records its
+/// own PPID as SEVORIX_AGENT_PID before entering the sandbox so the inner process can
+/// target the correct PID. Falls back to getppid() for the direct --no-sandbox path.
+fn agent_pid() -> i32 {
+    env::var("SEVORIX_AGENT_PID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| unsafe { libc::getppid() })
 }
 
 /// Fetch the syscall policy from Watchtower and compile it into a local rule set.
@@ -1669,6 +1719,7 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
                     status: "ERROR".to_string(),
                     reason: format!("API Error {}", r.status()),
                     confidence: "100%".to_string(),
+                    kill: false,
                 });
             }
 
@@ -1686,6 +1737,7 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
                 .as_str()
                 .unwrap_or("Unknown")
                 .to_string();
+            let kill = json_resp["kill"].as_bool().unwrap_or(false);
 
             // Map status to allowed
             let allowed = status == "ALLOW" || status == "FLAG"; // Plan says "If ALLOW/FLAG: Execute"
@@ -1695,6 +1747,7 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
                 status,
                 reason,
                 confidence,
+                kill,
             })
         }
         Err(e) => {
@@ -1704,6 +1757,7 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
                 status: "UNREACHABLE".to_string(),
                 reason: format!("Watchtower unreachable: {}", e),
                 confidence: "100%".to_string(),
+                kill: false,
             })
         }
     }

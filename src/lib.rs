@@ -1462,7 +1462,8 @@ async fn analyze_intent(
         "latency_ms": elapsed,
         "lane": scan.lane,
         "reason": scan.log_msg,
-        "confidence": scan.log_score
+        "confidence": scan.log_score,
+        "kill": scan.kill,
     }))
     .into_response()
 }
