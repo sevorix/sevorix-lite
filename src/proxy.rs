@@ -16,6 +16,7 @@ use axum::{
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
+use libc;
 use serde_json::{json, Value};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,6 +43,28 @@ impl HttpBody for NoHintBody {
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::default()
+    }
+}
+
+/// Log a traffic event to disk and fan-out via the WebSocket broadcast channel.
+fn emit_event(state: &AppState, event: &Value) {
+    let event_str = event.to_string();
+    #[allow(deprecated)]
+    log_traffic_event(&state.traffic_log_path, &event_str);
+    let _ = state.tx.send(event_str);
+}
+
+/// Send SIGKILL to the agent process identified by the advisory X-Sevorix-Ppid header
+/// when a blocking policy has kill:true set.
+fn kill_agent(kill: bool, ppid: Option<u32>) {
+    if kill {
+        if let Some(target) = ppid.filter(|&p| p > 1) {
+            tracing::warn!(
+                "[PROXY] kill=true — sending SIGKILL to agent pid {}",
+                target
+            );
+            unsafe { libc::kill(target as libc::pid_t, libc::SIGKILL) };
+        }
     }
 }
 
@@ -118,10 +141,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
                 "pid": pid,
                 "ppid": ppid,
             });
-            let event_str = event.to_string();
-            #[allow(deprecated)]
-            log_traffic_event(&state.traffic_log_path, &event_str);
-            let _ = state.tx.send(event_str);
+            emit_event(&state, &event);
 
             // Return 200 OK for CONNECT. Explicitly remove Content-Length header to avoid conflicts.
             // Using a custom body with no size hint ensures hyper doesn't add Content-Length: 0.
@@ -274,24 +294,23 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             )
         };
 
-        // Broadcast event
-        let event = json!({
-            "verdict": scan.verdict,
-            "lane": scan.lane,
-            "layer": "network",
-            "payload": display_payload,
-            "timestamp": chrono::Local::now().to_rfc3339(),
-            "latency": elapsed,
-            "reason": msg,
-            "confidence": score,
-            "context": "Network",
-            "pid": pid,
-            "ppid": ppid,
-        });
-        let event_str = event.to_string();
-        #[allow(deprecated)]
-        log_traffic_event(&state.traffic_log_path, &event_str);
-        let _ = state.tx.send(event_str);
+        emit_event(
+            &state,
+            &json!({
+                "verdict": scan.verdict,
+                "lane": scan.lane,
+                "layer": "network",
+                "payload": display_payload,
+                "timestamp": chrono::Local::now().to_rfc3339(),
+                "latency": elapsed,
+                "reason": msg,
+                "confidence": score,
+                "context": "Network",
+                "pid": pid,
+                "ppid": ppid,
+            }),
+        );
+        kill_agent(scan.kill, ppid);
 
         return (StatusCode::FORBIDDEN, format!("Request Blocked: {}", msg)).into_response();
     }
@@ -320,24 +339,24 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             },
         );
 
-        let pending_event = json!({
-            "type": "PENDING",
-            "event_id": event_id,
-            "verdict": "FLAG",
-            "lane": "YELLOW",
-            "layer": "network",
-            "payload": display_payload_flag,
-            "timestamp": chrono::Local::now().to_rfc3339(),
-            "reason": scan.log_msg,
-            "context": "Network",
-            "pid": pid,
-            "ppid": ppid,
-            "timeout_secs": state.intervention_timeout_secs,
-            "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
-        });
-        #[allow(deprecated)]
-        log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
-        let _ = state.tx.send(pending_event.to_string());
+        emit_event(
+            &state,
+            &json!({
+                "type": "PENDING",
+                "event_id": event_id,
+                "verdict": "FLAG",
+                "lane": "YELLOW",
+                "layer": "network",
+                "payload": display_payload_flag,
+                "timestamp": chrono::Local::now().to_rfc3339(),
+                "reason": scan.log_msg,
+                "context": "Network",
+                "pid": pid,
+                "ppid": ppid,
+                "timeout_secs": state.intervention_timeout_secs,
+                "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
+            }),
+        );
 
         let allowed = await_decision_with_pause(
             decision_rx,
@@ -361,23 +380,22 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
 
         if !allowed {
             let elapsed = start_time.elapsed().as_millis() as u64;
-            let block_event = json!({
-                "verdict": "BLOCK",
-                "lane": "RED",
-                "layer": "network",
-                "payload": display_payload_flag,
-                "timestamp": chrono::Local::now().to_rfc3339(),
-                "latency": elapsed,
-                "reason": "Blocked by operator",
-                "confidence": "Manual Override",
-                "context": "Network",
-                "pid": pid,
-                "ppid": ppid,
-            });
-            let block_str = block_event.to_string();
-            #[allow(deprecated)]
-            log_traffic_event(&state.traffic_log_path, &block_str);
-            let _ = state.tx.send(block_str);
+            emit_event(
+                &state,
+                &json!({
+                    "verdict": "BLOCK",
+                    "lane": "RED",
+                    "layer": "network",
+                    "payload": display_payload_flag,
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "latency": elapsed,
+                    "reason": "Blocked by operator",
+                    "confidence": "Manual Override",
+                    "context": "Network",
+                    "pid": pid,
+                    "ppid": ppid,
+                }),
+            );
             return (StatusCode::FORBIDDEN, "Request blocked by operator.").into_response();
         }
 
@@ -449,7 +467,6 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
         "pid": pid,
         "ppid": ppid,
     });
-    let event_str = event.to_string();
 
     // Point E — PreLog hook: observe-only in v1
     {
@@ -471,9 +488,7 @@ pub async fn proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> 
             .await;
     }
 
-    #[allow(deprecated)]
-    log_traffic_event(&state.traffic_log_path, &event_str);
-    let _ = state.tx.send(event_str);
+    emit_event(&state, &event);
 
     // Features: Forwarding (HTTP)
     // Create new client request and stream response.
@@ -669,22 +684,21 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
             // Poison pill check
             let pill = crate::scanner::PoisonPill::default_canary();
             if scan_payload.contains(pill.value) {
-                let event = serde_json::json!({
-                    "verdict": "BLOCK",
-                    "lane": "RED",
-                    "layer": "network",
-                    "payload": &scan_payload,
-                    "timestamp": chrono::Local::now().to_rfc3339(),
-                    "latency": start_time.elapsed().as_millis() as u64,
-                    "reason": "Poison pill detected in HTTPS payload",
-                    "confidence": "HIGH",
-                    "pid": pid,
-                    "ppid": ppid,
-                });
-                let event_str = event.to_string();
-                #[allow(deprecated)]
-                log_traffic_event(&state.traffic_log_path, &event_str);
-                let _ = state.tx.send(event_str);
+                emit_event(
+                    &state,
+                    &serde_json::json!({
+                        "verdict": "BLOCK",
+                        "lane": "RED",
+                        "layer": "network",
+                        "payload": &scan_payload,
+                        "timestamp": chrono::Local::now().to_rfc3339(),
+                        "latency": start_time.elapsed().as_millis() as u64,
+                        "reason": "Poison pill detected in HTTPS payload",
+                        "confidence": "HIGH",
+                        "pid": pid,
+                        "ppid": ppid,
+                    }),
+                );
                 let response = hyper::Response::builder()
                     .status(403)
                     .body(axum::body::Body::from("BLOCKED: Poison pill detected"))
@@ -707,22 +721,22 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
             let verdict = result.verdict.as_str();
 
             if verdict == "BLOCK" {
-                let event = serde_json::json!({
-                    "verdict": "BLOCK",
-                    "lane": "RED",
-                    "layer": "network",
-                    "payload": &scan_payload,
-                    "timestamp": chrono::Local::now().to_rfc3339(),
-                    "latency": start_time.elapsed().as_millis() as u64,
-                    "reason": result.log_msg,
-                    "confidence": "HIGH",
-                    "pid": pid,
-                    "ppid": ppid,
-                });
-                let event_str = event.to_string();
-                #[allow(deprecated)]
-                log_traffic_event(&state.traffic_log_path, &event_str);
-                let _ = state.tx.send(event_str);
+                emit_event(
+                    &state,
+                    &serde_json::json!({
+                        "verdict": "BLOCK",
+                        "lane": "RED",
+                        "layer": "network",
+                        "payload": &scan_payload,
+                        "timestamp": chrono::Local::now().to_rfc3339(),
+                        "latency": start_time.elapsed().as_millis() as u64,
+                        "reason": result.log_msg,
+                        "confidence": "HIGH",
+                        "pid": pid,
+                        "ppid": ppid,
+                    }),
+                );
+                kill_agent(result.kill, ppid);
                 let response = hyper::Response::builder()
                     .status(403)
                     .body(axum::body::Body::from("BLOCKED by Sevorix policy"))
@@ -743,24 +757,24 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
                     },
                 );
 
-                let pending_event = serde_json::json!({
-                    "type": "PENDING",
-                    "event_id": event_id,
-                    "verdict": "FLAG",
-                    "lane": "YELLOW",
-                    "layer": "network",
-                    "payload": &scan_payload,
-                    "timestamp": chrono::Local::now().to_rfc3339(),
-                    "reason": result.log_msg,
-                    "context": "Network",
-                    "pid": pid,
-                    "ppid": ppid,
-                    "timeout_secs": state.intervention_timeout_secs,
-                    "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
-                });
-                #[allow(deprecated)]
-                log_traffic_event(&state.traffic_log_path, &pending_event.to_string());
-                let _ = state.tx.send(pending_event.to_string());
+                emit_event(
+                    &state,
+                    &serde_json::json!({
+                        "type": "PENDING",
+                        "event_id": event_id,
+                        "verdict": "FLAG",
+                        "lane": "YELLOW",
+                        "layer": "network",
+                        "payload": &scan_payload,
+                        "timestamp": chrono::Local::now().to_rfc3339(),
+                        "reason": result.log_msg,
+                        "context": "Network",
+                        "pid": pid,
+                        "ppid": ppid,
+                        "timeout_secs": state.intervention_timeout_secs,
+                        "timeout_action": if state.intervention_timeout_allow { "allow" } else { "block" },
+                    }),
+                );
 
                 let allowed = crate::await_decision_with_pause(
                     decision_rx,
@@ -784,23 +798,22 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
 
                 if !allowed {
                     let elapsed = start_time.elapsed().as_millis() as u64;
-                    let block_event = serde_json::json!({
-                        "verdict": "BLOCK",
-                        "lane": "RED",
-                        "layer": "network",
-                        "payload": &scan_payload,
-                        "timestamp": chrono::Local::now().to_rfc3339(),
-                        "latency": elapsed,
-                        "reason": "Blocked by operator",
-                        "confidence": "Manual Override",
-                        "context": "Network",
-                        "pid": pid,
-                        "ppid": ppid,
-                    });
-                    let block_str = block_event.to_string();
-                    #[allow(deprecated)]
-                    log_traffic_event(&state.traffic_log_path, &block_str);
-                    let _ = state.tx.send(block_str);
+                    emit_event(
+                        &state,
+                        &serde_json::json!({
+                            "verdict": "BLOCK",
+                            "lane": "RED",
+                            "layer": "network",
+                            "payload": &scan_payload,
+                            "timestamp": chrono::Local::now().to_rfc3339(),
+                            "latency": elapsed,
+                            "reason": "Blocked by operator",
+                            "confidence": "Manual Override",
+                            "context": "Network",
+                            "pid": pid,
+                            "ppid": ppid,
+                        }),
+                    );
                     let response = hyper::Response::builder()
                         .status(403)
                         .body(axum::body::Body::from("Request blocked by operator."))
@@ -810,41 +823,39 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
 
                 // Operator allowed — log the allow decision and fall through to forward
                 let elapsed = start_time.elapsed().as_millis() as u64;
-                let allow_event = serde_json::json!({
-                    "verdict": "ALLOW",
-                    "lane": "GREEN",
-                    "layer": "network",
-                    "payload": &scan_payload,
-                    "timestamp": chrono::Local::now().to_rfc3339(),
-                    "latency": elapsed,
-                    "reason": "Allowed by operator intervention",
-                    "confidence": "Manual Override",
-                    "context": "Network",
-                    "pid": pid,
-                    "ppid": ppid,
-                });
-                let allow_str = allow_event.to_string();
-                #[allow(deprecated)]
-                log_traffic_event(&state.traffic_log_path, &allow_str);
-                let _ = state.tx.send(allow_str);
+                emit_event(
+                    &state,
+                    &serde_json::json!({
+                        "verdict": "ALLOW",
+                        "lane": "GREEN",
+                        "layer": "network",
+                        "payload": &scan_payload,
+                        "timestamp": chrono::Local::now().to_rfc3339(),
+                        "latency": elapsed,
+                        "reason": "Allowed by operator intervention",
+                        "confidence": "Manual Override",
+                        "context": "Network",
+                        "pid": pid,
+                        "ppid": ppid,
+                    }),
+                );
             } else {
-                // ALLOW — forward to upstream (non-FLAG path)
-                let event = serde_json::json!({
-                    "verdict": "ALLOW",
-                    "lane": "GREEN",
-                    "layer": "network",
-                    "payload": &scan_payload,
-                    "timestamp": chrono::Local::now().to_rfc3339(),
-                    "latency": start_time.elapsed().as_millis() as u64,
-                    "reason": result.log_msg,
-                    "confidence": "N/A",
-                    "pid": pid,
-                    "ppid": ppid,
-                });
-                let event_str = event.to_string();
-                #[allow(deprecated)]
-                log_traffic_event(&state.traffic_log_path, &event_str);
-                let _ = state.tx.send(event_str);
+                // ALLOW — log and fall through to forward
+                emit_event(
+                    &state,
+                    &serde_json::json!({
+                        "verdict": "ALLOW",
+                        "lane": "GREEN",
+                        "layer": "network",
+                        "payload": &scan_payload,
+                        "timestamp": chrono::Local::now().to_rfc3339(),
+                        "latency": start_time.elapsed().as_millis() as u64,
+                        "reason": result.log_msg,
+                        "confidence": "N/A",
+                        "pid": pid,
+                        "ppid": ppid,
+                    }),
+                );
             }
 
             // Forward client request headers to upstream, stripping internal Sevorix metadata.
