@@ -120,6 +120,88 @@ async fn test_1_6_empty_body_forwarded() {
     upstream.assert_called().await;
 }
 
+/// 1.8 — A request blocked by a kill:true policy sends SIGKILL to the process
+/// identified by X-Sevorix-Ppid and returns 403.
+#[tokio::test]
+async fn test_1_8_kill_true_policy_sigkills_target() {
+    let upstream = MockUpstream::start_any().await;
+
+    let h = TestHarness::with_role(Some("test".to_string())).await;
+    h.add_policy_direct(Policy {
+        id: "kill-block".to_string(),
+        match_type: PolicyType::Simple("KILL ME".to_string()),
+        action: Action::Block,
+        context: PolicyContext::All,
+        kill: true,
+        syscall: vec![],
+    });
+    h.add_role_direct(Role {
+        name: "test".to_string(),
+        policies: vec!["kill-block".to_string()],
+        is_dynamic: false,
+    });
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("failed to spawn sleep");
+    let target_pid = child.id();
+
+    let proxied = make_proxied_client(&h.base_url());
+    let resp = proxied
+        .post(upstream.uri())
+        .header("X-Sevorix-Ppid", target_pid.to_string())
+        .body("KILL ME please")
+        .send()
+        .await
+        .expect("proxied POST failed");
+
+    assert_eq!(resp.status(), 403);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let exit_status = child.try_wait().expect("try_wait failed");
+    assert!(
+        exit_status.is_some(),
+        "expected target process (pid {}) to be killed by kill:true policy",
+        target_pid
+    );
+    upstream.assert_not_called().await;
+}
+
+/// 1.9 — A request blocked by a kill:true policy with no X-Sevorix-Ppid header
+/// returns 403 without panicking (kill is skipped gracefully when no target is set).
+#[tokio::test]
+async fn test_1_9_kill_true_no_ppid_returns_403() {
+    let upstream = MockUpstream::start_any().await;
+
+    let h = TestHarness::with_role(Some("test".to_string())).await;
+    h.add_policy_direct(Policy {
+        id: "kill-block".to_string(),
+        match_type: PolicyType::Simple("KILL ME".to_string()),
+        action: Action::Block,
+        context: PolicyContext::All,
+        kill: true,
+        syscall: vec![],
+    });
+    h.add_role_direct(Role {
+        name: "test".to_string(),
+        policies: vec!["kill-block".to_string()],
+        is_dynamic: false,
+    });
+
+    let proxied = make_proxied_client(&h.base_url());
+    let resp = proxied
+        .post(upstream.uri())
+        .body("KILL ME please")
+        .send()
+        .await
+        .expect("proxied POST failed");
+
+    assert_eq!(resp.status(), 403);
+    upstream.assert_not_called().await;
+}
+
 /// 1.7 — Ten concurrent safe GET requests all return 200.
 #[tokio::test]
 async fn test_1_7_concurrent_requests() {
