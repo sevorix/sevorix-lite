@@ -15,6 +15,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sevorix_core::EnforcementTier;
 use sevorix_watchtower::{
     build_router,
+    context::ContextStore,
     policy::{Action, Engine, Policy, PolicyContext, PolicyType, Role},
     tls::{CaStore, TlsContext},
     AppState,
@@ -127,6 +128,7 @@ impl MitmTestHarness {
         std::fs::create_dir_all(config_dir.join("policies")).unwrap();
         std::fs::create_dir_all(config_dir.join("roles")).unwrap();
         std::fs::create_dir_all(config_dir.join("logs")).unwrap();
+        std::fs::create_dir_all(config_dir.join("context")).unwrap();
 
         // Build the Sevorix CA and TLS context.
         let ca_dir = config_dir.join("ca");
@@ -150,6 +152,14 @@ impl MitmTestHarness {
             traffic_log_path,
             log_dir: config_dir.join("logs"),
             session_id,
+            context_store: Arc::new(
+                ContextStore::new(
+                    config_dir.join("context"),
+                    500,
+                    std::sync::Arc::new(sevorix_watchtower::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),

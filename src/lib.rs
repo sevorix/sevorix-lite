@@ -28,6 +28,7 @@ pub const EBPF_SOCK_PATH: &str = "/tmp/sevorix-ebpf.sock";
 
 pub mod assets;
 pub mod cli;
+pub mod context;
 pub mod daemon;
 pub mod hooks;
 pub mod hub;
@@ -44,6 +45,10 @@ use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use assets::Assets;
 pub use cli::SessionCommands;
 pub use cli::{CaCommands, Cli, Commands, ConfigCommands, HubCommands, IntegrationsCommands};
+use context::{
+    default_context_dir, ContextChunkInput, ContextQueryResult, ContextStore, ContextStream,
+    DEFAULT_CONTEXT_RING_BUFFER_SIZE,
+};
 pub use daemon::find_available_port;
 pub use daemon::{
     is_ebpf_daemon_running, is_watchtower_running, DaemonManager, EbpfDaemonManager, SessionInfo,
@@ -76,6 +81,7 @@ pub struct AppState {
     pub traffic_log_path: std::path::PathBuf,
     pub log_dir: std::path::PathBuf,
     pub session_id: String,
+    pub context_store: Arc<ContextStore>,
     pub enforcement_tier: EnforcementTier,
     pub active_sessions: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Pending intervention decisions keyed by event UUID.
@@ -542,6 +548,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/analyze", post(analyze_intent))
         .route("/syscall-policy", get(syscall_policy_handler))
         .route("/policies/ebpf", get(ebpf_policies_handler))
+        .route(
+            "/api/context",
+            post(append_context_handler).get(get_context_handler),
+        )
         .route("/api/ebpf-event", post(ebpf_event_handler))
         .route("/api/policies/reload", post(reload_policies_handler))
         .route("/ws", get(ws_handler))
@@ -669,6 +679,7 @@ pub async fn run_server(
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<settings::Settings>(&s).ok())
         .unwrap_or_default();
+    tracing::info!("Loaded context settings: {:?}", loaded_settings.context);
     let intervention_settings = loaded_settings.intervention.unwrap_or_default();
     let default_role = loaded_settings.sevsh.and_then(|s| s.default_role);
     let lsm_enabled = loaded_settings
@@ -692,6 +703,11 @@ pub async fn run_server(
     let _ = std::fs::create_dir_all(&log_dir);
     let session_id_str = session_id.to_string();
     let traffic_log_path = log_dir.join(format!("{}-traffic.jsonl", session_id_str));
+    let context_store = Arc::new(ContextStore::new(
+        default_context_dir(),
+        DEFAULT_CONTEXT_RING_BUFFER_SIZE,
+        std::sync::Arc::new(loaded_settings.context.unwrap_or_default()),
+    )?);
 
     // Load (or generate) the Ed25519 signing key and compute the initial policy hash.
 
@@ -726,6 +742,7 @@ pub async fn run_server(
         traffic_log_path,
         log_dir: log_dir.clone(),
         session_id: session_id_str,
+        context_store,
         port,
         enforcement_tier,
         active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -983,6 +1000,163 @@ async fn session_set_role(
     *state.current_role.write().unwrap() = Some(role.to_string());
     tracing::info!("Session role updated to '{}'", role);
     StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct AppendContextRequest {
+    session_id: Option<String>,
+    chunks: Vec<ContextChunkInput>,
+}
+
+#[derive(Deserialize, Default)]
+struct ContextQuery {
+    session: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    stream: Option<ContextStream>,
+}
+
+async fn append_context_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AppendContextRequest>,
+) -> Response {
+    if body.chunks.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "chunks must not be empty" })),
+        )
+            .into_response();
+    }
+
+    // Prefer the session from the request body when provided, but validate
+    // it to avoid path traversal or arbitrary file writes. Session IDs must
+    // be valid UUID strings.
+    // Accept either a UUID or a safe short session id (alphanumeric, dash, underscore).
+    // This avoids path traversal while remaining compatible with existing sevsh
+    // session ids like "sevsh-abc123" used in tests and callers.
+    let is_safe_id = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+
+    let session_id = if let Some(s) = body.session_id.as_deref() {
+        let s_trim = s.trim();
+        if s_trim.is_empty() {
+            state.session_id.clone()
+        } else if uuid::Uuid::parse_str(s_trim).is_ok() || is_safe_id(s_trim) {
+            s_trim.to_string()
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid session_id; must be a UUID or safe short id" })),
+            )
+                .into_response();
+        }
+    } else {
+        state.session_id.clone()
+    };
+
+    // --- POLICY ENFORCEMENT: defend config endpoints from untrusted agents ---
+    // Concatenate chunk raw contents for a policy scan. The policy engine may
+    // contain rules that protect state paths and configuration (e.g. policies
+    // that block writes to ~/.sevorix/policies or similar). If the scan result
+    // is BLOCK, reject the request.
+    let combined: String = body
+        .chunks
+        .iter()
+        .map(|c| c.raw.as_str())
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    let role_opt = state.current_role.read().unwrap().clone();
+    if let Some(ref role_name) = role_opt {
+        let engine = state.policy_engine.read().unwrap();
+        let scan = scan_content(
+            &combined,
+            Some(role_name.as_str()),
+            &engine,
+            PolicyContext::All,
+        );
+        if scan.verdict == "BLOCK" {
+            tracing::warn!("append_context blocked by policy: {:?}", scan.log_msg);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "status": "BLOCK", "reason": scan.log_msg })),
+            )
+                .into_response();
+        }
+    }
+
+    match state
+        .context_store
+        .append_chunks(session_id.as_str(), body.chunks)
+    {
+        Ok(chunks) => Json(json!({
+            "session_id": session_id,
+            "appended": chunks.len(),
+            "chunks": chunks,
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_context_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ContextQuery>,
+) -> Response {
+    let Some(session_id) = q
+        .session
+        .as_deref()
+        .filter(|session| !session.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "session query parameter is required" })),
+        )
+            .into_response();
+    };
+
+    // Validate session id looks safe: either a UUID or a short safe id (alphanumeric,
+    // dash, underscore). This prevents path traversal while allowing existing
+    // sevsh-style session ids used in tests.
+    let is_safe_id = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if !(uuid::Uuid::parse_str(session_id).is_ok() || is_safe_id(session_id)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid session id; must be UUID or safe short id" })),
+        )
+            .into_response();
+    }
+
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let offset = q.offset.unwrap_or(0);
+
+    match state
+        .context_store
+        .query(session_id, limit, offset, q.stream.clone())
+    {
+        Ok(ContextQueryResult { chunks, total }) => Json(json!({
+            "session_id": session_id,
+            "chunks": chunks,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// Hot-reload all policies and roles from disk without restarting the server.
@@ -1889,7 +2063,7 @@ pub fn log_traffic_event(path: &std::path::Path, event: &str) {
 
 /// Query parameters for the event log endpoint.
 #[derive(Deserialize, Default)]
-struct EventQuery {
+struct TrafficEventQuery {
     /// Comma-separated layer filter: "shell", "syscall", "network".
     /// Omit to include all layers.
     layer: Option<String>,
@@ -1913,7 +2087,7 @@ struct EventQuery {
 /// for a cloud logging backend (e.g. Datadog, CloudWatch) behind a trait.
 async fn get_recent_events(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<EventQuery>,
+    Query(q): Query<TrafficEventQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(50).min(500);
     let page = q.page.unwrap_or(1).max(1);
@@ -2314,6 +2488,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[allow(deprecated)]
     fn test_log_traffic_event_creates_file() {
         let dir = tempdir().expect("Failed to create temp dir");
         let path = dir.path().join("traffic.jsonl");
@@ -2326,6 +2501,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_log_traffic_event_appends() {
         let dir = tempdir().expect("Failed to create temp dir");
         let path = dir.path().join("traffic.jsonl");
@@ -2339,6 +2515,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_log_traffic_event_creates_parent_dirs() {
         let dir = tempdir().expect("Failed to create temp dir");
         let path = dir.path().join("nested/deep/dir/traffic.jsonl");
@@ -2356,6 +2533,14 @@ mod tests {
             traffic_log_path: PathBuf::from("/tmp/test_traffic.jsonl"),
             log_dir: PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            context_store: Arc::new(
+                ContextStore::new(
+                    std::env::temp_dir().join(format!("sevorix-context-{}", uuid::Uuid::new_v4())),
+                    DEFAULT_CONTEXT_RING_BUFFER_SIZE,
+                    std::sync::Arc::new(crate::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2381,6 +2566,14 @@ mod tests {
             traffic_log_path: path,
             log_dir: PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            context_store: Arc::new(
+                ContextStore::new(
+                    std::env::temp_dir().join(format!("sevorix-context-{}", uuid::Uuid::new_v4())),
+                    DEFAULT_CONTEXT_RING_BUFFER_SIZE,
+                    std::sync::Arc::new(crate::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2406,6 +2599,14 @@ mod tests {
             traffic_log_path: PathBuf::from("/tmp/test_traffic.jsonl"),
             log_dir: PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            context_store: Arc::new(
+                ContextStore::new(
+                    std::env::temp_dir().join(format!("sevorix-context-{}", uuid::Uuid::new_v4())),
+                    DEFAULT_CONTEXT_RING_BUFFER_SIZE,
+                    std::sync::Arc::new(crate::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2639,6 +2840,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_log_traffic_event_to_nested_path() {
         let dir = tempdir().expect("Failed to create temp dir");
         let nested_path = dir.path().join("deep").join("nested").join("traffic.jsonl");
@@ -2910,7 +3112,7 @@ mod tests {
             let state = create_test_app_state_with_path(std::path::PathBuf::from(
                 "/tmp/nonexistent_traffic_test.jsonl",
             ));
-            let response = get_recent_events(State(state), Query(EventQuery::default()))
+            let response = get_recent_events(State(state), Query(TrafficEventQuery::default()))
                 .await
                 .into_response();
             let body = axum::body::to_bytes(response.into_body(), 1024)
@@ -2935,7 +3137,7 @@ mod tests {
             std::fs::write(&path, format!("{}\n{}\n", event1, event2)).unwrap();
 
             let state = create_test_app_state_with_path(path);
-            let response = get_recent_events(State(state), Query(EventQuery::default()))
+            let response = get_recent_events(State(state), Query(TrafficEventQuery::default()))
                 .await
                 .into_response();
             let body = axum::body::to_bytes(response.into_body(), 1024)
@@ -2946,6 +3148,245 @@ mod tests {
             let events = json.get("events").unwrap().as_array().unwrap();
             assert_eq!(events.len(), 2);
         });
+    }
+
+    #[tokio::test]
+    async fn test_append_context_handler_appends_chunks() {
+        use axum::response::IntoResponse;
+
+        let state = create_test_app_state();
+        let response = append_context_handler(
+            State(state.clone()),
+            Json(AppendContextRequest {
+                session_id: Some("sevsh-abc123".to_string()),
+                chunks: vec![ContextChunkInput {
+                    source: "codex".to_string(),
+                    stream: ContextStream::Stdout,
+                    raw: "\u{1b}[32mhello\u{1b}[0m".to_string(),
+                    text: None,
+                    timestamp: None,
+                }],
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.get("appended").and_then(|v| v.as_u64()), Some(1));
+
+        let recent = state.context_store.recent_chunks("sevsh-abc123", 10, None);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].text, "hello");
+        assert_eq!(recent[0].seq, 0);
+    }
+
+    #[tokio::test]
+    async fn test_append_context_handler_rejects_empty_chunks() {
+        use axum::response::IntoResponse;
+
+        let state = create_test_app_state();
+        let response = append_context_handler(
+            State(state),
+            Json(AppendContextRequest {
+                session_id: Some("sevsh-abc123".to_string()),
+                chunks: vec![],
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_append_context_handler_blocks_by_policy() {
+        use axum::response::IntoResponse;
+
+        // Build an engine with a blocking policy that matches the string "evil"
+        let mut engine = Engine::new();
+        let policy = Policy {
+            id: "block-evil".to_string(),
+            match_type: PolicyType::Simple("evil".to_string()),
+            action: Action::Block,
+            context: PolicyContext::All,
+            kill: false,
+            syscall: vec![],
+        };
+        engine.add_policy(policy.clone());
+        let role = Role {
+            name: "test-role".to_string(),
+            policies: vec![policy.id.clone()],
+            is_dynamic: false,
+        };
+        engine.add_role(role.clone());
+
+        let state = create_test_app_state_with_engine(engine);
+        // Ensure the server uses this role for scanning
+        *state.current_role.write().unwrap() = Some(role.name.clone());
+
+        let response = append_context_handler(
+            State(state.clone()),
+            Json(AppendContextRequest {
+                session_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
+                chunks: vec![ContextChunkInput {
+                    source: "agent".to_string(),
+                    stream: ContextStream::Stdin,
+                    raw: "this contains evil payload".to_string(),
+                    text: None,
+                    timestamp: None,
+                }],
+            }),
+        )
+        .await
+        .into_response();
+
+        // Expect forbidden due to policy block
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("BLOCK"));
+    }
+
+    #[tokio::test]
+    async fn test_append_context_handler_defaults_to_current_session_id() {
+        use axum::response::IntoResponse;
+
+        let state = create_test_app_state();
+        let response = append_context_handler(
+            State(state.clone()),
+            Json(AppendContextRequest {
+                session_id: None,
+                chunks: vec![ContextChunkInput {
+                    source: "codex".to_string(),
+                    stream: ContextStream::Stdout,
+                    raw: "hello".to_string(),
+                    text: None,
+                    timestamp: None,
+                }],
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.get("session_id").and_then(|v| v.as_str()),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+
+        let recent =
+            state
+                .context_store
+                .recent_chunks("00000000-0000-0000-0000-000000000000", 10, None);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].raw, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_append_context_handler_blank_session_id_defaults_to_current_session_id() {
+        use axum::response::IntoResponse;
+
+        let state = create_test_app_state();
+        let response = append_context_handler(
+            State(state.clone()),
+            Json(AppendContextRequest {
+                session_id: Some("   ".to_string()),
+                chunks: vec![ContextChunkInput {
+                    source: "codex".to_string(),
+                    stream: ContextStream::Stdout,
+                    raw: "hello".to_string(),
+                    text: None,
+                    timestamp: None,
+                }],
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let recent =
+            state
+                .context_store
+                .recent_chunks("00000000-0000-0000-0000-000000000000", 10, None);
+        assert_eq!(recent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_context_handler_respects_limit_offset_and_stream() {
+        use axum::response::IntoResponse;
+
+        let state = create_test_app_state();
+        state
+            .context_store
+            .append_chunks(
+                "sevsh-abc123",
+                vec![
+                    ContextChunkInput {
+                        source: "codex".to_string(),
+                        stream: ContextStream::Stdin,
+                        raw: "prompt".to_string(),
+                        text: None,
+                        timestamp: None,
+                    },
+                    ContextChunkInput {
+                        source: "codex".to_string(),
+                        stream: ContextStream::Stdout,
+                        raw: "out-1".to_string(),
+                        text: None,
+                        timestamp: None,
+                    },
+                    ContextChunkInput {
+                        source: "codex".to_string(),
+                        stream: ContextStream::Stdout,
+                        raw: "out-2".to_string(),
+                        text: None,
+                        timestamp: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let response = get_context_handler(
+            State(state),
+            Query(ContextQuery {
+                session: Some("sevsh-abc123".to_string()),
+                limit: Some(1),
+                offset: Some(1),
+                stream: Some(ContextStream::Stdout),
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.get("total").and_then(|v| v.as_u64()), Some(2));
+        let chunks = json.get("chunks").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].get("raw").and_then(|v| v.as_str()), Some("out-2"));
+    }
+
+    #[tokio::test]
+    async fn test_get_context_handler_requires_session() {
+        use axum::response::IntoResponse;
+
+        let state = create_test_app_state();
+        let response = get_context_handler(State(state), Query(ContextQuery::default()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -2971,6 +3412,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_log_traffic_event_with_invalid_parent() {
         // Test that logging to an invalid path doesn't panic
         // (it should silently fail)

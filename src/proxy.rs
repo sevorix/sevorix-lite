@@ -909,6 +909,7 @@ impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for MitmServ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextStore;
     use crate::policy::{Action, Engine, Policy, PolicyContext, PolicyType, Role};
     use axum::body::Body;
     use axum::extract::State;
@@ -933,6 +934,14 @@ mod tests {
             traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
             log_dir: std::path::PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            context_store: Arc::new(
+                ContextStore::new(
+                    std::env::temp_dir().join(format!("sevorix-context-{}", uuid::Uuid::new_v4())),
+                    500,
+                    std::sync::Arc::new(crate::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             port: 3000,
             enforcement_tier: sevorix_core::EnforcementTier::Standard,
             active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -982,6 +991,14 @@ mod tests {
             traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
             log_dir: std::path::PathBuf::from("/tmp"),
             session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            context_store: Arc::new(
+                ContextStore::new(
+                    std::env::temp_dir().join(format!("sevorix-context-{}", uuid::Uuid::new_v4())),
+                    500,
+                    std::sync::Arc::new(crate::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             enforcement_tier: sevorix_core::EnforcementTier::Standard,
             active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),

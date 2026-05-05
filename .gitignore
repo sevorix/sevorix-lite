@@ -29,3 +29,6 @@ infra/terraform.tfstate.backup
 
 # Local implementation plans (not for version control)
 .plans/
+
+# Codex cache (added by codex)
+.codex
