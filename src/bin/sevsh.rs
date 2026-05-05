@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sevorix
 
 use clap::Parser;
-use serde_json::json;
+use serde_json::{json, Value};
 #[cfg(target_os = "linux")]
 use sevorix_core::{
     apply_syscall_deny_filter, apply_syscall_notify_filter, run_seccomp_notify_supervisor,
@@ -10,7 +10,9 @@ use sevorix_core::{
 };
 use sevorix_core::{PtyMultiplexer, PtyMultiplexerConfig};
 use std::env;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{exit, Command, Stdio};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use uuid::Uuid;
@@ -18,12 +20,80 @@ use uuid::Uuid;
 /// Return the Watchtower proxy URL.
 /// Resolved proxy URL, set once at process startup and never changed.
 static RESOLVED_PROXY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Resolved Watchtower session ID, set once at process startup when session
+/// metadata is available for the selected daemon.
+static RESOLVED_CONTEXT_SESSION_ID: std::sync::OnceLock<Option<String>> =
+    std::sync::OnceLock::new();
+
+/// Cached HTTP client for the lifetime of the sevsh process to avoid building
+/// a new `reqwest::Client` on every small request.
+static REQWEST_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    REQWEST_CLIENT.get_or_init(|| reqwest::Client::builder().no_proxy().build().unwrap())
+}
 
 fn proxy_url() -> &'static str {
     RESOLVED_PROXY_URL
         .get()
         .map(|s| s.as_str())
         .unwrap_or("http://localhost:3000")
+}
+
+fn resolved_context_session_id() -> Option<&'static str> {
+    RESOLVED_CONTEXT_SESSION_ID
+        .get()
+        .and_then(|value| value.as_deref())
+}
+
+struct ResolvedProxyTarget {
+    url: String,
+    context_session_id: Option<String>,
+}
+
+fn find_running_session_target(
+    sessions_dir: &Path,
+    target_name: Option<&str>,
+) -> (Option<(u16, Option<String>)>, usize) {
+    let mut found_target: Option<(u16, Option<String>)> = None;
+    let mut running_count = 0usize;
+
+    if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let pid = info["pid"].as_i64().unwrap_or(0) as i32;
+                    let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
+                    if !alive {
+                        continue;
+                    }
+
+                    let port = info["port"].as_u64().unwrap_or(3000) as u16;
+                    let name = info["name"].as_str().unwrap_or("");
+                    let session_id = info["session_id"]
+                        .as_str()
+                        .filter(|session_id| !session_id.trim().is_empty())
+                        .map(ToString::to_string);
+
+                    running_count += 1;
+                    if let Some(wanted) = target_name {
+                        if name == wanted {
+                            found_target = Some((port, session_id));
+                            break;
+                        }
+                    } else {
+                        found_target = Some((port, session_id));
+                    }
+                }
+            }
+        }
+    }
+
+    (found_target, running_count)
 }
 
 /// Resolve the Watchtower proxy URL for this sevsh invocation.
@@ -37,11 +107,14 @@ fn proxy_url() -> &'static str {
 /// The resolved URL is stored as a plain Rust value and `SEVORIX_SESSION` /
 /// `SEVORIX_PORT` are stripped from the child environment so that nested
 /// sevsh invocations cannot inherit an agent-injected override.
-fn resolve_proxy_url() -> String {
+fn resolve_proxy_target() -> ResolvedProxyTarget {
     // Priority 1: direct port override
     if let Ok(port_str) = std::env::var("SEVORIX_PORT") {
         if let Ok(port) = port_str.parse::<u16>() {
-            return format!("http://localhost:{}", port);
+            return ResolvedProxyTarget {
+                url: format!("http://localhost:{}", port),
+                context_session_id: None,
+            };
         }
     }
 
@@ -54,42 +127,15 @@ fn resolve_proxy_url() -> String {
 
     if let Some(sdir) = sessions_dir {
         let target_name = std::env::var("SEVORIX_SESSION").ok();
-        let mut found_port: Option<u16> = None;
-        let mut running_count: usize = 0;
-
-        if let Ok(entries) = std::fs::read_dir(&sdir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let pid = info["pid"].as_i64().unwrap_or(0) as i32;
-                        let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
-                        if !alive {
-                            continue;
-                        }
-                        let port = info["port"].as_u64().unwrap_or(3000) as u16;
-                        let name = info["name"].as_str().unwrap_or("").to_string();
-                        running_count += 1;
-                        if let Some(ref wanted) = target_name {
-                            if &name == wanted {
-                                found_port = Some(port);
-                                break;
-                            }
-                        } else {
-                            // remember last running port for auto-detect
-                            found_port = Some(port);
-                        }
-                    }
-                }
-            }
-        }
+        let (found_target, running_count) =
+            find_running_session_target(&sdir, target_name.as_deref());
 
         if let Some(ref wanted) = target_name {
-            if let Some(p) = found_port {
-                return format!("http://localhost:{}", p);
+            if let Some((port, session_id)) = found_target {
+                return ResolvedProxyTarget {
+                    url: format!("http://localhost:{}", port),
+                    context_session_id: session_id,
+                };
             }
             // Named session requested but not found — warn loudly so the user
             // can see why traffic is being dropped instead of silently routing
@@ -101,8 +147,11 @@ fn resolve_proxy_url() -> String {
                 wanted
             );
         } else if running_count == 1 {
-            if let Some(p) = found_port {
-                return format!("http://localhost:{}", p);
+            if let Some((port, session_id)) = found_target {
+                return ResolvedProxyTarget {
+                    url: format!("http://localhost:{}", port),
+                    context_session_id: session_id,
+                };
             }
         } else if running_count > 1 {
             // Multiple sessions running with no SEVORIX_SESSION specified.
@@ -117,7 +166,10 @@ fn resolve_proxy_url() -> String {
     }
 
     // Fallback: no sessions running (or session dir unreadable). Use default port.
-    "http://localhost:3000".to_string()
+    ResolvedProxyTarget {
+        url: "http://localhost:3000".to_string(),
+        context_session_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -306,7 +358,7 @@ fn has_sevsh_flags(args: &[String]) -> bool {
     args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "--internal-sandbox" | "--internal-forward-sock" | "--session-id" | "--"
+            "--internal-sandbox" | "--internal-forward-sock" | "--"
         ) || a.starts_with("--publish")
             || a == "-p"
     })
@@ -333,7 +385,7 @@ struct SevshArgs {
     no_sandbox: bool,
 
     /// Command to execute (optional - if omitted, starts interactive shell)
-    #[arg(trailing_var_arg = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
@@ -341,7 +393,9 @@ struct SevshArgs {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve the proxy URL once from env/session metadata, then strip the
     // session env vars so nested sevsh invocations cannot inherit an agent-injected override.
-    RESOLVED_PROXY_URL.get_or_init(resolve_proxy_url);
+    let resolved_target = resolve_proxy_target();
+    let _ = RESOLVED_PROXY_URL.set(resolved_target.url);
+    let _ = RESOLVED_CONTEXT_SESSION_ID.set(resolved_target.context_session_id);
     env::remove_var("SEVORIX_SESSION");
     env::remove_var("SEVORIX_PORT");
 
@@ -781,7 +835,7 @@ async fn run_parent_bridge(
     args: &[String],
     port_mappings: &[String],
     no_proxy: bool,
-    session_id: &str,
+    _session_id: &str,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     // 1. Create Unix Socket for bridging
     let pid = std::process::id();
@@ -888,9 +942,7 @@ async fn run_parent_bridge(
         child_cmd_args.push("--no-proxy".to_string());
     }
 
-    // Pass session ID to child
-    child_cmd_args.push("--session-id".to_string());
-    child_cmd_args.push(session_id.to_string());
+    // session ID is not user-supplied; child will derive it from env
 
     // Append original args (skip binary name)
     if args.len() > 1 {
@@ -966,6 +1018,27 @@ fn resolved_proxy_port() -> u16 {
 }
 
 async fn proxy_unix_to_tcp(mut unix: UnixStream) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(initial_request) = read_and_inject_initial_request(&mut unix).await? else {
+        return Ok(());
+    };
+
+    // --- Connect to the Watchtower daemon and forward the modified request ---
+    let addr = format!("127.0.0.1:{}", resolved_proxy_port());
+    let mut tcp = TcpStream::connect(&addr).await?;
+
+    tcp.write_all(&initial_request).await?;
+
+    // Proxy the remaining request body and response bidirectionally.
+    tokio::io::copy_bidirectional(&mut unix, &mut tcp).await?;
+    Ok(())
+}
+
+async fn read_and_inject_initial_request<S>(stream: &mut S) -> std::io::Result<Option<Vec<u8>>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Inject X-Sevorix-Pid / X-Sevorix-Ppid into the first HTTP request's
@@ -988,19 +1061,19 @@ async fn proxy_unix_to_tcp(mut unix: UnixStream) -> std::io::Result<()> {
                 "[SEVSH] proxy_unix_to_tcp: request headers exceed {} bytes; rejecting connection",
                 MAX_HEADER_BYTES
             );
-            let _ = unix
+            let _ = stream
                 .write_all(
                     b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .await;
-            return Ok(());
+            return Ok(None);
         }
 
         let mut byte = [0u8; 1];
-        let n = unix.read(&mut byte).await?;
+        let n = stream.read(&mut byte).await?;
         if n == 0 {
             // Client closed connection before we saw end-of-headers.
-            return Ok(());
+            return Ok(None);
         }
 
         header_buf.push(byte[0]);
@@ -1045,17 +1118,12 @@ async fn proxy_unix_to_tcp(mut unix: UnixStream) -> std::io::Result<()> {
         (&header_buf[..header_buf.len() - 1], b"\n")
     };
 
-    // --- Connect to the Watchtower daemon and forward the modified request ---
-    let addr = format!("127.0.0.1:{}", resolved_proxy_port());
-    let mut tcp = TcpStream::connect(&addr).await?;
+    let mut forwarded = Vec::with_capacity(headers_part.len() + injected.len() + blank_line.len());
+    forwarded.extend_from_slice(headers_part);
+    forwarded.extend_from_slice(injected.as_bytes());
+    forwarded.extend_from_slice(blank_line);
 
-    tcp.write_all(headers_part).await?;
-    tcp.write_all(injected.as_bytes()).await?;
-    tcp.write_all(blank_line).await?;
-
-    // Proxy the remaining request body and response bidirectionally.
-    tokio::io::copy_bidirectional(&mut unix, &mut tcp).await?;
-    Ok(())
+    Ok(Some(forwarded))
 }
 
 // -----------------------------------------------------------------------------
@@ -1142,8 +1210,7 @@ async fn run_internal_agent(
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--internal-sandbox" || arg == "--internal-forward-sock" || arg == "--session-id"
-        {
+        if arg == "--internal-sandbox" || arg == "--internal-forward-sock" {
             i += 2;
         } else if arg == "--no-proxy" || arg == "--no-sandbox" {
             // Filter out these flags as they are handled via bool params
@@ -1158,9 +1225,12 @@ async fn run_internal_agent(
     let no_proxy = args.iter().any(|arg| arg == "--no-proxy");
     let _no_sandbox = args.iter().any(|arg| arg == "--no-sandbox");
 
-    // Extract session ID from args
-    let session_id =
-        get_arg_value(args, "--session-id").unwrap_or_else(|| format!("sevsh-{}", Uuid::new_v4()));
+    // Determine resolved session id (from detected running session) or generate one for this sevsh
+    let session_id = if let Some(sid) = resolved_context_session_id() {
+        sid.to_string()
+    } else {
+        format!("sevsh-{}", Uuid::new_v4())
+    };
 
     // Set session ID in environment
     env::set_var("SEVORIX_SESSION_ID", &session_id);
@@ -1211,6 +1281,13 @@ async fn handle_direct_exec(
     // Validation payload: join args for a human-readable command string.
     let payload = args.join(" ");
     let verdict = validate_command(&payload).await?;
+    let context_session_id = resolve_context_session_id().await;
+
+    append_context_entries(
+        context_session_id.as_deref(),
+        vec![("stdin", payload.clone())],
+    )
+    .await;
 
     if verdict.allowed {
         if verdict.status == "FLAG" {
@@ -1234,15 +1311,44 @@ async fn handle_direct_exec(
                 .env("no_proxy", "localhost,127.0.0.1,::1");
         }
         cmd.env("SEVORIX_SESSION_ID", session_id);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
         // On Linux: apply seccomp notify/deny filter via the shared helper.
         #[cfg(target_os = "linux")]
-        let status = spawn_with_seccomp(&mut cmd).await?;
+        let output = spawn_with_seccomp_output(&mut cmd).await?;
 
         #[cfg(not(target_os = "linux"))]
-        let status = cmd.status()?;
+        let output = cmd.output()?;
 
-        Ok(status.code().unwrap_or(1))
+        // On Linux the child output is already streamed to the parent's
+        // stdout/stderr by `run_child_with_tee` inside
+        // `spawn_with_seccomp_output`. Only write the captured `Output` bytes
+        // for non-Linux builds where we used `command.output()` (no streaming).
+        #[cfg(not(target_os = "linux"))]
+        {
+            if !output.stdout.is_empty() {
+                std::io::stdout().write_all(&output.stdout)?;
+                std::io::stdout().flush()?;
+            }
+            if !output.stderr.is_empty() {
+                std::io::stderr().write_all(&output.stderr)?;
+                std::io::stderr().flush()?;
+            }
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut context_entries = Vec::new();
+        if !stdout.is_empty() {
+            context_entries.push(("stdout", stdout));
+        }
+        if !stderr.is_empty() {
+            context_entries.push(("stderr", stderr));
+        }
+        append_context_entries(context_session_id.as_deref(), context_entries).await;
+
+        Ok(output.status.code().unwrap_or(1))
     } else {
         eprintln!("SEVORIX BLOCKED: {}", verdict.reason);
         if verdict.kill {
@@ -1277,6 +1383,13 @@ async fn handle_bash_invocation(
 
     // Validate
     let verdict = validate_command(&payload).await?;
+    let context_session_id = resolve_context_session_id().await;
+
+    append_context_entries(
+        context_session_id.as_deref(),
+        vec![("stdin", payload.clone())],
+    )
+    .await;
 
     if verdict.allowed {
         if verdict.status == "FLAG" {
@@ -1316,17 +1429,45 @@ async fn handle_bash_invocation(
         for (key, value) in env_vars {
             command.env(key, value);
         }
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
 
         // On Linux: fetch the syscall policy and apply a per-child seccomp notify filter
         // for synchronous kernel-level enforcement. On macOS seccomp is unavailable
         // so we skip the fetch and go straight to command execution.
         #[cfg(target_os = "linux")]
-        let status = spawn_with_seccomp(&mut command).await?;
+        let output = spawn_with_seccomp_output(&mut command).await?;
 
         #[cfg(not(target_os = "linux"))]
-        let status = command.status()?;
+        let output = command.output()?;
 
-        Ok(status.code().unwrap_or(1))
+        // See above: only write captured output for non-Linux builds where
+        // `command.output()` was used. On Linux `run_child_with_tee` already
+        // forwarded the child's output live.
+        #[cfg(not(target_os = "linux"))]
+        {
+            if !output.stdout.is_empty() {
+                std::io::stdout().write_all(&output.stdout)?;
+                std::io::stdout().flush()?;
+            }
+            if !output.stderr.is_empty() {
+                std::io::stderr().write_all(&output.stderr)?;
+                std::io::stderr().flush()?;
+            }
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut context_entries = Vec::new();
+        if !stdout.is_empty() {
+            context_entries.push(("stdout", stdout));
+        }
+        if !stderr.is_empty() {
+            context_entries.push(("stderr", stderr));
+        }
+        append_context_entries(context_session_id.as_deref(), context_entries).await;
+
+        Ok(output.status.code().unwrap_or(1))
     } else {
         eprintln!("SEVORIX BLOCKED: {}", verdict.reason);
         if verdict.kill {
@@ -1411,6 +1552,69 @@ struct Verdict {
     kill: bool,
 }
 
+fn parse_current_context_session_id(body: &Value) -> Option<String> {
+    body.get("current_session")
+        .and_then(|value| value.as_str())
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+async fn resolve_context_session_id() -> Option<String> {
+    if let Some(session_id) = resolved_context_session_id() {
+        return Some(session_id.to_string());
+    }
+
+    let client = http_client();
+    let response = client
+        .get(format!("{}/api/sessions", proxy_url()))
+        .send()
+        .await
+        .ok()?;
+    let body = response.json::<Value>().await.ok()?;
+    let parsed = parse_current_context_session_id(&body);
+    // Cache the parsed response (including `None`) so we don't query
+    // `/api/sessions` on every sevsh invocation. OnceLock stores an
+    // `Option<String>`; setting it here remembers either the resolved
+    // session id or the absence of one for the lifetime of this process.
+    let _ = RESOLVED_CONTEXT_SESSION_ID.set(parsed.clone());
+    parsed
+}
+
+async fn append_context_entries(session_id: Option<&str>, entries: Vec<(&str, String)>) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+
+    let chunks: Vec<Value> = entries
+        .into_iter()
+        .filter_map(|(stream, raw)| {
+            if raw.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "source": "sevsh",
+                    "stream": stream,
+                    "raw": raw,
+                }))
+            }
+        })
+        .collect();
+
+    if chunks.is_empty() {
+        return;
+    }
+
+    let client = http_client();
+    let _ = client
+        .post(format!("{}/api/context", proxy_url()))
+        .json(&json!({
+            "session_id": session_id,
+            "chunks": chunks,
+        }))
+        .send()
+        .await;
+}
+
 /// Return the path to the real bash binary to use for executing commands.
 ///
 /// Prefers `SEVORIX_REAL_SHELL`, which the sevorix-claude-launcher sets to a
@@ -1419,9 +1623,64 @@ struct Verdict {
 /// back to `/bin/bash` because in the Claude Code integration that path IS
 /// sevsh — using it would recurse infinitely.
 fn real_shell() -> String {
-    env::var("SEVORIX_REAL_SHELL")
-        .or_else(|_| env::var("SHELL"))
-        .unwrap_or_else(|_| "/usr/bin/bash".to_string())
+    if let Ok(shell) = env::var("SEVORIX_REAL_SHELL") {
+        if !shell.trim().is_empty() {
+            return shell;
+        }
+    }
+
+    let shell_env = env::var("SHELL").ok();
+    let current_exe = env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    let fallback_candidates: Vec<&str> = ["/usr/bin/bash", "/bin/bash", "/usr/bin/sh", "/bin/sh"]
+        .into_iter()
+        .filter(|candidate| Path::new(candidate).exists())
+        .collect();
+
+    choose_real_shell(
+        shell_env.as_deref(),
+        current_exe.as_deref(),
+        &fallback_candidates,
+    )
+}
+
+fn choose_real_shell(
+    shell_env: Option<&str>,
+    current_exe: Option<&Path>,
+    fallback_candidates: &[&str],
+) -> String {
+    if let Some(shell) = shell_env.filter(|shell| !shell.trim().is_empty()) {
+        if !path_looks_like_sevsh(shell) && !path_matches_current_exe(shell, current_exe) {
+            return shell.to_string();
+        }
+    }
+
+    for candidate in fallback_candidates {
+        if !path_matches_current_exe(candidate, current_exe) {
+            return (*candidate).to_string();
+        }
+    }
+
+    "bash".to_string()
+}
+
+fn path_looks_like_sevsh(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.contains("sevsh"))
+        .unwrap_or_else(|| path.contains("sevsh"))
+}
+
+fn path_matches_current_exe(path: &str, current_exe: Option<&Path>) -> bool {
+    let Some(current_exe) = current_exe else {
+        return false;
+    };
+
+    std::fs::canonicalize(path)
+        .map(|candidate| candidate == current_exe)
+        .unwrap_or(false)
 }
 
 /// Returns the PID of the real agent process to target for kill=true enforcement.
@@ -1488,7 +1747,7 @@ async fn fetch_syscall_policy() -> (sevorix_core::CompiledRuleSet, String) {
 ///
 /// Returns the child's exit status.
 #[cfg(target_os = "linux")]
-async fn spawn_with_seccomp(command: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+async fn spawn_with_seccomp_output(command: &mut Command) -> std::io::Result<std::process::Output> {
     let (rule_set, session_role) = fetch_syscall_policy().await;
 
     if !rule_set.is_empty() {
@@ -1528,7 +1787,7 @@ async fn spawn_with_seccomp(command: &mut Command) -> std::io::Result<std::proce
                 });
             }
 
-            let mut child = command.spawn()?;
+            let child = command.spawn()?;
             let child_pid = child.id();
 
             // Close parent's write end so the pipe read returns EOF after
@@ -1653,7 +1912,10 @@ async fn spawn_with_seccomp(command: &mut Command) -> std::io::Result<std::proce
                 }
             }
 
-            child.wait()
+            // Stream child output to the console while capturing a bounded
+            // amount for later upload. This avoids buffering arbitrarily
+            // large outputs in memory (reviewer: tee approach).
+            run_child_with_tee(child, 1024 * 1024)
         } else {
             // Pipe creation failed; fall back to EPERM-only filter (no logging).
             let fallback_names = rule_set.syscall_names.clone();
@@ -1663,11 +1925,100 @@ async fn spawn_with_seccomp(command: &mut Command) -> std::io::Result<std::proce
                         .map_err(|e| std::io::Error::other(format!("seccomp filter failed: {}", e)))
                 });
             }
-            command.status()
+            // Pipe creation failed — spawn and stream with tee.
+            let child = command.spawn()?;
+            run_child_with_tee(child, 1024 * 1024)
         }
     } else {
-        command.status()
+        let child = command.spawn()?;
+        run_child_with_tee(child, 1024 * 1024)
     }
+}
+
+/// Spawn a child process and stream its stdout/stderr to the parent's
+/// stdout/stderr while capturing up to `cap` bytes of each stream.
+fn run_child_with_tee(
+    mut child: std::process::Child,
+    cap: usize,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::new()));
+
+    // Spawn threads to stream stdout/stderr if available.
+    let mut handles = Vec::new();
+
+    if let Some(mut stdout) = child.stdout.take() {
+        let out_cap = cap;
+        let out_clone = Arc::clone(&out_buf);
+        handles.push(std::thread::spawn(move || {
+            let mut dst = std::io::stdout();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = dst.write_all(&buf[..n]);
+                        let mut b = out_clone.lock().unwrap();
+                        let remaining = out_cap.saturating_sub(b.len());
+                        if remaining > 0 {
+                            let to_take = remaining.min(n);
+                            b.extend_from_slice(&buf[..to_take]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    if let Some(mut stderr) = child.stderr.take() {
+        let err_cap = cap;
+        let err_clone = Arc::clone(&err_buf);
+        handles.push(std::thread::spawn(move || {
+            let mut dst = std::io::stderr();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = dst.write_all(&buf[..n]);
+                        let mut b = err_clone.lock().unwrap();
+                        let remaining = err_cap.saturating_sub(b.len());
+                        if remaining > 0 {
+                            let to_take = remaining.min(n);
+                            b.extend_from_slice(&buf[..to_take]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    let status = child.wait()?;
+
+    // Wait for streaming threads to finish consuming any remaining data.
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let stdout = Arc::try_unwrap(out_buf)
+        .unwrap_or_default()
+        .into_inner()
+        .unwrap_or_default();
+    let stderr = Arc::try_unwrap(err_buf)
+        .unwrap_or_default()
+        .into_inner()
+        .unwrap_or_default();
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Error>> {
@@ -1786,15 +2137,11 @@ fn parse_ppid_from_stat(stat: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tempfile::TempDir;
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
     }
-
-    /// Shared lock so proxy_unix_to_tcp tests that mutate RESOLVED_PROXY_URL
-    /// don't race against each other.
-    static PORT_LOCK: Mutex<()> = Mutex::new(());
 
     // -------------------------------------------------------------------------
     // parse_ppid_from_stat
@@ -2029,6 +2376,68 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_current_context_session_id_extracts_non_empty_value() {
+        let body = json!({
+            "current_session": "550e8400-e29b-41d4-a716-446655440000"
+        });
+
+        assert_eq!(
+            parse_current_context_session_id(&body).as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn test_parse_current_context_session_id_rejects_blank_value() {
+        let body = json!({
+            "current_session": "   "
+        });
+
+        assert!(parse_current_context_session_id(&body).is_none());
+    }
+
+    #[test]
+    fn test_find_running_session_target_extracts_session_id_for_named_session() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let session_json = json!({
+            "name": "demo-session",
+            "session_id": session_id,
+            "port": 4310,
+            "pid": std::process::id(),
+        });
+        std::fs::write(
+            temp_dir.path().join("demo-session.json"),
+            serde_json::to_string(&session_json).unwrap(),
+        )
+        .unwrap();
+
+        let (target, running_count) =
+            find_running_session_target(temp_dir.path(), Some("demo-session"));
+
+        assert_eq!(running_count, 1);
+        assert_eq!(target, Some((4310, Some(session_id.to_string()))));
+    }
+
+    #[test]
+    fn test_choose_real_shell_ignores_sevsh_shell_env() {
+        let chosen = choose_real_shell(
+            Some("/home/demo/.local/bin/sevsh"),
+            None,
+            &["/usr/bin/bash"],
+        );
+
+        assert_eq!(chosen, "/usr/bin/bash");
+    }
+
+    #[test]
+    fn test_choose_real_shell_prefers_non_sevsh_shell_env() {
+        let chosen = choose_real_shell(Some("/bin/zsh"), None, &["/usr/bin/bash"]);
+
+        assert_eq!(chosen, "/bin/zsh");
+    }
+
+    #[test]
     fn test_parse_dashdash_no_following_args() {
         let inv = parse_bash_invocation(&args(&["--"]));
         assert!(inv.positional_args.is_empty());
@@ -2232,77 +2641,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_unix_to_tcp_bare_lf_injection() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::UnixStream;
+        use tokio::io::{duplex, AsyncWriteExt};
 
-        let _guard = PORT_LOCK.lock().unwrap();
+        let (mut client, mut server) = duplex(1024);
+        let rewrite_task =
+            tokio::spawn(async move { read_and_inject_initial_request(&mut server).await });
 
-        // Bind a TCP listener on a random port.
-        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = tcp_listener.local_addr().unwrap().port();
-
-        // Point RESOLVED_PROXY_URL at our listener.  The OnceLock may already
-        // be initialised from a previous test run in this process; if so we
-        // need to overwrite it.  We do this by temporarily putting the port
-        // into SEVORIX_PORT and then calling resolved_proxy_port() which
-        // parses from the OnceLock — but since the OnceLock is already set we
-        // have to use a small workaround: override the OnceLock value with
-        // unsafe memory manipulation would be unsound, so instead we force the
-        // URL by using set_var and calling resolve_proxy_url() inline here,
-        // then patching the OnceLock.  Because OnceLock doesn't allow
-        // overwrite we use a different strategy: derive the port from the
-        // env-var inside a helper and verify the listener receives the request.
-        //
-        // The cleanest approach that avoids OnceLock conflicts: write the
-        // request to the unix socket directly, and inspect what arrives at the
-        // TCP listener after spawning the task.  We temporarily set
-        // SEVORIX_PORT so that resolved_proxy_port() picks up our port.
-        // resolved_proxy_port() reads proxy_url() which reads RESOLVED_PROXY_URL.
-        // If RESOLVED_PROXY_URL is uninitialised it falls back to env vars via
-        // resolve_proxy_url().  We ensure RESOLVED_PROXY_URL is initialised to
-        // our port by calling get_or_init before the task starts.
-        RESOLVED_PROXY_URL.get_or_init(|| format!("http://localhost:{}", port));
-
-        // If the OnceLock was already initialised to a different port we fall
-        // back to whatever port it holds and bind a new listener on that port.
-        let actual_port: u16 = {
-            let url = RESOLVED_PROXY_URL.get().unwrap();
-            url.split(':')
-                .nth(2)
-                .and_then(|s| s.split('/').next())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3000)
-        };
-
-        // Re-bind the listener on the actual port if it differs.
-        let tcp_listener: tokio::net::TcpListener = if actual_port == port {
-            tcp_listener
-        } else {
-            tokio::net::TcpListener::bind(format!("127.0.0.1:{}", actual_port))
-                .await
-                .unwrap()
-        };
-
-        // Create a Unix socket pair.  We pass the *server* side to
-        // proxy_unix_to_tcp; we write the request to the *client* side.
-        let (mut client_unix, server_unix) = UnixStream::pair().unwrap();
-
-        // Spawn the proxy task.
-        let proxy_task = tokio::spawn(proxy_unix_to_tcp(server_unix));
-
-        // Write an HTTP request with bare-LF line endings.
-        client_unix
+        client
             .write_all(b"GET / HTTP/1.0\nHost: example.com\n\n")
             .await
             .unwrap();
+        drop(client);
 
-        // Accept the forwarded connection on the TCP listener.
-        let (mut tcp_conn, _) = tcp_listener.accept().await.unwrap();
-
-        // Read the forwarded request (up to 8 KiB).
-        let mut buf = vec![0u8; 8192];
-        let n = tcp_conn.read(&mut buf).await.unwrap();
-        let forwarded = std::str::from_utf8(&buf[..n]).unwrap();
+        let forwarded = rewrite_task
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("expected rewritten request");
+        let forwarded = std::str::from_utf8(&forwarded).unwrap();
 
         assert!(
             forwarded.contains("X-Sevorix-Pid:"),
@@ -2327,11 +2683,6 @@ mod tests {
             "injected headers must not be concatenated onto Host value; got:\n{}",
             forwarded
         );
-
-        // Close the TCP connection so the bidirectional copy terminates.
-        drop(tcp_conn);
-        drop(client_unix);
-        let _ = proxy_task.await;
     }
 
     // -------------------------------------------------------------------------
@@ -2340,49 +2691,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_unix_to_tcp_crlf_injection() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::UnixStream;
+        use tokio::io::{duplex, AsyncWriteExt};
 
-        // Serialize with the bare-LF test so they don't race on RESOLVED_PROXY_URL.
-        let _guard = PORT_LOCK.lock().unwrap();
+        let (mut client, mut server) = duplex(1024);
+        let rewrite_task =
+            tokio::spawn(async move { read_and_inject_initial_request(&mut server).await });
 
-        // Reuse the same port-discovery pattern as the bare-LF test.
-        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = tcp_listener.local_addr().unwrap().port();
-
-        RESOLVED_PROXY_URL.get_or_init(|| format!("http://localhost:{}", port));
-        let actual_port: u16 = {
-            let url = RESOLVED_PROXY_URL.get().unwrap();
-            url.split(':')
-                .nth(2)
-                .and_then(|s| s.split('/').next())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3000)
-        };
-        let tcp_listener = if actual_port == port {
-            tcp_listener
-        } else {
-            drop(tcp_listener);
-            tokio::net::TcpListener::bind(format!("127.0.0.1:{}", actual_port))
-                .await
-                .unwrap()
-        };
-
-        let (mut client_unix, server_unix) = UnixStream::pair().unwrap();
-        let proxy_task = tokio::spawn(proxy_unix_to_tcp(server_unix));
-
-        // Standard CRLF HTTP/1.1 POST with a small JSON body.
-        client_unix
+        client
             .write_all(
                 b"POST /analyze HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
             )
             .await
             .unwrap();
+        drop(client);
 
-        let (mut tcp_conn, _) = tcp_listener.accept().await.unwrap();
-        let mut buf = vec![0u8; 8192];
-        let n = tcp_conn.read(&mut buf).await.unwrap();
-        let forwarded = std::str::from_utf8(&buf[..n]).unwrap();
+        let forwarded = rewrite_task
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("expected rewritten request");
+        let forwarded = std::str::from_utf8(&forwarded).unwrap();
 
         // Injected headers must be present.
         assert!(
@@ -2411,10 +2739,6 @@ mod tests {
             !forwarded[header_end + 4..].contains("\r\n\r\n"),
             "forwarded request must have exactly one header terminator; got:\n{forwarded}"
         );
-
-        drop(tcp_conn);
-        drop(client_unix);
-        let _ = proxy_task.await;
     }
 
     // -------------------------------------------------------------------------
@@ -2423,11 +2747,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_unix_to_tcp_oversized_headers_431() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::UnixStream;
+        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
-        // Create a Unix socket pair.
-        let (mut client_unix, server_unix) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = duplex(70_000);
 
         // Build a request whose headers exceed MAX_HEADER_BYTES (65536).
         // The header value consists of 66000 'a' bytes (no \r or \n embedded),
@@ -2436,23 +2758,21 @@ mod tests {
         big_request.extend(std::iter::repeat(b'a').take(66_000));
         big_request.extend_from_slice(b"\r\n\r\n");
 
-        // Spawn the proxy function as a task first, then feed it data.
-        // We read from the client concurrently so we capture the 431 response
-        // before server_unix is dropped.
-        let proxy_task = tokio::spawn(proxy_unix_to_tcp(server_unix));
+        let rewrite_task =
+            tokio::spawn(async move { read_and_inject_initial_request(&mut server).await });
 
-        // Write the oversized request to the client side.
-        client_unix.write_all(&big_request).await.unwrap();
-        // Shut down the write half so the server sees EOF after writing the 431.
-        client_unix.shutdown().await.unwrap();
+        client.write_all(&big_request).await.unwrap();
+        client.shutdown().await.unwrap();
 
-        // Concurrently read back the 431 response from the server.
         let mut response = Vec::new();
-        client_unix.read_to_end(&mut response).await.unwrap_or(0);
+        client.read_to_end(&mut response).await.unwrap();
 
-        // Wait for the proxy task to finish.
-        let result = proxy_task.await.expect("proxy task panicked");
-        assert!(result.is_ok(), "expected Ok(()), got: {:?}", result);
+        let result = rewrite_task.await.expect("rewrite task panicked");
+        assert!(result.is_ok(), "expected Ok(_), got: {:?}", result);
+        assert!(
+            result.unwrap().is_none(),
+            "expected oversized headers to short-circuit without a forwarded request"
+        );
 
         let response_str = std::str::from_utf8(&response).unwrap_or("<non-utf8>");
         assert!(

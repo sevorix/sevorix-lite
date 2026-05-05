@@ -317,6 +317,13 @@ pub struct PullResponse {
     pub artifact_type: String,
     #[serde(default)]
     pub dependencies: Vec<DependencyRef>,
+    // The following fields are verified server-side; reserved for future local verification.
+    #[serde(default)]
+    pub signed: bool,
+    #[serde(default)]
+    pub signature_valid: Option<bool>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,12 +574,14 @@ pub fn check_executable_policy(content: &serde_json::Value) -> Vec<String> {
         for policy in policies {
             if let Some(policy_type) = policy.get("type").and_then(|t| t.as_str()) {
                 if policy_type == "Executable" {
-                    if let Some(name) = policy.get("name").and_then(|n| n.as_str()) {
-                        warnings.push(format!(
-                            "Policy '{}' uses Executable type which can run arbitrary commands",
-                            name
-                        ));
-                    }
+                    let label = policy
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("<unnamed>");
+                    warnings.push(format!(
+                        "Policy '{}' uses Executable type which can run arbitrary commands",
+                        label
+                    ));
                 }
             }
         }
@@ -920,6 +929,72 @@ mod tests {
     }
 
     #[test]
+    fn test_pull_response_signature_fields_present() {
+        let json = r#"{
+            "id": "art-1",
+            "name": "signed-policy",
+            "version": "1.0.0",
+            "description": null,
+            "owner": "admin",
+            "tags": [],
+            "downloads": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "content": {"policies": []},
+            "signed": true,
+            "signature_valid": true,
+            "content_hash": "abc123"
+        }"#;
+
+        let response: PullResponse = serde_json::from_str(json).expect("Failed to deserialize");
+        assert!(response.signed);
+        assert_eq!(response.signature_valid, Some(true));
+        assert_eq!(response.content_hash.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_pull_response_signature_fields_default_when_absent() {
+        let json = r#"{
+            "id": "art-2",
+            "name": "old-policy",
+            "version": "1.0.0",
+            "description": null,
+            "owner": "admin",
+            "tags": [],
+            "downloads": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "content": {"policies": []}
+        }"#;
+
+        let response: PullResponse = serde_json::from_str(json).expect("Failed to deserialize");
+        assert!(!response.signed);
+        assert_eq!(response.signature_valid, None);
+        assert_eq!(response.content_hash, None);
+    }
+
+    #[test]
+    fn test_pull_response_signature_invalid() {
+        let json = r#"{
+            "id": "art-3",
+            "name": "bad-sig-policy",
+            "version": "1.0.0",
+            "description": null,
+            "owner": "admin",
+            "tags": [],
+            "downloads": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "content": {"policies": []},
+            "signed": true,
+            "signature_valid": false
+        }"#;
+
+        let response: PullResponse = serde_json::from_str(json).expect("Failed to deserialize");
+        assert!(response.signed);
+        assert_eq!(response.signature_valid, Some(false));
+        // Some(false) is not Some(true), so handler treats this as the unsigned/invalid branch
+        assert_ne!(response.signature_valid, Some(true));
+    }
+
+    #[test]
     fn test_check_executable_policy_with_missing_name() {
         let content = json!({
             "policies": [
@@ -930,7 +1005,8 @@ mod tests {
         });
 
         let warnings = check_executable_policy(&content);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("<unnamed>"));
     }
 
     #[test]

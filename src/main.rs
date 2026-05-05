@@ -72,6 +72,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // Always auto-generate a new session UUID for `start`.
                 let session_id = uuid::Uuid::new_v4();
                 let session_name = name.unwrap_or_else(|| session_id.to_string());
                 let resolved_port = port.unwrap_or_else(|| find_available_port(3000));
@@ -684,6 +685,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn test_cli_stop_command() {
         let cli = Cli::try_parse_from(["sevorix", "stop"]);
         assert!(cli.is_ok());
@@ -887,12 +889,37 @@ mod tests {
                     name,
                     version,
                     output,
+                    allow_executable,
                     ..
                 } => {
                     assert_eq!(name, "my-policy");
                     assert_eq!(version, "1.0.0");
                     assert_eq!(output, Some("/tmp/policy.json".to_string()));
+                    assert!(!allow_executable);
                 }
+                _ => panic!("Expected Pull subcommand"),
+            }
+        } else {
+            panic!("Expected Hub command");
+        }
+    }
+
+    #[test]
+    fn test_cli_hub_pull_with_allow_executable_flag() {
+        let cli = Cli::try_parse_from([
+            "sevorix",
+            "hub",
+            "pull",
+            "--allow-executable",
+            "my-policy",
+            "1.0.0",
+        ]);
+        assert!(cli.is_ok());
+        if let Some(Commands::Hub { subcmd }) = cli.unwrap().command {
+            match subcmd {
+                HubCommands::Pull {
+                    allow_executable, ..
+                } => assert!(allow_executable),
                 _ => panic!("Expected Pull subcommand"),
             }
         } else {
@@ -1213,19 +1240,40 @@ async fn handle_hub_async(cmd: HubCommands) -> anyhow::Result<()> {
             name,
             version,
             output,
+            allow_executable,
         } => {
             let client = HubClient::new(hub_url.as_deref())?;
             let response = client.pull(&name, &version).await?;
 
-            // Check for executable policy warnings
             let warnings = check_executable_policy(&response.content);
             if !warnings.is_empty() {
-                eprintln!("\n⚠️  SECURITY WARNING:");
-                for warning in &warnings {
-                    eprintln!("  - {}", warning);
+                if !allow_executable {
+                    eprintln!("\nERROR: This artifact contains Executable policies that can run");
+                    eprintln!("arbitrary commands on your system:");
+                    for warning in &warnings {
+                        eprintln!("  - {}", warning);
+                    }
+                    eprintln!("\nTo pull this artifact you must explicitly acknowledge the risk:");
+                    eprintln!("  sevorix hub pull --allow-executable {} {}", name, version);
+                    anyhow::bail!("Refusing to pull artifact with Executable policies without --allow-executable");
+                } else if response.signature_valid == Some(true) {
+                    eprintln!("\nSECURITY WARNING:");
+                    for warning in &warnings {
+                        eprintln!("  - {}", warning);
+                    }
+                    eprintln!("Artifact signature is valid (verified by hub, not locally).");
+                    eprintln!("Review carefully before using in production.\n");
+                } else {
+                    eprintln!("\n!!! UNSIGNED EXECUTABLE POLICY WARNING !!!");
+                    eprintln!(
+                        "This artifact is NOT cryptographically signed (or signature invalid)."
+                    );
+                    eprintln!("A compromised hub could have injected these policies to run arbitrary code:");
+                    for warning in &warnings {
+                        eprintln!("  - {}", warning);
+                    }
+                    eprintln!("\nYou passed --allow-executable; proceeding at your own risk.\n");
                 }
-                eprintln!("\nThis artifact contains policies that can execute arbitrary commands.");
-                eprintln!("Review carefully before using in production.\n");
             }
 
             let content_str = serde_json::to_string_pretty(&response.content)?;
