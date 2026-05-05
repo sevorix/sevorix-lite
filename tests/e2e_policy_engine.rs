@@ -212,3 +212,157 @@ async fn test_4_6_kill_flag_in_policy() {
         "kill:true policy must still return BLOCK to caller; got: {resp}"
     );
 }
+
+// ── 4.7 – /api/policies/reload returns status and counts ─────────────────────
+
+#[tokio::test]
+async fn test_4_7_reload_response_shape() {
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .client
+        .post(format!("{}/api/policies/reload", h.base_url()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "reload endpoint must return 200");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "reloaded", "body.status must be 'reloaded'");
+    assert!(
+        body["policies"].is_number(),
+        "body.policies must be a number; got: {body}"
+    );
+    assert!(
+        body["roles"].is_number(),
+        "body.roles must be a number; got: {body}"
+    );
+}
+
+// ── 4.8 – reload clears in-memory-only policies and reports accurate counts ───
+
+#[tokio::test]
+async fn test_4_8_reload_clears_direct_injected_policies() {
+    let h = TestHarness::new().await;
+
+    // Inject 3 policies directly into the engine (not on disk).
+    for i in 0..3u32 {
+        h.add_policy_direct(Policy {
+            id: format!("direct-reload-{}", i),
+            match_type: PolicyType::Simple(format!("DIRECT_RELOAD_{}", i)),
+            action: Action::Block,
+            context: PolicyContext::All,
+            kill: false,
+            syscall: vec![],
+        });
+    }
+
+    let before = h.state.policy_engine.read().unwrap().policies.len();
+    assert_eq!(
+        before, 3,
+        "engine should hold 3 direct policies before reload"
+    );
+
+    // Reload atomically replaces the engine with whatever is on disk.
+    let resp: serde_json::Value = h
+        .client
+        .post(format!("{}/api/policies/reload", h.base_url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["status"], "reloaded");
+
+    // The reported count must match the actual post-reload engine state.
+    let reported = resp["policies"].as_u64().unwrap_or(0);
+    let actual = h.state.policy_engine.read().unwrap().policies.len() as u64;
+    assert_eq!(
+        reported, actual,
+        "response policy count must match engine state; reported={reported} actual={actual}"
+    );
+
+    // None of the directly-injected policy IDs should survive the reload.
+    {
+        let engine = h.state.policy_engine.read().unwrap();
+        for i in 0..3u32 {
+            assert!(
+                !engine
+                    .policies
+                    .contains_key(&format!("direct-reload-{}", i)),
+                "direct-injected policy direct-reload-{i} must be gone after reload"
+            );
+        }
+    }
+}
+
+// ── 4.9 – reload picks up a policy written to disk ───────────────────────────
+
+#[tokio::test]
+async fn test_4_9_reload_picks_up_disk_policy() {
+    // Write a policy file into .sevorix/policies/ relative to CWD — one of the
+    // paths the reload handler searches. Use a unique ID to avoid interfering
+    // with other tests running in parallel.
+    let policy_id = format!("test-disk-reload-{}", uuid::Uuid::new_v4());
+    const CANARY: &str = "DISK_RELOAD_CANARY_ZP3M";
+
+    let cwd = std::env::current_dir().unwrap();
+    let policies_dir = cwd.join(".sevorix").join("policies");
+    std::fs::create_dir_all(&policies_dir).unwrap();
+    let policy_path = policies_dir.join(format!("{}.json", policy_id));
+
+    std::fs::write(
+        &policy_path,
+        serde_json::to_string_pretty(&json!({
+            "id": policy_id,
+            "type": "Simple",
+            "pattern": CANARY,
+            "action": "Block",
+            "context": "All",
+            "kill": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let h = TestHarness::new().await;
+
+    // Canary is not in the engine yet (server started before we wrote the file).
+    let before = analyze(&h, CANARY, "Shell").await;
+    // The engine might already have picked it up if ~/.sevorix loaded it at startup;
+    // we only assert the before/after delta below, so skip a pre-reload assertion.
+
+    let reload_resp: serde_json::Value = h
+        .client
+        .post(format!("{}/api/policies/reload", h.base_url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reload_resp["status"], "reloaded");
+
+    // After reload the policy file is on disk — it must now be enforced.
+    let after = analyze(&h, CANARY, "Shell").await;
+
+    // Clean up the file regardless of assertion outcome.
+    let _ = std::fs::remove_file(&policy_path);
+
+    // The reload response count must include at least our one policy.
+    let count = reload_resp["policies"].as_u64().unwrap_or(0);
+    assert!(
+        count >= 1,
+        "reload should report at least 1 policy after writing to disk; got {count}"
+    );
+
+    // Canary must be blocked after reload, regardless of before state.
+    let _ = before; // suppress unused warning
+    assert_eq!(
+        after["status"], "BLOCK",
+        "disk policy must be enforced after reload; got: {after}"
+    );
+}

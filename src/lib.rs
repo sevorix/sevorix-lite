@@ -1045,9 +1045,12 @@ async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl Int
         }
     }
 
+    let policy_count = engine.policies.len();
+    let role_count = engine.roles.len();
     *state.policy_engine.write().unwrap() = engine;
     tracing::info!("Policies reloaded via API");
-    Json(json!({ "status": "reloaded" })).into_response()
+    Json(json!({ "status": "reloaded", "policies": policy_count, "roles": role_count }))
+        .into_response()
 }
 
 async fn dashboard_redirect() -> impl IntoResponse {
