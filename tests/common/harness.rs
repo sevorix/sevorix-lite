@@ -3,7 +3,7 @@
 
 use dashmap::DashMap;
 use sevorix_core::EnforcementTier;
-use sevorix_watchtower::{build_router, policy::Engine, AppState};
+use sevorix_watchtower::{build_router, context::ContextStore, policy::Engine, AppState};
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -37,6 +37,7 @@ impl TestHarness {
         std::fs::create_dir_all(config_dir.join("policies")).unwrap();
         std::fs::create_dir_all(config_dir.join("roles")).unwrap();
         std::fs::create_dir_all(config_dir.join("logs")).unwrap();
+        std::fs::create_dir_all(config_dir.join("context")).unwrap();
 
         let engine = Engine::new();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -52,6 +53,14 @@ impl TestHarness {
             traffic_log_path,
             log_dir: config_dir.join("logs"),
             session_id,
+            context_store: Arc::new(
+                ContextStore::new(
+                    config_dir.join("context"),
+                    500,
+                    std::sync::Arc::new(sevorix_watchtower::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -133,6 +142,7 @@ impl TestHarness {
         std::fs::create_dir_all(config_dir.join("policies")).unwrap();
         std::fs::create_dir_all(config_dir.join("roles")).unwrap();
         std::fs::create_dir_all(config_dir.join("logs")).unwrap();
+        std::fs::create_dir_all(config_dir.join("context")).unwrap();
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let traffic_log_path = config_dir
@@ -146,6 +156,14 @@ impl TestHarness {
             traffic_log_path,
             log_dir: config_dir.join("logs"),
             session_id,
+            context_store: Arc::new(
+                ContextStore::new(
+                    config_dir.join("context"),
+                    500,
+                    std::sync::Arc::new(sevorix_watchtower::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             port: 3000,
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -220,6 +238,14 @@ impl TestHarness {
             traffic_log_path,
             log_dir: config_dir.join("logs"),
             session_id,
+            context_store: Arc::new(
+                ContextStore::new(
+                    config_dir.join("context"),
+                    500,
+                    std::sync::Arc::new(sevorix_watchtower::settings::ContextSettings::default()),
+                )
+                .unwrap(),
+            ),
             enforcement_tier: EnforcementTier::Standard,
             active_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             pending_decisions: Arc::new(DashMap::new()),
