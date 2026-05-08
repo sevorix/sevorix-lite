@@ -196,6 +196,9 @@ pub enum HubCommands {
         /// Output file path (prints to stdout if not specified)
         #[arg(short, long)]
         output: Option<String>,
+        /// Allow pulling artifacts that contain Executable policies (dangerous; requires explicit opt-in)
+        #[arg(long)]
+        allow_executable: bool,
     },
     /// Search for policy artifacts on SevorixHub
     Search {

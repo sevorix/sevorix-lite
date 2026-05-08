@@ -4,7 +4,7 @@
 use axum::Router;
 use dashmap::DashMap;
 use sevorix_core::EnforcementTier;
-use sevorix_watchtower::{policy::Engine, proxy::proxy_handler, AppState};
+use sevorix_watchtower::{context::ContextStore, policy::Engine, proxy::proxy_handler, AppState};
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +21,14 @@ async fn test_real_connect_handshake() {
         traffic_log_path: std::path::PathBuf::from("/tmp/test_traffic_events.jsonl"),
         log_dir: std::path::PathBuf::from("/tmp"),
         session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+        context_store: Arc::new(
+            ContextStore::new(
+                std::env::temp_dir().join(format!("sevorix-context-{}", uuid::Uuid::new_v4())),
+                500,
+                std::sync::Arc::new(sevorix_watchtower::settings::ContextSettings::default()),
+            )
+            .unwrap(),
+        ),
         port: 3000,
         enforcement_tier: EnforcementTier::Standard,
         active_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
