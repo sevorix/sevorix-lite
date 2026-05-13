@@ -1,12 +1,12 @@
-# Terraform configuration for sevorix-hub GCP infrastructure
+# Terraform configuration for sevorix-hub Azure infrastructure
 
 terraform {
   required_version = ">= 1.0"
 
   required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 5.0"
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
     }
     random = {
       source  = "hashicorp/random"
@@ -14,159 +14,91 @@ terraform {
     }
   }
 
-  # Backend configuration - update with your GCS bucket
-  # backend "gcs" {
-  #   bucket = "sevorix-terraform-state"
-  #   prefix = "sevorix-hub"
+  # Backend configuration - update with your Azure Storage Account
+  # backend "azurerm" {
+  #   resource_group_name  = "sevorix-terraform-state-rg"
+  #   storage_account_name = "sevorixterraformstate"
+  #   container_name       = "tfstate"
+  #   key                  = "sevorix-hub.tfstate"
   # }
 }
 
-provider "google" {
-  project = var.project_id
-  region  = var.region
-}
-
-# Enable required APIs
-resource "google_project_service" "required_apis" {
-  for_each = toset([
-    "run.googleapis.com",
-    "sqladmin.googleapis.com",
-    "storage.googleapis.com",
-    "secretmanager.googleapis.com",
-    "artifactregistry.googleapis.com",
-    "cloudbuild.googleapis.com",
-    "vpcaccess.googleapis.com",
-    "servicenetworking.googleapis.com",
-  ])
-
-  service            = each.value
-  disable_on_destroy = false
-}
-
-# Cloud Storage bucket for artifacts
-resource "google_storage_bucket" "artifacts" {
-  name          = "${var.project_id}-artifacts"
-  location      = var.region
-  force_destroy = false
-
-  uniform_bucket_level_access = true
-
-  versioning {
-    enabled = true
-  }
-
-  lifecycle_rule {
-    action {
-      type = "Delete"
-    }
-    condition {
-      age = 365 # Delete objects older than 1 year
+provider "azurerm" {
+  features {
+    key_vault {
+      purge_soft_delete_on_destroy    = true
+      recover_soft_deleted_key_vaults = true
     }
   }
-
-  depends_on = [google_project_service.required_apis]
+  subscription_id = var.subscription_id
 }
 
-# VPC Connector for Cloud Run to Cloud SQL
-resource "google_vpc_access_connector" "hub_connector" {
-  name          = "sevorix-hub-connector"
-  region        = var.region
-  network       = "default"
-  ip_cidr_range = "10.8.0.0/28"
+data "azurerm_client_config" "current" {}
 
-  depends_on = [google_project_service.required_apis]
+# Resource group
+resource "azurerm_resource_group" "hub" {
+  name     = var.resource_group_name
+  location = var.location
 }
 
-# Cloud SQL PostgreSQL instance
-resource "google_sql_database_instance" "hub_db" {
-  name             = "sevorix-hub-db"
-  database_version = "POSTGRES_15"
-  region           = var.region
+# User-assigned managed identity for the Container App
+resource "azurerm_user_assigned_identity" "hub" {
+  name                = "${var.project_name}-identity"
+  resource_group_name = azurerm_resource_group.hub.name
+  location            = azurerm_resource_group.hub.location
+}
 
-  settings {
-    tier              = var.db_tier
-    availability_type = var.db_availability_type
+# Azure Container Registry
+resource "azurerm_container_registry" "hub" {
+  name                = "${var.project_name}acr"
+  resource_group_name = azurerm_resource_group.hub.name
+  location            = azurerm_resource_group.hub.location
+  sku                 = "Standard"
+  admin_enabled       = false
+}
 
-    ip_configuration {
-      ipv4_enabled    = false
-      private_network = "projects/${var.project_id}/global/networks/default"
-    }
+# Grant the managed identity AcrPull on the registry
+resource "azurerm_role_assignment" "hub_acr_pull" {
+  scope                = azurerm_container_registry.hub.id
+  role_definition_name = "AcrPull"
+  principal_id         = azurerm_user_assigned_identity.hub.principal_id
+}
 
-    backup_configuration {
-      enabled                        = true
-      point_in_time_recovery_enabled = true
-    }
+# Storage account for artifacts (equivalent to GCS bucket)
+resource "azurerm_storage_account" "hub" {
+  name                     = "${var.project_name}storage"
+  resource_group_name      = azurerm_resource_group.hub.name
+  location                 = azurerm_resource_group.hub.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
 
-    maintenance_window {
-      day  = 7  # Sunday
-      hour = 3  # 3 AM
+  blob_properties {
+    versioning_enabled = true
+
+    delete_retention_policy {
+      days = 7
     }
   }
-
-  depends_on = [
-    google_project_service.required_apis,
-    google_service_networking_connection.private_service_access
-  ]
 }
 
-# Private service access for Cloud SQL
-resource "google_compute_global_address" "private_ip_range" {
-  name          = "google-managed-services-range"
-  purpose       = "VPC_PEERING"
-  address_type  = "INTERNAL"
-  prefix_length = 16
-  network       = "projects/${var.project_id}/global/networks/default"
+# Blob container for artifacts
+resource "azurerm_storage_container" "artifacts" {
+  name                  = "artifacts"
+  storage_account_name  = azurerm_storage_account.hub.name
+  container_access_type = "private"
 }
 
-resource "google_service_networking_connection" "private_service_access" {
-  network                 = "projects/${var.project_id}/global/networks/default"
-  service                 = "servicenetworking.googleapis.com"
-  reserved_peering_ranges = [google_compute_global_address.private_ip_range.name]
-
-  depends_on = [google_project_service.required_apis]
+# Grant the managed identity Storage Blob Data Contributor on the storage account
+resource "azurerm_role_assignment" "hub_storage_contributor" {
+  scope                = azurerm_storage_account.hub.id
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = azurerm_user_assigned_identity.hub.principal_id
 }
 
-# Database and user
-resource "google_sql_database" "hub_database" {
-  name     = "sevorix_hub"
-  instance = google_sql_database_instance.hub_db.name
-}
-
+# Random passwords
 resource "random_password" "db_password" {
   length  = 32
   special = false
-}
-
-resource "google_sql_user" "hub_user" {
-  name     = "sevorix"
-  instance = google_sql_database_instance.hub_db.name
-  password = random_password.db_password.result
-}
-
-# Secret Manager secrets
-resource "google_secret_manager_secret" "database_url" {
-  secret_id = "sevorix-hub-database-url"
-
-  replication {
-    auto {}
-  }
-
-  depends_on = [google_project_service.required_apis]
-}
-
-resource "google_secret_manager_secret_version" "database_url" {
-  secret      = google_secret_manager_secret.database_url.id
-  secret_data = "postgresql://${google_sql_user.hub_user.name}:${random_password.db_password.result}@localhost/${google_sql_database.hub_database.name}?host=/cloudsql/${var.project_id}:${var.region}:${google_sql_database_instance.hub_db.name}"
-}
-
-resource "google_secret_manager_secret" "jwt_secret" {
-  secret_id = "sevorix-hub-jwt-secret"
-
-  replication {
-    auto {}
-  }
-
-  depends_on = [google_project_service.required_apis]
 }
 
 resource "random_password" "jwt_secret" {
@@ -174,88 +106,190 @@ resource "random_password" "jwt_secret" {
   special = false
 }
 
-resource "google_secret_manager_secret_version" "jwt_secret" {
-  secret      = google_secret_manager_secret.jwt_secret.id
-  secret_data = random_password.jwt_secret.result
+# PostgreSQL Flexible Server (equivalent to Cloud SQL)
+resource "azurerm_postgresql_flexible_server" "hub" {
+  name                   = "${var.project_name}-db"
+  resource_group_name    = azurerm_resource_group.hub.name
+  location               = azurerm_resource_group.hub.location
+  version                = "15"
+  administrator_login    = "sevorix"
+  administrator_password = random_password.db_password.result
+  storage_mb             = var.db_storage_mb
+  sku_name               = var.db_sku_name
+
+  backup_retention_days        = 7
+  geo_redundant_backup_enabled = false
 }
 
-# Service account for Cloud Run
-resource "google_service_account" "hub_sa" {
-  account_id   = "sevorix-hub"
-  display_name = "Sevorix Hub Service Account"
+resource "azurerm_postgresql_flexible_server_database" "hub" {
+  name      = "sevorix_hub"
+  server_id = azurerm_postgresql_flexible_server.hub.id
+  collation = "en_US.utf8"
+  charset   = "utf8"
 }
 
-# Grant service account access to secrets
-resource "google_secret_manager_secret_iam_member" "hub_db_url_access" {
-  secret_id = google_secret_manager_secret.database_url.id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.hub_sa.email}"
+# Allow the Container Apps environment to reach Postgres
+# (public access with firewall; use VNet integration for stricter environments)
+resource "azurerm_postgresql_flexible_server_firewall_rule" "allow_azure_services" {
+  name             = "allow-azure-services"
+  server_id        = azurerm_postgresql_flexible_server.hub.id
+  start_ip_address = "0.0.0.0"
+  end_ip_address   = "0.0.0.0"
 }
 
-resource "google_secret_manager_secret_iam_member" "hub_jwt_access" {
-  secret_id = google_secret_manager_secret.jwt_secret.id
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.hub_sa.email}"
+# Key Vault for secrets (equivalent to GCP Secret Manager)
+resource "azurerm_key_vault" "hub" {
+  name                        = "${var.project_name}-kv"
+  resource_group_name         = azurerm_resource_group.hub.name
+  location                    = azurerm_resource_group.hub.location
+  tenant_id                   = data.azurerm_client_config.current.tenant_id
+  sku_name                    = "standard"
+  soft_delete_retention_days  = 7
+  purge_protection_enabled    = false
 }
 
-# Grant service account access to GCS bucket
-resource "google_storage_bucket_iam_member" "hub_gcs_access" {
-  bucket = google_storage_bucket.artifacts.name
-  role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.hub_sa.email}"
+# Allow the Terraform principal full admin access (for provisioning)
+resource "azurerm_key_vault_access_policy" "terraform_admin" {
+  key_vault_id = azurerm_key_vault.hub.id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = data.azurerm_client_config.current.object_id
+
+  secret_permissions = ["Get", "List", "Set", "Delete", "Purge", "Recover"]
 }
 
-# Grant service account Cloud SQL client access
-resource "google_project_iam_member" "hub_cloudsql_client" {
-  project = var.project_id
-  role    = "roles/cloudsql.client"
-  member  = "serviceAccount:${google_service_account.hub_sa.email}"
+# Allow the managed identity to read secrets at runtime
+resource "azurerm_key_vault_access_policy" "hub_identity" {
+  key_vault_id = azurerm_key_vault.hub.id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = azurerm_user_assigned_identity.hub.principal_id
+
+  secret_permissions = ["Get", "List"]
 }
 
-# Artifact Registry repository
-resource "google_artifact_registry_repository" "hub_repo" {
-  location      = var.region
-  repository_id = "sevorix-hub"
-  description   = "Docker repository for sevorix-hub"
-  format        = "DOCKER"
+# Secrets
+resource "azurerm_key_vault_secret" "database_url" {
+  name         = "database-url"
+  value        = "postgresql://sevorix:${random_password.db_password.result}@${azurerm_postgresql_flexible_server.hub.fqdn}/sevorix_hub?sslmode=require"
+  key_vault_id = azurerm_key_vault.hub.id
 
-  depends_on = [google_project_service.required_apis]
+  depends_on = [azurerm_key_vault_access_policy.terraform_admin]
 }
 
-# Cloud Build trigger created manually in console after GitHub connection
-# Create at: https://console.cloud.google.com/cloud-build/triggers
-# Settings:
-#   - Name: sevorix-hub-deploy
-#   - Event: Push to branch
-#   - Source: sevorix/sevorix-watchtower (GitHub)
-#   - Branch: ^main$
-#   - Configuration: cloudbuild.yaml
-#   - Substitutions: _REGION=us-central1
+resource "azurerm_key_vault_secret" "jwt_secret" {
+  name         = "jwt-secret"
+  value        = random_password.jwt_secret.result
+  key_vault_id = azurerm_key_vault.hub.id
 
-# Output values
-output "cloud_run_service_url" {
-  description = "URL of the Cloud Run service"
-  value       = data.google_cloud_run_service.hub_service.status[0].url
+  depends_on = [azurerm_key_vault_access_policy.terraform_admin]
 }
 
-output "database_connection_name" {
-  description = "Cloud SQL connection name"
-  value       = google_sql_database_instance.hub_db.connection_name
+# Container Apps Environment
+resource "azurerm_container_app_environment" "hub" {
+  name                = "${var.project_name}-env"
+  resource_group_name = azurerm_resource_group.hub.name
+  location            = azurerm_resource_group.hub.location
 }
 
-output "artifacts_bucket" {
-  description = "GCS bucket for artifacts"
-  value       = google_storage_bucket.artifacts.name
+# Container App (equivalent to Cloud Run service)
+resource "azurerm_container_app" "hub" {
+  name                         = "${var.project_name}-hub"
+  resource_group_name          = azurerm_resource_group.hub.name
+  container_app_environment_id = azurerm_container_app_environment.hub.id
+  revision_mode                = "Single"
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.hub.id]
+  }
+
+  registry {
+    server   = azurerm_container_registry.hub.login_server
+    identity = azurerm_user_assigned_identity.hub.id
+  }
+
+  secret {
+    name                = "database-url"
+    key_vault_secret_id = azurerm_key_vault_secret.database_url.id
+    identity            = azurerm_user_assigned_identity.hub.id
+  }
+
+  secret {
+    name                = "jwt-secret"
+    key_vault_secret_id = azurerm_key_vault_secret.jwt_secret.id
+    identity            = azurerm_user_assigned_identity.hub.id
+  }
+
+  template {
+    container {
+      name   = "sevorix-hub"
+      image  = "${azurerm_container_registry.hub.login_server}/sevorix-hub:latest"
+      cpu    = 0.25
+      memory = "0.5Gi"
+
+      env {
+        name  = "STORAGE_BACKEND"
+        value = "azure-blob"
+      }
+
+      env {
+        name  = "AZURE_STORAGE_ACCOUNT"
+        value = azurerm_storage_account.hub.name
+      }
+
+      env {
+        name  = "AZURE_STORAGE_CONTAINER"
+        value = azurerm_storage_container.artifacts.name
+      }
+
+      env {
+        name        = "DATABASE_URL"
+        secret_name = "database-url"
+      }
+
+      env {
+        name        = "JWT_SECRET"
+        secret_name = "jwt-secret"
+      }
+    }
+
+    min_replicas = 0
+    max_replicas = 3
+  }
+
+  ingress {
+    external_enabled = true
+    target_port      = 8080
+
+    traffic_weight {
+      percentage      = 100
+      latest_revision = true
+    }
+  }
+
+  depends_on = [
+    azurerm_key_vault_access_policy.hub_identity,
+    azurerm_role_assignment.hub_acr_pull,
+    azurerm_role_assignment.hub_storage_contributor,
+  ]
 }
 
-
-# Data source for Cloud Run service (deployed via Cloud Build)
-data "google_cloud_run_service" "hub_service" {
-  name     = "sevorix-hub"
-  location = var.region
-
-  depends_on = [google_project_service.required_apis]
+# Outputs
+output "container_app_url" {
+  description = "FQDN of the Container App (configure CNAME hub.sevorix.io -> this)"
+  value       = azurerm_container_app.hub.ingress[0].fqdn
 }
 
-# Public access is configured via --allow-unauthenticated in cloudbuild.yaml
-# If organization policy blocks allUsers, the deployment will handle it there
+output "postgres_fqdn" {
+  description = "PostgreSQL Flexible Server FQDN"
+  value       = azurerm_postgresql_flexible_server.hub.fqdn
+}
+
+output "storage_account_name" {
+  description = "Azure Storage Account name"
+  value       = azurerm_storage_account.hub.name
+}
+
+output "acr_login_server" {
+  description = "ACR login server (set as ACR_REGISTRY GitHub secret)"
+  value       = azurerm_container_registry.hub.login_server
+}
