@@ -1,9 +1,14 @@
-# Example terraform.tfvars file
+# Example terraform.tfvars file for Azure deployment
 # Copy to terraform.tfvars and fill in your values
 
-project_id        = "sevorix"
-region            = "us-central1"
-db_tier           = "db-f1-micro"
-db_availability_type = "ZONAL"
-github_owner      = "your-github-username"
-github_repo       = "sevorix"
+subscription_id = "your-azure-subscription-id"
+
+# Azure region (PostgreSQL Flexible Server not available in all regions)
+# Recommended: westus2, eastus2, centralus, canadacentral, northeurope, westeurope
+location = "westus2"
+
+# Optional: override other defaults
+# resource_group_name = "sevorix-hub-rg"
+# project_name = "sevorixhub"
+# db_sku_name = "B_Standard_B1ms"
+# db_storage_mb = 32768
