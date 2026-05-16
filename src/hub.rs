@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-const DEFAULT_HUB_URL: &str = "https://sevorix-hub-668536931811.us-central1.run.app";
+const DEFAULT_HUB_URL: &str =
+    "https://sevorixhub-hub.calmcliff-23638960.swedencentral.azurecontainerapps.io";
 
 // ---------------------------------------------------------------------------
 // Token Storage
@@ -836,7 +837,7 @@ mod tests {
         let client = client.unwrap();
         assert_eq!(
             client.base_url,
-            "https://sevorix-hub-668536931811.us-central1.run.app"
+            "https://sevorixhub-hub.calmcliff-23638960.swedencentral.azurecontainerapps.io"
         );
     }
 

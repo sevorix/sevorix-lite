@@ -21,7 +21,7 @@ struct Cli {
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
 
-    /// Storage backend type: "filesystem" or "gcs".
+    /// Storage backend type: "filesystem" or "azure-blob".
     #[arg(long, env = "STORAGE_BACKEND", default_value = "filesystem")]
     storage_backend: String,
 
@@ -33,9 +33,13 @@ struct Cli {
     )]
     artifacts_dir: String,
 
-    /// GCS bucket name (for GCS backend).
-    #[arg(long, env = "GCS_BUCKET")]
-    gcs_bucket: Option<String>,
+    /// Azure Storage account name (for azure-blob backend).
+    #[arg(long, env = "AZURE_STORAGE_ACCOUNT")]
+    azure_storage_account: Option<String>,
+
+    /// Azure Blob Storage container name (for azure-blob backend).
+    #[arg(long, env = "AZURE_STORAGE_CONTAINER")]
+    azure_storage_container: Option<String>,
 
     /// Secret key used to sign JWT tokens.
     #[arg(long, env = "JWT_SECRET", default_value = "change-me-in-production")]
@@ -67,12 +71,21 @@ async fn main() -> Result<()> {
 
     // Set up artifact storage based on configured backend.
     let store = match cli.storage_backend.as_str() {
-        "gcs" => {
-            let bucket = cli.gcs_bucket.ok_or_else(|| {
-                anyhow::anyhow!("GCS_BUCKET is required when STORAGE_BACKEND=gcs")
+        "azure-blob" | "azure" => {
+            let account = cli.azure_storage_account.ok_or_else(|| {
+                anyhow::anyhow!("AZURE_STORAGE_ACCOUNT is required when STORAGE_BACKEND=azure-blob")
             })?;
-            tracing::info!("using GCS storage backend: {}", bucket);
-            Store::gcs(bucket)
+            let container = cli.azure_storage_container.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "AZURE_STORAGE_CONTAINER is required when STORAGE_BACKEND=azure-blob"
+                )
+            })?;
+            tracing::info!(
+                "using Azure Blob storage backend: account={}, container={}",
+                account,
+                container
+            );
+            Store::azure_blob(account, container)
         }
         _ => {
             let artifacts_dir = expand_home(&cli.artifacts_dir)?;
@@ -237,11 +250,12 @@ mod tests {
     /// Used only in tests to verify backend selection logic is documented correctly.
     /// The actual storage selection in production uses string matching for CLI simplicity.
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     enum StorageBackend {
         /// Local filesystem storage (for development).
         Filesystem { base_dir: String },
-        /// Google Cloud Storage (for production).
-        Gcs { bucket: String },
+        /// Azure Blob Storage (for production).
+        AzureBlob { account: String, container: String },
     }
 
     #[test]
@@ -370,13 +384,15 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_backend_gcs_debug() {
-        let backend = StorageBackend::Gcs {
-            bucket: "my-bucket".to_string(),
+    fn test_storage_backend_azure_blob_debug() {
+        let backend = StorageBackend::AzureBlob {
+            account: "my-account".to_string(),
+            container: "my-container".to_string(),
         };
         let debug = format!("{:?}", backend);
-        assert!(debug.contains("Gcs"));
-        assert!(debug.contains("my-bucket"));
+        assert!(debug.contains("AzureBlob"));
+        assert!(debug.contains("my-account"));
+        assert!(debug.contains("my-container"));
     }
 
     #[test]
@@ -432,21 +448,24 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_gcs_backend() {
+    fn test_cli_azure_blob_backend() {
         let result = Cli::try_parse_from([
             "test",
             "--database-url",
             "postgres://localhost/test",
             "--storage-backend",
-            "gcs",
-            "--gcs-bucket",
-            "my-gcs-bucket",
+            "azure-blob",
+            "--azure-storage-account",
+            "myaccount",
+            "--azure-storage-container",
+            "mycontainer",
         ]);
 
         assert!(result.is_ok());
         let cli = result.unwrap();
-        assert_eq!(cli.storage_backend, "gcs");
-        assert_eq!(cli.gcs_bucket, Some("my-gcs-bucket".to_string()));
+        assert_eq!(cli.storage_backend, "azure-blob");
+        assert_eq!(cli.azure_storage_account, Some("myaccount".to_string()));
+        assert_eq!(cli.azure_storage_container, Some("mycontainer".to_string()));
     }
 
     #[test]
