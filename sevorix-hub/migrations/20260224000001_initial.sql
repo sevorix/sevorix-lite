@@ -1,6 +1,5 @@
 -- Initial schema for sevorix-hub
-
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- gen_random_uuid() is built-in since PostgreSQL 13; pgcrypto not needed on Azure
 
 CREATE TABLE users (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
