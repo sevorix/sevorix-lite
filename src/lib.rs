@@ -881,7 +881,13 @@ async fn session_register(
         // before sevsh runs the child process. Best-effort: if the daemon socket
         // is not available (e.g. non-ebpf build), we continue without blocking.
         let watchtower_url = format!("http://localhost:{}", state.port);
-        notify_ebpf_daemon_cgroup(path, &watchtower_url).await;
+        let role = state
+            .current_role
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        notify_ebpf_daemon_cgroup(path, &watchtower_url, &role).await;
     }
     StatusCode::OK
 }
@@ -890,15 +896,15 @@ async fn session_register(
 ///
 /// The daemon inserts the cgroup's inode into SEVORIX_CGROUP_IDS before returning ACK,
 /// ensuring the BPF filter recognises the new session immediately.
-/// Timeout is 200ms — if the daemon is not running or the socket is unavailable,
+/// Timeout is 2s — if the daemon is not running or the socket is unavailable,
 /// this returns promptly without blocking session startup.
-async fn notify_ebpf_daemon_cgroup(cgroup_path: &str, watchtower_url: &str) {
+async fn notify_ebpf_daemon_cgroup(cgroup_path: &str, watchtower_url: &str, role: &str) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
     let msg = format!(
         "{}\n",
-        json!({"cgroup_path": cgroup_path, "watchtower_url": watchtower_url})
+        json!({"cgroup_path": cgroup_path, "watchtower_url": watchtower_url, "role": role})
     );
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(2000), async {
@@ -1082,6 +1088,17 @@ async fn session_set_role(
         let _ = dm.update_meta_role(role);
     }
     tracing::info!("Session role updated to '{}'", role);
+
+    // Re-notify the eBPF daemon for every active session so kernel maps and the
+    // routing table are updated with the new role immediately.
+    let sessions = state.active_sessions.lock().await.clone();
+    if !sessions.is_empty() {
+        let watchtower_url = format!("http://localhost:{}", state.port);
+        for cgroup_path in &sessions {
+            notify_ebpf_daemon_cgroup(cgroup_path, &watchtower_url, role).await;
+        }
+    }
+
     StatusCode::OK.into_response()
 }
 
@@ -1306,6 +1323,23 @@ async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl Int
     let role_count = engine.roles.len();
     *state.policy_engine.write().unwrap() = engine;
     tracing::info!("Policies reloaded via API");
+
+    // Re-notify the eBPF daemon for every active session so kernel maps reflect
+    // the new policy set immediately (with the correct active role).
+    let sessions = state.active_sessions.lock().await.clone();
+    if !sessions.is_empty() {
+        let watchtower_url = format!("http://localhost:{}", state.port);
+        let role = state
+            .current_role
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        for cgroup_path in &sessions {
+            notify_ebpf_daemon_cgroup(cgroup_path, &watchtower_url, &role).await;
+        }
+    }
+
     Json(json!({ "status": "reloaded", "policies": policy_count, "roles": role_count }))
         .into_response()
 }
@@ -1744,6 +1778,14 @@ async fn analyze_syscall(
     // scan_syscall_with_engine uses syscall name + resolved path, not text matching,
     // so it correctly handles syscall-only Simple policies (empty pattern) and
     // Regex policies whose pattern targets a file path rather than a formatted string.
+    // eBPF-sourced events now carry the role set at cgroup registration time; fall back
+    // to current_role for legacy callers that don't set event.role.
+    let mut event = event;
+    // Treat absent or empty role as "use the daemon's live current_role".
+    // Empty string arises from older sevsh versions that omit the role field.
+    if event.role.as_deref().unwrap_or("").is_empty() {
+        event.role = state.current_role.read().unwrap().clone();
+    }
     let decision = scan_syscall_with_engine(&event, &state.policy_engine.read().unwrap());
 
     // Determine verdict and lane
@@ -1860,7 +1902,14 @@ async fn syscall_policy_handler(
     Query(q): Query<RoleQuery>,
 ) -> impl IntoResponse {
     let engine = state.policy_engine.read().unwrap();
-    let role_name = q.role.as_deref().unwrap_or("default");
+    // Prefer the explicit ?role= param; fall back to the daemon's live current_role
+    // so sevsh always gets rules for whatever role was last set via set-role.
+    let current = state.current_role.read().unwrap().clone();
+    let role_name = q
+        .role
+        .as_deref()
+        .or(current.as_deref())
+        .unwrap_or("default");
 
     let policy_ids: Vec<String> = match engine.roles.get(role_name) {
         Some(role) => role.policies.clone(),
@@ -1929,7 +1978,7 @@ async fn syscall_policy_handler(
         .flatten()
         .collect();
 
-    Json(json!({ "deny_names": deny_names, "rules": rules }))
+    Json(json!({ "deny_names": deny_names, "rules": rules, "role": role_name }))
 }
 
 /// Map syscall name to x86-64 syscall number.

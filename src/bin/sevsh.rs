@@ -1708,20 +1708,23 @@ fn agent_pid() -> i32 {
 #[cfg(target_os = "linux")]
 async fn fetch_syscall_policy() -> (sevorix_core::CompiledRuleSet, String) {
     use sevorix_core::{CompiledRuleSet, SyscallRule};
-    let role = sevorix_watchtower::settings::Settings::load()
-        .sevsh
-        .and_then(|s| s.default_role)
-        .unwrap_or_else(|| "default".to_string());
     let client = reqwest::Client::new();
-    let url = format!("{}/syscall-policy?role={}", proxy_url(), role);
+    // No ?role= param — the daemon uses its live current_role (set via set-role).
+    // Reading a role from settings.json here would race with set-role and cause
+    // stale seccomp filters after a role change. The response now echoes back the
+    // resolved role name so analyze-syscall events carry the correct role.
+    let url = format!("{}/syscall-policy", proxy_url());
     match client.get(&url).send().await {
         Ok(resp) => {
-            let rules: Vec<SyscallRule> = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| serde_json::from_value(v["rules"].clone()).ok())
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let rules: Vec<SyscallRule> = body["rules"]
+                .as_array()
+                .and_then(|a| serde_json::from_value(serde_json::Value::Array(a.clone())).ok())
                 .unwrap_or_default();
+            // The server echoes back the role it resolved to (its live current_role).
+            // If the field is absent (old server version), send no role in events so
+            // the server falls back to its own current_role at evaluation time.
+            let role = body["role"].as_str().unwrap_or("").to_string();
             (CompiledRuleSet::from_rules(rules), role)
         }
         Err(e) => {
@@ -1729,7 +1732,9 @@ async fn fetch_syscall_policy() -> (sevorix_core::CompiledRuleSet, String) {
                 "[SEVSH] Warning: Could not fetch syscall policy: {}. Seccomp filter not applied.",
                 e
             );
-            (CompiledRuleSet::from_rules(vec![]), role)
+            // Empty rule set → no seccomp filter installed → no analyze-syscall events.
+            // Role string is unused in this path.
+            (CompiledRuleSet::from_rules(vec![]), String::new())
         }
     }
 }

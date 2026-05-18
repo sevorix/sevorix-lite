@@ -165,7 +165,7 @@ mod ebpf_impl {
     /// kernel program and embedded directly in each SyscallEvent/NetworkEvent. This
     /// removes the need to read /proc/<pid>/cgroup at event-processing time — which
     /// races with fast commands (e.g. `ls`) that exit before the 10ms ring buffer poll.
-    type RoutingTable = Arc<RwLock<HashMap<u64, String>>>;
+    type RoutingTable = Arc<RwLock<HashMap<u64, (String, String)>>>;
 
     /// Look up the watchtower URL for a given cgroup ID.
     ///
@@ -174,17 +174,34 @@ mod ebpf_impl {
     /// the process has exited. Falls back to `default_url` if no matching session is found.
     fn lookup_url_for_cgroup(
         cgroup_id: u64,
-        routing_table: &RwLock<HashMap<u64, String>>,
+        routing_table: &RwLock<HashMap<u64, (String, String)>>,
         default_url: &str,
     ) -> String {
         if cgroup_id != 0 {
             if let Ok(table) = routing_table.read() {
-                if let Some(url) = table.get(&cgroup_id) {
+                if let Some((url, _)) = table.get(&cgroup_id) {
                     return url.clone();
                 }
             }
         }
         default_url.to_string()
+    }
+
+    /// Look up the active role for a given cgroup ID.
+    ///
+    /// Returns "default" if the cgroup is not registered or cgroup_id is 0.
+    fn lookup_role_for_cgroup(
+        cgroup_id: u64,
+        routing_table: &RwLock<HashMap<u64, (String, String)>>,
+    ) -> String {
+        if cgroup_id != 0 {
+            if let Ok(table) = routing_table.read() {
+                if let Some((_, role)) = table.get(&cgroup_id) {
+                    return role.clone();
+                }
+            }
+        }
+        "default".to_string()
     }
 
     /// Shared HTTP client — created once, reused for all policy query calls.
@@ -306,6 +323,7 @@ mod ebpf_impl {
     /// On KILL:  sends SIGKILL to the process and also denies the syscall.
     async fn evaluate_and_enforce_syscall(
         watchtower_url: String,
+        role: String,
         pid: u32,
         syscall_nr: u64,
         args: [u64; 6],
@@ -320,6 +338,7 @@ mod ebpf_impl {
             "pid": pid,
             "ppid": 0,
             "timestamp": chrono::Local::now().to_rfc3339(),
+            "role": role,
         });
 
         let resp = match http_client()
@@ -487,6 +506,7 @@ mod ebpf_impl {
             .as_str()
             .unwrap_or(&default_url)
             .to_string();
+        let role = v["role"].as_str().unwrap_or("default").to_string();
         // Stat for inode: needed for SEVORIX_CGROUP_IDS BPF map AND for the routing table.
         // The inode matches bpf_get_current_cgroup_id() returned in each event.
         use std::os::unix::fs::MetadataExt;
@@ -504,16 +524,16 @@ mod ebpf_impl {
             Ok(mut ids_map) => match ids_map.insert(ino, 1u8, 0) {
                 Ok(_) => {
                     info!(
-                        "eBPF socket: registered cgroup path={} ino={} url={}",
-                        path, ino, session_url
+                        "eBPF socket: registered cgroup path={} ino={} url={} role={}",
+                        path, ino, session_url, role
                     );
                     drop(guard);
-                    // Store cgroup inode → URL so lookup_url_for_cgroup can route events
-                    // directly from the cgroup_id embedded in each eBPF event.
+                    // Store cgroup inode → (URL, role) so events can be routed to the
+                    // correct session and evaluated against the correct role's policies.
                     if let Ok(mut table) = routing_table.write() {
-                        table.insert(ino, session_url.clone());
+                        table.insert(ino, (session_url.clone(), role.clone()));
                     }
-                    prefill_policy_maps(&session_url, &pmaps).await;
+                    prefill_policy_maps(&session_url, &role, &pmaps).await;
                     let _ = writer.write_all(b"{\"ok\":true}\n").await;
                 }
                 Err(e) => {
@@ -532,9 +552,9 @@ mod ebpf_impl {
     /// first-occurrence gap: without pre-population, the first forbidden syscall passes
     /// through (triggering the feedback loop for future calls). With pre-population,
     /// GLOBAL_DENYLIST is filled before any session process runs.
-    async fn prefill_policy_maps(watchtower_url: &str, maps: &PolicyMaps) {
+    async fn prefill_policy_maps(watchtower_url: &str, role: &str, maps: &PolicyMaps) {
         let resp = match http_client()
-            .get(format!("{}/policies/ebpf", watchtower_url))
+            .get(format!("{}/policies/ebpf?role={}", watchtower_url, role))
             .send()
             .await
         {
@@ -556,14 +576,24 @@ mod ebpf_impl {
             }
         };
 
-        if policies.syscall_rules.is_empty() {
-            info!("Policy prefill: no syscall rules to populate");
-            return;
-        }
-
         let mut guard = maps.global_denylist.lock().await;
         match aya::maps::HashMap::<_, u64, i32>::try_from(&mut *guard) {
             Ok(mut map) => {
+                // Clear all existing entries first so stale rules from a previous role
+                // are removed even when the new role has no (or fewer) syscall policies.
+                let existing_keys: Vec<u64> = map.keys().filter_map(|r| r.ok()).collect();
+                for key in &existing_keys {
+                    if let Err(e) = map.remove(key) {
+                        warn!("Policy prefill: failed to remove stale GLOBAL_DENYLIST[syscall={}]: {}", key, e);
+                    }
+                }
+                if !existing_keys.is_empty() {
+                    info!(
+                        "Policy prefill: cleared {} stale entries from GLOBAL_DENYLIST",
+                        existing_keys.len()
+                    );
+                }
+
                 for rule in &policies.syscall_rules {
                     match map.insert(rule.syscall_nr, rule.errno, 0) {
                         Ok(_) => info!(
@@ -730,7 +760,7 @@ mod ebpf_impl {
     fn process_event(
         data: &[u8],
         event_tx: &broadcast::Sender<EbpfEvent>,
-        routing_table: &RwLock<HashMap<u64, String>>,
+        routing_table: &RwLock<HashMap<u64, (String, String)>>,
         default_url: &str,
         maps: &PolicyMaps,
     ) -> Result<()> {
@@ -807,7 +837,7 @@ mod ebpf_impl {
         event: SyscallEvent,
         event_tx: &broadcast::Sender<EbpfEvent>,
         event_type: EventType,
-        routing_table: &RwLock<HashMap<u64, String>>,
+        routing_table: &RwLock<HashMap<u64, (String, String)>>,
         default_url: &str,
         maps: &PolicyMaps,
     ) -> Result<()> {
@@ -831,11 +861,13 @@ mod ebpf_impl {
             );
             if let Ok(permit) = eval_sem().clone().try_acquire_owned() {
                 let url = lookup_url_for_cgroup(event.cgroup_id, routing_table, default_url);
+                let role = lookup_role_for_cgroup(event.cgroup_id, routing_table);
                 let maps = maps.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     evaluate_and_enforce_syscall(
                         url,
+                        role,
                         event.pid,
                         event.syscall_nr,
                         event.args,
@@ -860,7 +892,7 @@ mod ebpf_impl {
     fn handle_network_event(
         event: NetworkEvent,
         event_tx: &broadcast::Sender<EbpfEvent>,
-        routing_table: &RwLock<HashMap<u64, String>>,
+        routing_table: &RwLock<HashMap<u64, (String, String)>>,
         default_url: &str,
         maps: &PolicyMaps,
     ) -> Result<()> {
@@ -1090,7 +1122,7 @@ mod ebpf_impl {
 
                 // Pre-populate maps at startup so any already-running sessions get
                 // the current policy set applied without waiting for first occurrence.
-                prefill_policy_maps(&config.watchtower_url, &policy_maps).await;
+                prefill_policy_maps(&config.watchtower_url, "default", &policy_maps).await;
 
                 let sevorix_cgroup_base = "/sys/fs/cgroup/sevorix";
                 if let Err(e) = std::fs::create_dir_all(sevorix_cgroup_base) {
@@ -1254,17 +1286,18 @@ mod ebpf_impl {
                                         );
                                         loop {
                                             tokio::time::sleep(Duration::from_millis(500)).await;
-                                            let any_new = {
-                                                let mut guard = cgroup_map_arc.lock().await;
-                                                sync_map(
-                                                    &mut *guard,
-                                                    &mut known,
-                                                    &scan_cgroup_ids(sevorix_cgroup_base),
-                                                )
-                                            };
-                                            if any_new {
-                                                prefill_policy_maps(&cgroup_watchtower_url, &cgroup_maps).await;
-                                            }
+                                            let mut guard = cgroup_map_arc.lock().await;
+                                            sync_map(
+                                                &mut *guard,
+                                                &mut known,
+                                                &scan_cgroup_ids(sevorix_cgroup_base),
+                                            );
+                                            // Do NOT call prefill_policy_maps here — this path
+                                            // only adds new cgroup IDs to SEVORIX_CGROUP_IDS.
+                                            // Policy maps are populated by handle_cgroup_registration
+                                            // (socket path) with the correct active role. Calling
+                                            // prefill here with "default" would overwrite rules for
+                                            // already-registered sessions using a non-default role.
                                         }
                                     }
                                 };
@@ -1295,9 +1328,9 @@ mod ebpf_impl {
                                                     &scan_cgroup_ids(sevorix_cgroup_base),
                                                 )
                                             };
-                                            if any_new {
-                                                prefill_policy_maps(&cgroup_watchtower_url, &cgroup_maps).await;
-                                            }
+                                            // Do NOT call prefill_policy_maps here — see comment
+                                            // in the polling fallback above for rationale.
+                                            let _ = any_new;
                                         },
                                         _ = rescan.tick() => {
                                             let mut guard = cgroup_map_arc.lock().await;
@@ -1325,9 +1358,9 @@ mod ebpf_impl {
                                             &scan_cgroup_ids(sevorix_cgroup_base),
                                         )
                                     };
-                                    if any_new {
-                                        prefill_policy_maps(&cgroup_watchtower_url, &cgroup_maps).await;
-                                    }
+                                    // Do NOT call prefill_policy_maps here — see comment
+                                    // in the inotify path above for rationale.
+                                    let _ = any_new;
                                 }
                             }
                         }
