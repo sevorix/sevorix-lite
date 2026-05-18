@@ -167,6 +167,7 @@ impl MitmTestHarness {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(std::sync::RwLock::new(Some(role_name.to_string()))),
+            session_name: "test".to_string(),
             // Accept self-signed upstream certs so our minimal test HTTPS server works.
             http_client: reqwest::Client::builder()
                 .no_proxy()

@@ -94,6 +94,9 @@ pub struct AppState {
     /// settings.json `default_role` at startup; updated live via
     /// `POST /api/session/set-role`. Fail-closed if None.
     pub current_role: Arc<RwLock<Option<String>>>,
+    /// Session name used for the DaemonManager metadata file. Equals session_id
+    /// when no --name flag was given at startup; otherwise the user-provided name.
+    pub session_name: String,
     /// Port this Watchtower session is listening on. Included in eBPF cgroup
     /// registration messages so the eBPF daemon can route events to the correct session.
     pub port: u16,
@@ -111,17 +114,24 @@ pub struct AppState {
 pub fn handle_config(cmd: ConfigCommands) {
     match cmd {
         ConfigCommands::Check => {
-            if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
-                let config_dir = proj_dirs.config_dir();
-                let policy_path = config_dir.join("policies.json");
-                println!("Config path: {}", policy_path.display());
-                if policy_path.exists() {
-                    println!("Status: File exists.");
-                } else {
-                    println!("Status: File MISSING.");
+            // Daemon status and active role across all sessions
+            match DaemonManager::list_sessions() {
+                Ok(sessions) if !sessions.is_empty() => {
+                    for (info, _) in &sessions {
+                        let role = info.role.as_deref().unwrap_or("(none)");
+                        println!(
+                            "Daemon: Running — session '{}' (PID: {}, port: {}, role: {})",
+                            info.name, info.pid, info.port, role
+                        );
+                    }
                 }
-            } else {
-                println!("Could not determine config directory.");
+                _ => println!("Daemon: Not running"),
+            }
+            println!();
+
+            // Config path validation
+            if !handle_validate_config() {
+                std::process::exit(1);
             }
         }
     }
@@ -315,8 +325,8 @@ pub fn handle_integrations(cmd: IntegrationsCommands) {
     }
 }
 
-/// Validate configuration files and policies
-pub fn handle_validate_config() {
+/// Validate configuration files and policies. Returns true if no errors found.
+pub fn handle_validate_config() -> bool {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
@@ -330,31 +340,98 @@ pub fn handle_validate_config() {
             warnings.push("~/.sevorix/: Not found (will be created on first use)".to_string());
         }
 
-        // Check primary policies directory
+        // Check primary policies directory — parse and validate each file
         let policy_dir = sevorix_dir.join("policies");
         if policy_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&policy_dir) {
-                let count = entries.count();
-                println!("✓ ~/.sevorix/policies/: {} policy file(s) found", count);
+            let results = crate::policy::parse_policies_dir(&policy_dir);
+            println!("~/.sevorix/policies/ — {} file(s):", results.len());
+            let mut total_policies = 0usize;
+            for (path, result) in &results {
+                let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                match result {
+                    Err(e) => {
+                        println!("  ✗ {}: {}", fname, e);
+                        errors.push(format!("~/.sevorix/policies/{}: {}", fname, e));
+                    }
+                    Ok(policies) => {
+                        let mut policy_errors = Vec::new();
+                        for policy in policies {
+                            if let Err(e) = policy.validate() {
+                                policy_errors.push(e);
+                            }
+                        }
+                        if policy_errors.is_empty() {
+                            let n = policies.len();
+                            total_policies += n;
+                            println!(
+                                "  ✓ {}: {} {}",
+                                fname,
+                                n,
+                                if n == 1 { "policy" } else { "policies" }
+                            );
+                        } else {
+                            for e in &policy_errors {
+                                println!("  ✗ {}: {}", fname, e);
+                                errors.push(format!("~/.sevorix/policies/{}: {}", fname, e));
+                            }
+                        }
+                    }
+                }
+            }
+            if results.is_empty() {
+                println!("  (no .json files)");
+            } else {
+                println!("  {} policies total", total_policies);
+            }
+
+            // Check primary roles directory — parse each file
+            let roles_dir = sevorix_dir.join("roles");
+            if roles_dir.exists() {
+                let results = crate::policy::parse_roles_dir(&roles_dir);
+                println!("~/.sevorix/roles/ — {} file(s):", results.len());
+                let mut total_roles = 0usize;
+                for (path, result) in &results {
+                    let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                    match result {
+                        Err(e) => {
+                            println!("  ✗ {}: {}", fname, e);
+                            errors.push(format!("~/.sevorix/roles/{}: {}", fname, e));
+                        }
+                        Ok(roles) => {
+                            let n = roles.len();
+                            total_roles += n;
+                            println!(
+                                "  ✓ {}: {} {}",
+                                fname,
+                                n,
+                                if n == 1 { "role" } else { "roles" }
+                            );
+                        }
+                    }
+                }
+                if results.is_empty() {
+                    println!("  (no .json files)");
+                } else {
+                    println!("  {} roles total", total_roles);
+                }
+            } else {
+                warnings.push(
+                    "~/.sevorix/roles/: Not found (optional — place .json role files here)"
+                        .to_string(),
+                );
             }
         } else {
             warnings.push(
                 "~/.sevorix/policies/: Not found (optional — place .json policy files here)"
                     .to_string(),
             );
-        }
-
-        // Check primary roles directory
-        let roles_dir = sevorix_dir.join("roles");
-        if roles_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&roles_dir) {
-                let count = entries.count();
-                println!("✓ ~/.sevorix/roles/: {} role file(s) found", count);
+            let roles_dir = sevorix_dir.join("roles");
+            if !roles_dir.exists() {
+                warnings.push(
+                    "~/.sevorix/roles/: Not found (optional — place .json role files here)"
+                        .to_string(),
+                );
             }
-        } else {
-            warnings.push(
-                "~/.sevorix/roles/: Not found (optional — place .json role files here)".to_string(),
-            );
         }
 
         // Check hub token
@@ -405,12 +482,13 @@ pub fn handle_validate_config() {
         for e in &errors {
             println!("  ✗ {}", e);
         }
-        std::process::exit(1);
+        return false;
     }
 
-    if errors.is_empty() && warnings.is_empty() {
+    if warnings.is_empty() {
         println!("\n✓ All validations passed");
     }
+    true
 }
 
 /// Validate a command string for security
@@ -583,6 +661,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 pub async fn run_server(
     allowed_roles: Option<Vec<String>>,
     session_id: uuid::Uuid,
+    session_name: String,
     port: u16,
     initial_role: Option<String>,
 ) -> anyhow::Result<()> {
@@ -750,6 +829,7 @@ pub async fn run_server(
         intervention_timeout_secs: intervention_settings.timeout_secs(),
         intervention_timeout_allow: intervention_settings.timeout_action_allow(),
         current_role: Arc::new(RwLock::new(resolved_role)),
+        session_name,
         http_client: reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -998,6 +1078,9 @@ async fn session_set_role(
             .into_response();
     }
     *state.current_role.write().unwrap() = Some(role.to_string());
+    if let Ok(dm) = DaemonManager::new(&state.session_name) {
+        let _ = dm.update_meta_role(role);
+    }
     tracing::info!("Session role updated to '{}'", role);
     StatusCode::OK.into_response()
 }
@@ -2548,6 +2631,7 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(None)),
+            session_name: "test".to_string(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -2581,6 +2665,7 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(None)),
+            session_name: "test".to_string(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -2614,6 +2699,7 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(None)),
+            session_name: "test".to_string(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -2625,16 +2711,117 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_validate_config_missing_files() {
-        // This test just verifies the function doesn't panic
-        // when config files don't exist
-        handle_validate_config();
+    fn test_handle_validate_config_with_valid_dirs() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let policies_dir = tmp.path().join("policies");
+        let roles_dir = tmp.path().join("roles");
+        fs::create_dir_all(&policies_dir).unwrap();
+        fs::create_dir_all(&roles_dir).unwrap();
+        fs::write(
+            policies_dir.join("p.json"),
+            r#"[{"id":"test","type":"Simple","pattern":"DROP","action":"Block","context":"All","kill":false}]"#,
+        ).unwrap();
+        fs::write(
+            roles_dir.join("r.json"),
+            r#"[{"name":"dev","policies":["test"],"is_dynamic":false}]"#,
+        )
+        .unwrap();
+
+        // parse_policies_dir and parse_roles_dir should return no errors
+        let policy_results = crate::policy::parse_policies_dir(&policies_dir);
+        assert_eq!(policy_results.len(), 1);
+        assert!(policy_results[0].1.is_ok(), "expected valid policy parse");
+
+        let role_results = crate::policy::parse_roles_dir(&roles_dir);
+        assert_eq!(role_results.len(), 1);
+        assert!(role_results[0].1.is_ok(), "expected valid role parse");
     }
 
     #[test]
-    fn test_handle_config_check() {
-        // This test verifies handle_config doesn't panic
-        handle_config(ConfigCommands::Check);
+    fn test_handle_validate_config_invalid_policy_json() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let policies_dir = tmp.path().join("policies");
+        fs::create_dir_all(&policies_dir).unwrap();
+        fs::write(policies_dir.join("bad.json"), "NOT JSON {{{").unwrap();
+
+        let results = crate::policy::parse_policies_dir(&policies_dir);
+        assert_eq!(results.len(), 1);
+        let err = results[0].1.as_ref().unwrap_err();
+        assert!(
+            err.contains("Invalid JSON"),
+            "expected JSON error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_handle_validate_config_invalid_policy_schema() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let policies_dir = tmp.path().join("policies");
+        fs::create_dir_all(&policies_dir).unwrap();
+        // Valid JSON but missing required fields
+        fs::write(policies_dir.join("bad.json"), r#"[{"foo":"bar"}]"#).unwrap();
+
+        let results = crate::policy::parse_policies_dir(&policies_dir);
+        assert_eq!(results.len(), 1);
+        let err = results[0].1.as_ref().unwrap_err();
+        assert!(
+            err.contains("Invalid schema"),
+            "expected schema error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_policy_file_single_object_format() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("p.json");
+        fs::write(
+            &path,
+            r#"{"id":"single","type":"Simple","pattern":"KILL","action":"Block","context":"All","kill":false}"#,
+        ).unwrap();
+        let result = crate::policy::parse_policy_file(&path);
+        assert!(result.is_ok(), "single-object policy should parse");
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_role_file_single_object_format() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("r.json");
+        fs::write(
+            &path,
+            r#"{"name":"admin","policies":["block-drop"],"is_dynamic":false}"#,
+        )
+        .unwrap();
+        let result = crate::policy::parse_role_file(&path);
+        assert!(result.is_ok(), "single-object role should parse");
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_policies_dir_sorted_order() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("policies");
+        fs::create_dir_all(&dir).unwrap();
+        for name in &["z.json", "a.json", "m.json"] {
+            fs::write(
+                dir.join(name),
+                r#"[{"id":"x","type":"Simple","pattern":"x","action":"Block","context":"All","kill":false}]"#,
+            ).unwrap();
+        }
+        let results = crate::policy::parse_policies_dir(&dir);
+        let names: Vec<_> = results
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.json", "m.json", "z.json"]);
     }
 
     #[test]

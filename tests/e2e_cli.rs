@@ -211,7 +211,7 @@ fn test_8_6_validate_invalid_context() {
     );
 }
 
-// ── 8.7 – config check: command runs and produces useful output ───────────────
+// ── 8.7 – config check: command runs, produces structured output ─────────────
 
 #[test]
 fn test_8_7_config_check_runs() {
@@ -223,49 +223,107 @@ fn test_8_7_config_check_runs() {
         .expect("failed to run sevorix config check");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    println!("config check stdout: {}", stdout);
-    println!("config check stderr: {}", stderr);
 
-    // Must complete without crashing.
+    // Must complete without being killed by a signal.
     assert!(
         output.status.code().is_some(),
         "process was killed by a signal"
     );
 
-    // config check always exits 0 — it reports status rather than failing.
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "expected exit code 0 for config check"
-    );
-
-    // Output should contain at least a config path reference.
+    // Output must mention daemon status and the primary config dir.
     assert!(
-        stdout.contains("Config path:") || stdout.contains("config"),
-        "expected config check output to mention a config path, got: {}",
+        stdout.contains("Daemon:"),
+        "expected 'Daemon:' in output, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains(".sevorix"),
+        "expected '.sevorix' path in output, got: {}",
         stdout
     );
 }
 
-// ── 8.7 – config check: output mentions the policies.json path ───────────────
+// ── 8.7 – config check: per-file policy/role validation ──────────────────────
 
 #[test]
-fn test_8_7_config_check_mentions_policies() {
-    let bin = sevorix_bin();
+fn test_8_7_config_check_validates_files() {
+    use std::fs;
+    use std::process::Command as StdCommand;
 
-    let output = Command::new(bin)
+    let tmp = tempfile::tempdir().unwrap();
+    let policies_dir = tmp.path().join(".sevorix").join("policies");
+    let roles_dir = tmp.path().join(".sevorix").join("roles");
+    fs::create_dir_all(&policies_dir).unwrap();
+    fs::create_dir_all(&roles_dir).unwrap();
+
+    // Write a valid policy and a valid role.
+    fs::write(
+        policies_dir.join("good.json"),
+        r#"[{"id":"block-drop","type":"Simple","pattern":"DROP","action":"Block","context":"All","kill":false}]"#,
+    ).unwrap();
+    fs::write(
+        roles_dir.join("dev.json"),
+        r#"[{"name":"dev","policies":["block-drop"],"is_dynamic":false}]"#,
+    )
+    .unwrap();
+
+    let bin = sevorix_bin();
+    let output = StdCommand::new(bin)
         .args(["config", "check"])
+        .env("HOME", tmp.path())
         .output()
         .expect("failed to run sevorix config check");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // handle_config prints "Config path: <path>"; the path always contains
-    // "policies.json" at the end.
+    // Valid files should be marked with ✓ and show counts.
     assert!(
-        stdout.contains("policies.json"),
-        "expected 'policies.json' to appear in config check output, got: {}",
+        stdout.contains("✓") && stdout.contains("good.json"),
+        "expected good.json to be marked valid, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("✓") && stdout.contains("dev.json"),
+        "expected dev.json to be marked valid, got: {}",
+        stdout
+    );
+}
+
+// ── 8.7 – config check: invalid JSON exits 1 and reports error ───────────────
+
+#[test]
+fn test_8_7_config_check_exits_1_on_invalid_json() {
+    use std::fs;
+    use std::process::Command as StdCommand;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let policies_dir = tmp.path().join(".sevorix").join("policies");
+    fs::create_dir_all(&policies_dir).unwrap();
+    fs::write(policies_dir.join("bad.json"), "NOT VALID JSON {{{").unwrap();
+
+    let bin = sevorix_bin();
+    let output = StdCommand::new(bin)
+        .args(["config", "check"])
+        .env("HOME", tmp.path())
+        .output()
+        .expect("failed to run sevorix config check");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 for invalid JSON, got stdout: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("✗") && stdout.contains("bad.json"),
+        "expected bad.json to be flagged, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Invalid JSON"),
+        "expected 'Invalid JSON' in error message, got: {}",
         stdout
     );
 }

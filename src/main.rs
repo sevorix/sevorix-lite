@@ -95,7 +95,13 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                start_runtime(allowed_roles.clone(), session_id, resolved_port, start_role)?;
+                start_runtime(
+                    allowed_roles.clone(),
+                    session_id,
+                    session_name,
+                    resolved_port,
+                    start_role,
+                )?;
             } else if start_ebpf {
                 // eBPF-only mode: spawn daemon and wait for it
                 #[cfg(feature = "ebpf")]
@@ -147,7 +153,13 @@ fn main() -> anyhow::Result<()> {
                     info!("eBPF daemon started with PID: {}", ebpf_process.id());
                 }
             }
-            start_runtime(allowed_roles.clone(), session_id, resolved_port, None)?;
+            start_runtime(
+                allowed_roles.clone(),
+                session_id,
+                session_name,
+                resolved_port,
+                None,
+            )?;
         }
         Some(Commands::Status {}) => {
             print_all_sessions_status();
@@ -167,7 +179,13 @@ fn main() -> anyhow::Result<()> {
             // Explicit foreground run
             let (_guard, session_id) = init_logging();
             info!("Running in foreground. Session ID: {}", session_id);
-            start_runtime(allowed_roles, session_id, find_available_port(3000), None)?;
+            start_runtime(
+                allowed_roles,
+                session_id,
+                session_id.to_string(),
+                find_available_port(3000),
+                None,
+            )?;
         }
         None => {
             Cli::command().print_help()?;
@@ -180,6 +198,7 @@ fn main() -> anyhow::Result<()> {
 fn start_runtime(
     allowed_roles: Option<Vec<String>>,
     session_id: uuid::Uuid,
+    session_name: String,
     port: u16,
     initial_role: Option<String>,
 ) -> anyhow::Result<()> {
@@ -187,7 +206,13 @@ fn start_runtime(
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_server(allowed_roles, session_id, port, initial_role))
+        .block_on(run_server(
+            allowed_roles,
+            session_id,
+            session_name,
+            port,
+            initial_role,
+        ))
 }
 
 /// Spawn the eBPF daemon via `sudo -n` and write its PID to the state directory.

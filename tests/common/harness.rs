@@ -68,6 +68,7 @@ impl TestHarness {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(default_role)),
+            session_name: "test".to_string(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -171,6 +172,7 @@ impl TestHarness {
             intervention_timeout_secs: timeout_secs,
             intervention_timeout_allow: timeout_allow,
             current_role: Arc::new(RwLock::new(None)),
+            session_name: "test".to_string(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -252,6 +254,7 @@ impl TestHarness {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: Arc::new(RwLock::new(default_role)),
+            session_name: "test".to_string(),
             port: 3000,
             http_client: reqwest::Client::builder()
                 .no_proxy()

@@ -44,6 +44,86 @@ impl Default for Engine {
     }
 }
 
+/// Parse a single .json file as a list of policies.
+/// Accepts both array (`[{...}]`) and single-object (`{...}`) formats.
+/// Returns a descriptive error distinguishing invalid JSON from invalid schema.
+pub fn parse_policy_file(path: &std::path::Path) -> Result<Vec<Policy>, String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("Cannot read — {}", e))?;
+    serde_json::from_str::<Vec<Policy>>(&content)
+        .map(Ok)
+        .unwrap_or_else(|vec_err| {
+            serde_json::from_str::<Policy>(&content)
+                .map(|p| vec![p])
+                .map_err(
+                    |_| match serde_json::from_str::<serde_json::Value>(&content) {
+                        Err(e) => format!("Invalid JSON — {}", e),
+                        Ok(_) => format!("Invalid schema — {}", vec_err),
+                    },
+                )
+        })
+}
+
+/// Parse a single .json file as a list of roles.
+/// Accepts both array and single-object formats.
+pub fn parse_role_file(path: &std::path::Path) -> Result<Vec<Role>, String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("Cannot read — {}", e))?;
+    serde_json::from_str::<Vec<Role>>(&content)
+        .map(Ok)
+        .unwrap_or_else(|vec_err| {
+            serde_json::from_str::<Role>(&content)
+                .map(|r| vec![r])
+                .map_err(
+                    |_| match serde_json::from_str::<serde_json::Value>(&content) {
+                        Err(e) => format!("Invalid JSON — {}", e),
+                        Ok(_) => format!("Invalid schema — {}", vec_err),
+                    },
+                )
+        })
+}
+
+/// Scan a directory and parse all .json files as policies.
+/// Returns one entry per file, sorted by filename. Parse errors are included in the Result.
+/// Callers are responsible for calling `policy.validate()` if needed.
+pub fn parse_policies_dir(
+    dir: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Result<Vec<Policy>, String>)> {
+    let mut results = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let result = parse_policy_file(&path);
+            results.push((path, result));
+        }
+    }
+    results
+}
+
+/// Scan a directory and parse all .json files as roles.
+/// Returns one entry per file, sorted by filename.
+pub fn parse_roles_dir(
+    dir: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Result<Vec<Role>, String>)> {
+    let mut results = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let result = parse_role_file(&path);
+            results.push((path, result));
+        }
+    }
+    results
+}
+
 impl Engine {
     #[allow(clippy::let_and_return)] // `let engine` is needed in pro to shadow as mut
     pub fn new() -> Self {
@@ -141,26 +221,21 @@ impl Engine {
         }
         for entry in fs::read_dir(path)? {
             let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                let content = fs::read_to_string(&path)?;
-                // Try Vec<Policy>
-                if let Ok(policies) = serde_json::from_str::<Vec<Policy>>(&content) {
-                    for policy in policies {
-                        policy
-                            .validate()
-                            .map_err(|e| format!("{} (in {})", e, path.display()))?;
-                        policy.warn_if_suspicious();
-                        self.add_policy(policy);
+            let file_path = entry.path();
+            if file_path.extension().and_then(|s| s.to_str()) == Some("json") {
+                match parse_policy_file(&file_path) {
+                    Err(e) => {
+                        tracing::warn!("Failed to parse policy file {}: {}", file_path.display(), e)
                     }
-                } else if let Ok(policy) = serde_json::from_str::<Policy>(&content) {
-                    policy
-                        .validate()
-                        .map_err(|e| format!("{} (in {})", e, path.display()))?;
-                    policy.warn_if_suspicious();
-                    self.add_policy(policy);
-                } else {
-                    tracing::warn!("Warning: Failed to parse policy file: {}", path.display());
+                    Ok(policies) => {
+                        for policy in policies {
+                            policy
+                                .validate()
+                                .map_err(|e| format!("{} (in {})", e, file_path.display()))?;
+                            policy.warn_if_suspicious();
+                            self.add_policy(policy);
+                        }
+                    }
                 }
             }
         }
@@ -173,18 +248,17 @@ impl Engine {
         }
         for entry in fs::read_dir(path)? {
             let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                let content = fs::read_to_string(&path)?;
-                // Try Vec<Role>
-                if let Ok(roles) = serde_json::from_str::<Vec<Role>>(&content) {
-                    for role in roles {
-                        self.add_role(role);
+            let file_path = entry.path();
+            if file_path.extension().and_then(|s| s.to_str()) == Some("json") {
+                match parse_role_file(&file_path) {
+                    Err(e) => {
+                        tracing::warn!("Failed to parse role file {}: {}", file_path.display(), e)
                     }
-                } else if let Ok(role) = serde_json::from_str::<Role>(&content) {
-                    self.add_role(role);
-                } else {
-                    tracing::warn!("Warning: Failed to parse role file: {}", path.display());
+                    Ok(roles) => {
+                        for role in roles {
+                            self.add_role(role);
+                        }
+                    }
                 }
             }
         }
