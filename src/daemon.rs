@@ -371,6 +371,16 @@ impl DaemonManager {
         serde_json::from_str(&content).ok()
     }
 
+    pub fn update_meta_role(&self, role: &str) -> anyhow::Result<()> {
+        let mut meta = self.read_meta().ok_or_else(|| {
+            anyhow::anyhow!("No metadata file for session '{}'", self.session_name)
+        })?;
+        meta.role = Some(role.to_string());
+        let json = serde_json::to_string_pretty(&meta)?;
+        fs::write(&self.meta_path, json)?;
+        Ok(())
+    }
+
     fn read_pid(&self) -> Option<i32> {
         if let Ok(content) = fs::read_to_string(&self.pid_path) {
             content.trim().parse::<i32>().ok()

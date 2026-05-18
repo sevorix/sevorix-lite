@@ -951,6 +951,7 @@ mod tests {
             intervention_timeout_secs: 30,
             intervention_timeout_allow: false,
             current_role: std::sync::Arc::new(std::sync::RwLock::new(Some("default".to_string()))),
+            session_name: "test".to_string(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -1008,6 +1009,7 @@ mod tests {
             intervention_timeout_allow: false,
             port: 3000,
             current_role: std::sync::Arc::new(std::sync::RwLock::new(Some("default".to_string()))),
+            session_name: "test".to_string(),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())

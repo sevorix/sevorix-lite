@@ -38,6 +38,7 @@ async fn test_real_connect_handshake() {
         intervention_timeout_secs: 30,
         intervention_timeout_allow: false,
         current_role: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        session_name: "test".to_string(),
         http_client: reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
