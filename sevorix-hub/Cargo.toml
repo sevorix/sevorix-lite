@@ -31,6 +31,7 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 directories = "5.0"
 reqwest = { version = "0.12", features = ["json"] }
+percent-encoding = "2"
 url = "2.5"
 tower_governor = "0.4"
 governor = "0.7"

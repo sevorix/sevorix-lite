@@ -23,6 +23,8 @@ server.log
 infra/.terraform/
 infra/terraform.tfstate
 infra/terraform.tfstate.backup
+infra/terraform.tfstate.*.backup
+infra/terraform.tfvars
 
 # Playwright CLI cache
 .playwright-cli/
