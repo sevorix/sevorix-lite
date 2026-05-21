@@ -193,6 +193,23 @@ impl Engine {
         self.roles.insert(role.name.clone(), role);
     }
 
+    /// Returns one error string per policy ID referenced by a role that does not
+    /// exist in the loaded policy set. An empty vec means all references are valid.
+    pub fn validate_policy_refs(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (role_name, role) in &self.roles {
+            for policy_id in &role.policies {
+                if !self.policies.contains_key(policy_id) {
+                    errors.push(format!(
+                        "role '{}' references unknown policy '{}'",
+                        role_name, policy_id
+                    ));
+                }
+            }
+        }
+        errors
+    }
+
     /// Look up a compiled regex for a policy by ID.
     pub fn get_regex(&self, policy_id: &str) -> Option<&Regex> {
         self.regex_cache.get(policy_id)
@@ -516,6 +533,61 @@ mod tests {
 
         let d3 = engine.check("this is worse", PolicyContext::All);
         assert!(d3.is_some());
+    }
+
+    #[test]
+    fn test_validate_policy_refs_detects_missing() {
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "p1".to_string(),
+            Policy {
+                id: "p1".to_string(),
+                match_type: PolicyType::Simple("bad".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+                syscall: vec![],
+            },
+        );
+        engine.roles.insert(
+            "r1".to_string(),
+            Role {
+                name: "r1".to_string(),
+                policies: vec!["p1".to_string(), "ghost_policy".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let errors = engine.validate_policy_refs();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("ghost_policy"));
+    }
+
+    #[test]
+    fn test_validate_policy_refs_all_present() {
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "p1".to_string(),
+            Policy {
+                id: "p1".to_string(),
+                match_type: PolicyType::Simple("bad".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+                syscall: vec![],
+            },
+        );
+        engine.roles.insert(
+            "r1".to_string(),
+            Role {
+                name: "r1".to_string(),
+                policies: vec!["p1".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let errors = engine.validate_policy_refs();
+        assert!(errors.is_empty());
     }
 
     #[test]
