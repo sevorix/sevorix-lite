@@ -588,7 +588,7 @@ pub fn validate_startup_config() -> anyhow::Result<()> {
     use crate::policy::Engine;
     use directories::UserDirs;
 
-    // Load roles from disk (same search path as run_server)
+    // Load policies and roles from disk (same search path as run_server)
     let mut engine = Engine::new();
     let mut base_dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Some(proj_dirs) = ProjectDirs::from("com", "sevorix", "sevorix") {
@@ -598,10 +598,26 @@ pub fn validate_startup_config() -> anyhow::Result<()> {
         base_dirs.push(user_dirs.home_dir().join(".sevorix"));
     }
     for base in &base_dirs {
+        let policy_dir = base.join("policies");
+        if policy_dir.exists() && policy_dir.is_dir() {
+            let _ = engine.load_policies_from_dir(&policy_dir);
+        }
+    }
+    for base in &base_dirs {
         let role_dir = base.join("roles");
         if role_dir.exists() && role_dir.is_dir() {
             let _ = engine.load_roles_from_dir(&role_dir);
         }
+    }
+
+    // Validate that all policy IDs referenced by roles are actually loaded
+    let ref_errors = engine.validate_policy_refs();
+    if !ref_errors.is_empty() {
+        anyhow::bail!(
+            "Role validation failed — {} missing policy reference(s):\n  - {}",
+            ref_errors.len(),
+            ref_errors.join("\n  - ")
+        );
     }
 
     // Read settings and validate default_role
@@ -748,6 +764,17 @@ pub async fn run_server(
 
     if engine.policies.is_empty() {
         tracing::warn!("Warning: No policies loaded. Engine is empty.");
+    }
+
+    // 6. Fail fast if any active role references a policy that wasn't loaded
+    let ref_errors = engine.validate_policy_refs();
+    if !ref_errors.is_empty() {
+        let msg = ref_errors.join("\n  - ");
+        anyhow::bail!(
+            "Missing policy references detected:\n  - {}\n\
+             Fix your role definitions in ~/.sevorix/roles/ before starting.",
+            msg
+        );
     }
 
     // Load settings from ~/.sevorix/settings.json (optional; missing = all defaults)
@@ -1317,6 +1344,16 @@ async fn reload_policies_handler(State(state): State<Arc<AppState>>) -> impl Int
                 }
             }
         }
+    }
+
+    let ref_errors = engine.validate_policy_refs();
+    if !ref_errors.is_empty() {
+        let msg = ref_errors.join("; ");
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "status": "error", "reason": format!("Missing policy references: {}", msg) })),
+        )
+            .into_response();
     }
 
     let policy_count = engine.policies.len();
