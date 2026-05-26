@@ -1,0 +1,113 @@
+#!/bin/bash
+set -e
+# sevorix-agent-wrap — wraps an agent process in a persistent sevorix cgroup.
+#
+# Usage: sevorix-agent-wrap [--port PORT] -- COMMAND [ARGS...]
+#
+# Creates an agent-<uuid> cgroup, enrolls this process (so COMMAND inherits it
+# via fork), registers with Watchtower, runs COMMAND, and cleans up on exit.
+# Exit code matches COMMAND's exit code.
+#
+# Designed to be called from privileged launcher scripts (e.g. sevorix-claude-
+# launcher) that already run as root. Cgroup setup is best-effort — if it fails
+# (e.g. cgroup v2 not available), COMMAND still runs normally.
+#
+# Options:
+#   --port PORT   Watchtower port (default: auto-detect from session files)
+
+CGROUP_BASE="/sys/fs/cgroup/sevorix"
+WATCHTOWER_PORT=""
+COMMAND=()
+AGENT_CGROUP=""
+AGENT_REGISTERED=0
+
+# --- Cleanup (runs on any exit via trap) ---
+_cleanup() {
+    if [ "$AGENT_REGISTERED" = "1" ]; then
+        curl -sf -X POST "http://localhost:$WATCHTOWER_PORT/api/session/unregister" \
+            -H "Content-Type: application/json" \
+            -H "X-Sevorix-Internal: true" \
+            -d "{\"cgroup_path\": \"$AGENT_CGROUP\"}" > /dev/null 2>&1 || true
+    fi
+    if [ -n "$AGENT_CGROUP" ] && [ -d "$AGENT_CGROUP" ]; then
+        # Move any surviving processes to the parent cgroup before rmdir.
+        if [ -f "$AGENT_CGROUP/cgroup.procs" ]; then
+            while IFS= read -r pid; do
+                [ -n "$pid" ] && echo "$pid" > "$CGROUP_BASE/cgroup.procs" 2>/dev/null || true
+            done < "$AGENT_CGROUP/cgroup.procs"
+        fi
+        rmdir "$AGENT_CGROUP" 2>/dev/null || true
+    fi
+}
+
+# EXIT trap fires on normal exit, set -e triggered exit, and explicit exit calls.
+# Signal traps call exit so the EXIT trap fires for those too.
+trap '_cleanup'        EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)
+            WATCHTOWER_PORT="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            COMMAND=("$@")
+            break
+            ;;
+        *)
+            echo "sevorix-agent-wrap: unknown argument '$1'" >&2
+            echo "Usage: sevorix-agent-wrap [--port PORT] -- COMMAND [ARGS...]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ ${#COMMAND[@]} -eq 0 ]; then
+    echo "sevorix-agent-wrap: no command specified" >&2
+    echo "Usage: sevorix-agent-wrap [--port PORT] -- COMMAND [ARGS...]" >&2
+    exit 1
+fi
+
+# Auto-detect Watchtower port from session JSON files if not specified.
+# Checks the SUDO_USER's home first (common when running as root via sudo).
+if [ -z "$WATCHTOWER_PORT" ]; then
+    SUDO_HOME=$(getent passwd "${SUDO_USER:-}" | cut -d: -f6 2>/dev/null || true)
+    for STATE_DIR in \
+        "$SUDO_HOME/.local/state/sevorix/sessions" \
+        "$HOME/.local/state/sevorix/sessions"; do
+        PORT=$(find "$STATE_DIR" -name "*.json" 2>/dev/null \
+            | xargs grep -h '"port"' 2>/dev/null \
+            | grep -oP '(?<="port": )\d+' | head -1)
+        if [ -n "$PORT" ]; then
+            WATCHTOWER_PORT="$PORT"
+            break
+        fi
+    done
+    WATCHTOWER_PORT="${WATCHTOWER_PORT:-3000}"
+fi
+
+# --- Agent cgroup setup (best-effort) ---
+AGENT_ID="agent-$(cat /proc/sys/kernel/random/uuid | tr -d '\n')"
+AGENT_CGROUP="$CGROUP_BASE/$AGENT_ID"
+# Propagate session ID so nested sevsh invocations skip cgroup creation.
+export SEVORIX_SESSION_ID="$AGENT_ID"
+
+mkdir -p "$CGROUP_BASE" 2>/dev/null || true
+
+if mkdir -p "$AGENT_CGROUP" 2>/dev/null && \
+   echo $BASHPID > "$AGENT_CGROUP/cgroup.procs" 2>/dev/null; then
+    if curl -sf -X POST "http://localhost:$WATCHTOWER_PORT/api/session/register" \
+            -H "Content-Type: application/json" \
+            -H "X-Sevorix-Internal: true" \
+            -d "{\"cgroup_path\": \"$AGENT_CGROUP\"}" > /dev/null 2>&1; then
+        AGENT_REGISTERED=1
+    fi
+fi
+
+# Run the command. It forks from this process and inherits the agent cgroup.
+"${COMMAND[@]}"

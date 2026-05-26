@@ -1,14 +1,20 @@
 #!/bin/bash
 # Sevorix Claude Code launcher — runs as root to set up a mount namespace,
-# then drops back to the original user and exec's claude.
+# then drops back to the original user and runs claude.
 #
 # Creates a new mount namespace (scoped to this process tree only) and
 # bind-mounts sevsh over /bin/bash inside it. This ensures Claude Code's
 # Bash tool — which calls /bin/bash by absolute path — is intercepted by
 # sevsh and validated through Sevorix Watchtower.
 #
-# The bind mount is invisible to the rest of the system and is torn down
-# automatically when the claude session exits.
+# Also creates a persistent agent-level cgroup (agent-<uuid>) and enrolls the
+# claude process in it before it starts. This gives Watchtower a stable target
+# for freeze and kill operations across the entire agent session — individual
+# sevsh invocations are short-lived, but the agent cgroup persists until claude
+# exits and is registered in active_sessions throughout.
+#
+# The bind mount and cgroup are torn down automatically when the claude session
+# exits.
 #
 # Must be invoked via: sudo sevorix-claude-launcher [claude-args...]
 
@@ -48,11 +54,17 @@ USER_PATH=$(su -l "$ORIGINAL_USER" -s /bin/bash -c 'echo $PATH' 2>/dev/null)
 # IMPORTANT: before replacing /bin/bash we bind-mount the real bash to a temp
 # file and pass that path as SHELL. Without this, sevsh would use /bin/bash to
 # execute validated commands, hit the bind mount, and recurse infinitely.
+#
+# sevorix-agent-wrap handles agent cgroup creation, Watchtower registration,
+# and cleanup — keeping this launcher focused solely on mount-namespace setup.
 exec unshare --mount -- \
     bash -c '
         REAL_BASH=$(mktemp)
         chmod +x "$REAL_BASH"
         mount --bind /bin/bash "$REAL_BASH"
         mount --bind "$1" /bin/bash
-        exec runuser -u "$2" -- env HOME="$4" SHELL="$REAL_BASH" SEVORIX_REAL_SHELL="$REAL_BASH" PATH="$5" "$3" "${@:6}"
+        # Use $REAL_BASH explicitly to run sevorix-agent-wrap — not exec, which
+        # would trigger the #!/bin/bash shebang and hit the sevsh bind-mount.
+        exec "$REAL_BASH" /usr/local/bin/sevorix-agent-wrap -- \
+            runuser -u "$2" -- env HOME="$4" SHELL="$REAL_BASH" SEVORIX_REAL_SHELL="$REAL_BASH" PATH="$5" "$3" "${@:6}"
     ' _ "$SEVSH" "$ORIGINAL_USER" "$CLAUDE_BIN" "$USER_HOME" "$USER_PATH" "$@"
