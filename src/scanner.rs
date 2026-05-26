@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Sevorix
 
-use crate::policy::{Action, Engine, PolicyContext, PolicyType};
+#[cfg(target_os = "linux")]
+use crate::policy::PolicyType;
+use crate::policy::{Action, Engine, PolicyContext};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

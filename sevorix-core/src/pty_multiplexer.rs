@@ -130,6 +130,9 @@ pub struct PtyMultiplexerConfig {
     pub watchtower_url: String,
     /// Timeout for validation requests (ms).
     pub validation_timeout_ms: u64,
+    /// Optional channel for context accumulation: sends (stream, raw_bytes) pairs.
+    /// "stdin" carries validated commands forwarded to bash; "stdout" carries bash output.
+    pub context_tx: Option<std::sync::mpsc::SyncSender<(&'static str, Vec<u8>)>>,
 }
 
 impl Default for PtyMultiplexerConfig {
@@ -145,6 +148,7 @@ impl Default for PtyMultiplexerConfig {
             .collect(),
             watchtower_url: "http://localhost:3000".to_string(),
             validation_timeout_ms: 120_000,
+            context_tx: None,
         }
     }
 }
@@ -414,6 +418,8 @@ pub struct PtyMultiplexer {
     watchtower_url: String,
     /// HTTP client for validation.
     client: reqwest::blocking::Client,
+    /// Optional channel for context accumulation.
+    context_tx: Option<std::sync::mpsc::SyncSender<(&'static str, Vec<u8>)>>,
 }
 
 impl PtyMultiplexer {
@@ -446,6 +452,7 @@ impl PtyMultiplexer {
             mode: MultiplexerMode::Validation,
             watchtower_url: config.watchtower_url,
             client,
+            context_tx: config.context_tx,
         })
     }
 
@@ -534,6 +541,11 @@ impl PtyMultiplexer {
                 // Forward bash output to user terminal
                 io::stdout().write_all(&bash_buf[..n])?;
                 io::stdout().flush()?;
+
+                // Tee to context accumulation channel (best-effort, non-blocking)
+                if let Some(tx) = &self.context_tx {
+                    let _ = tx.try_send(("stdout", bash_buf[..n].to_vec()));
+                }
             }
 
             // Check if bash is still running
@@ -645,19 +657,22 @@ impl PtyMultiplexer {
         let verdict = self.validate_command(line)?;
 
         match verdict.status.as_str() {
-            "ALLOW" => {
+            "ALLOW" | "FLAG" => {
+                if verdict.status == "FLAG" {
+                    eprintln!(
+                        "\r\n[SEVSH] WARNING: {} (Confidence: {})\r",
+                        verdict.reason, verdict.confidence
+                    );
+                }
                 // Forward to bash with newline
                 self.bash_pty.write_all(line.as_bytes())?;
                 self.bash_pty.write_all(b"\n")?;
-            }
-            "FLAG" => {
-                // Show warning, then forward
-                eprintln!(
-                    "\r\n[SEVSH] WARNING: {} (Confidence: {})\r",
-                    verdict.reason, verdict.confidence
-                );
-                self.bash_pty.write_all(line.as_bytes())?;
-                self.bash_pty.write_all(b"\n")?;
+                // Tee stdin to context accumulation (best-effort)
+                if let Some(tx) = &self.context_tx {
+                    let mut bytes = line.as_bytes().to_vec();
+                    bytes.push(b'\n');
+                    let _ = tx.try_send(("stdin", bytes));
+                }
             }
             _ => {
                 // Show error, don't forward
@@ -834,6 +849,7 @@ mod tests {
             passthrough_commands: vec!["vim".to_string()],
             watchtower_url: "http://localhost:9000".to_string(),
             validation_timeout_ms: 5000,
+            context_tx: None,
         };
 
         assert_eq!(config.shell, "/bin/zsh");
@@ -943,6 +959,7 @@ mod tests {
             passthrough_commands: vec!["myapp".to_string(), "custom-tui".to_string()],
             watchtower_url: "http://localhost:3000".to_string(),
             validation_timeout_ms: 5000,
+            context_tx: None,
         };
 
         let detector = PassthroughDetector::new(config.passthrough_commands);

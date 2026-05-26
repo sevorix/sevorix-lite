@@ -60,11 +60,13 @@ pub use integrations::{
 use policy::{Action, Engine, PolicyContext, PolicyType};
 use proxy::proxy_handler;
 #[cfg(target_os = "linux")]
-use scanner::scan_syscall_with_engine;
-use scanner::{log_kill, log_threat, scan_content, scan_for_poison, PoisonPill};
+use scanner::{log_kill, scan_syscall_with_engine};
+use scanner::{log_threat, scan_content, scan_for_poison, PoisonPill};
+use sevorix_core::EnforcementTier;
 #[cfg(target_os = "linux")]
 use sevorix_core::SeccompDecision;
-use sevorix_core::{EnforcementTier, SyscallEvent};
+#[cfg(target_os = "linux")]
+use sevorix_core::SyscallEvent;
 
 /// Holds both channel halves for one pending intervention decision.
 pub struct PendingEntry {
@@ -1184,10 +1186,6 @@ async fn append_context_handler(
     };
 
     // --- POLICY ENFORCEMENT: defend config endpoints from untrusted agents ---
-    // Concatenate chunk raw contents for a policy scan. The policy engine may
-    // contain rules that protect state paths and configuration (e.g. policies
-    // that block writes to ~/.sevorix/policies or similar). If the scan result
-    // is BLOCK, reject the request.
     let combined: String = body
         .chunks
         .iter()
@@ -3475,57 +3473,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_context_handler_blocks_by_policy() {
-        use axum::response::IntoResponse;
-
-        // Build an engine with a blocking policy that matches the string "evil"
-        let mut engine = Engine::new();
-        let policy = Policy {
-            id: "block-evil".to_string(),
-            match_type: PolicyType::Simple("evil".to_string()),
-            action: Action::Block,
-            context: PolicyContext::All,
-            kill: false,
-            syscall: vec![],
-        };
-        engine.add_policy(policy.clone());
-        let role = Role {
-            name: "test-role".to_string(),
-            policies: vec![policy.id.clone()],
-            is_dynamic: false,
-        };
-        engine.add_role(role.clone());
-
-        let state = create_test_app_state_with_engine(engine);
-        // Ensure the server uses this role for scanning
-        *state.current_role.write().unwrap() = Some(role.name.clone());
-
-        let response = append_context_handler(
-            State(state.clone()),
-            Json(AppendContextRequest {
-                session_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
-                chunks: vec![ContextChunkInput {
-                    source: "agent".to_string(),
-                    stream: ContextStream::Stdin,
-                    raw: "this contains evil payload".to_string(),
-                    text: None,
-                    timestamp: None,
-                }],
-            }),
-        )
-        .await
-        .into_response();
-
-        // Expect forbidden due to policy block
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("BLOCK"));
-    }
-
-    #[tokio::test]
     async fn test_append_context_handler_defaults_to_current_session_id() {
         use axum::response::IntoResponse;
 
@@ -3591,6 +3538,58 @@ mod tests {
                 .context_store
                 .recent_chunks("00000000-0000-0000-0000-000000000000", 10, None);
         assert_eq!(recent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_append_context_handler_blocks_by_policy() {
+        use axum::response::IntoResponse;
+
+        let mut engine = Engine::new();
+        engine.policies.insert(
+            "block-dangerous".to_string(),
+            Policy {
+                id: "block-dangerous".to_string(),
+                match_type: PolicyType::Simple("DANGEROUS_KEYWORD".to_string()),
+                action: Action::Block,
+                context: PolicyContext::All,
+                kill: false,
+                syscall: vec![],
+            },
+        );
+        engine.roles.insert(
+            "test-role".to_string(),
+            policy::Role {
+                name: "test-role".to_string(),
+                policies: vec!["block-dangerous".to_string()],
+                is_dynamic: false,
+            },
+        );
+
+        let state = create_test_app_state_with_engine(engine);
+        *state.current_role.write().unwrap() = Some("test-role".to_string());
+
+        let response = append_context_handler(
+            State(state),
+            Json(AppendContextRequest {
+                session_id: Some("sevsh-abc123".to_string()),
+                chunks: vec![ContextChunkInput {
+                    source: "codex".to_string(),
+                    stream: ContextStream::Stdout,
+                    raw: "DANGEROUS_KEYWORD found in output".to_string(),
+                    text: None,
+                    timestamp: None,
+                }],
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("BLOCK"));
     }
 
     #[tokio::test]
@@ -3718,6 +3717,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_syscall_event_creation() {
         let event = SyscallEvent {
             syscall_name: "read".to_string(),
