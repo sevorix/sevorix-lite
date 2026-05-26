@@ -11,9 +11,11 @@ use sevorix_core::{
 use sevorix_core::{PtyMultiplexer, PtyMultiplexerConfig};
 use std::env;
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{exit, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use uuid::Uuid;
 
@@ -25,12 +27,46 @@ static RESOLVED_PROXY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::ne
 static RESOLVED_CONTEXT_SESSION_ID: std::sync::OnceLock<Option<String>> =
     std::sync::OnceLock::new();
 
+/// Whether context accumulation is enabled for this process (via --accumulate or SEVSH_ACCUMULATE).
+static ACCUMULATE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Session ID to accumulate context under (set once at startup).
+static ACCUMULATE_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Source label for context chunks (set once at startup).
+static ACCUMULATE_SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Cached HTTP client for the lifetime of the sevsh process to avoid building
 /// a new `reqwest::Client` on every small request.
 static REQWEST_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
 fn http_client() -> &'static reqwest::Client {
     REQWEST_CLIENT.get_or_init(|| reqwest::Client::builder().no_proxy().build().unwrap())
+}
+
+/// Returns the session ID to use for context accumulation, if accumulation is active.
+fn accumulation_session_id() -> Option<&'static str> {
+    if ACCUMULATE_ENABLED.load(Ordering::Relaxed) {
+        ACCUMULATE_SESSION_ID.get().map(|s| s.as_str())
+    } else {
+        None
+    }
+}
+
+/// Returns the source label for context chunks.
+fn accumulation_source() -> &'static str {
+    ACCUMULATE_SOURCE
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("sevsh")
+}
+
+/// Activate context accumulation for this process by initialising the process-lifetime
+/// statics.  Must be called from the sync preamble (before the tokio runtime starts)
+/// when the `--accumulate` flag is set, so that any `env::set_var` required to
+/// propagate the state to child processes is done while still single-threaded.
+fn activate_accumulation(session_id: &str, source: &str) {
+    let _ = ACCUMULATE_SESSION_ID.set(session_id.to_string());
+    let _ = ACCUMULATE_SOURCE.set(source.to_string());
+    ACCUMULATE_ENABLED.store(true, Ordering::Relaxed);
 }
 
 fn proxy_url() -> &'static str {
@@ -355,11 +391,15 @@ fn has_sevsh_flags(args: &[String]) -> bool {
     //
     // `"--"` signals direct binary execution (sevsh -- cmd args); it must
     // route through clap so args.command is populated correctly.
+    //
+    // `--accumulate` and `--source` are sevsh-specific opt-ins; they require
+    // the clap path so SevshArgs is populated correctly.
     args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "--internal-sandbox" | "--internal-forward-sock" | "--"
+            "--internal-sandbox" | "--internal-forward-sock" | "--" | "--accumulate" | "--source"
         ) || a.starts_with("--publish")
+            || a.starts_with("--source=")
             || a == "-p"
     })
 }
@@ -384,13 +424,25 @@ struct SevshArgs {
     #[arg(long)]
     no_sandbox: bool,
 
+    /// Enable context accumulation: stream stdin/stdout to the context API so
+    /// Jury and other consumers can access session history. Sets SEVSH_ACCUMULATE
+    /// so child sevsh invocations inherit accumulation automatically.
+    #[arg(long)]
+    accumulate: bool,
+
+    /// Source label for context chunks (e.g. "claude-code"). Only valid with --accumulate.
+    #[arg(long)]
+    source: Option<String>,
+
     /// Command to execute (optional - if omitted, starts interactive shell)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --- Sync preamble: all env mutations MUST happen before the tokio runtime starts.
+    // std::env::set_var is unsound in async multi-threaded contexts (Rust 1.81+).
+
     // Resolve the proxy URL once from env/session metadata, then strip the
     // session env vars so nested sevsh invocations cannot inherit an agent-injected override.
     let resolved_target = resolve_proxy_target();
@@ -399,6 +451,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env::remove_var("SEVORIX_SESSION");
     env::remove_var("SEVORIX_PORT");
 
+    // Bash-compat path inherits accumulation from a parent sevsh via SEVSH_ACCUMULATE.
+    // The env vars are already set by the parent; just initialise the statics.
+    // Filter out empty strings: an unset var and an empty var are both treated as "not set".
+    if let Some(inherited_session) = env::var("SEVSH_ACCUMULATE").ok().filter(|s| !s.is_empty()) {
+        let inherited_source = env::var("SEVSH_ACCUMULATE_SOURCE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sevsh".to_string());
+        activate_accumulation(&inherited_session, &inherited_source);
+    }
+
+    // For the --accumulate flag path: detect the flag in raw args now (before the
+    // runtime) so we can call env::set_var safely while still single-threaded.
+    // The session UUID is pre-generated here and stored in ACCUMULATE_SESSION_ID so
+    // async_main() can reuse it without creating a mismatched session ID.
+    if !ACCUMULATE_ENABLED.load(Ordering::Relaxed) {
+        let raw_args_pre: Vec<String> = env::args().collect();
+        // Only scan args that appear *before* the first `--` end-of-options marker.
+        // Scanning past `--` would incorrectly activate accumulation for invocations
+        // like `sevsh -- some_program --accumulate`, where `--accumulate` belongs to
+        // the inner program rather than to sevsh itself.
+        let args_before_dashdash: &[String] = raw_args_pre
+            .iter()
+            .position(|a| a == "--")
+            .map(|i| &raw_args_pre[..i])
+            .unwrap_or(&raw_args_pre);
+        if args_before_dashdash.iter().any(|a| a == "--accumulate") {
+            let source = args_before_dashdash
+                .windows(2)
+                .find_map(|w| (w[0] == "--source").then(|| w[1].clone()))
+                .or_else(|| {
+                    args_before_dashdash
+                        .iter()
+                        .find_map(|a| a.strip_prefix("--source=").map(|s| s.to_string()))
+                })
+                .unwrap_or_else(|| "sevsh".to_string());
+            let session_id = format!("sevsh-{}", Uuid::new_v4());
+            activate_accumulation(&session_id, &source);
+            // Safe: single-threaded, tokio runtime not yet started.
+            env::set_var("SEVSH_ACCUMULATE", &session_id);
+            env::set_var("SEVSH_ACCUMULATE_SOURCE", &source);
+        }
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = env::args().collect();
 
     // Internal Sandbox entry point (Child mode)
@@ -555,8 +659,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse arguments with clap (sevsh-specific invocation)
     let args = SevshArgs::parse();
 
-    // Generate unique session ID for this sevsh session
-    let session_id = format!("sevsh-{}", Uuid::new_v4());
+    // Validate: --source is only meaningful alongside --accumulate.
+    if args.source.is_some() && !args.accumulate {
+        eprintln!("[SEVSH] Error: --source requires --accumulate");
+        std::process::exit(1);
+    }
+
+    // Generate unique session ID for this sevsh session.
+    // When --accumulate was detected in the sync preamble, that preamble pre-generated
+    // the UUID and propagated it via SEVSH_ACCUMULATE; reuse the same ID here so the
+    // cgroup and the context session stay consistent.
+    // When --accumulate is set the sync preamble must have already populated
+    // ACCUMULATE_SESSION_ID.  If it somehow isn't set (shouldn't happen), panic
+    // loudly rather than silently generating a mismatched session ID that would
+    // cause the cgroup and the context store to use different identifiers.
+    let session_id = if args.accumulate {
+        ACCUMULATE_SESSION_ID.get().cloned().expect(
+            "ACCUMULATE_SESSION_ID must be set by the sync preamble when --accumulate is used",
+        )
+    } else {
+        format!("sevsh-{}", Uuid::new_v4())
+    };
 
     // Fail-closed: Check daemon availability before proceeding
     if !args.no_sandbox {
@@ -1281,10 +1404,10 @@ async fn handle_direct_exec(
     // Validation payload: join args for a human-readable command string.
     let payload = args.join(" ");
     let verdict = validate_command(&payload).await?;
-    let context_session_id = resolve_context_session_id().await;
 
     append_context_entries(
-        context_session_id.as_deref(),
+        accumulation_session_id(),
+        accumulation_source(),
         vec![("stdin", payload.clone())],
     )
     .await;
@@ -1346,7 +1469,12 @@ async fn handle_direct_exec(
         if !stderr.is_empty() {
             context_entries.push(("stderr", stderr));
         }
-        append_context_entries(context_session_id.as_deref(), context_entries).await;
+        append_context_entries(
+            accumulation_session_id(),
+            accumulation_source(),
+            context_entries,
+        )
+        .await;
 
         Ok(output.status.code().unwrap_or(1))
     } else {
@@ -1383,10 +1511,10 @@ async fn handle_bash_invocation(
 
     // Validate
     let verdict = validate_command(&payload).await?;
-    let context_session_id = resolve_context_session_id().await;
 
     append_context_entries(
-        context_session_id.as_deref(),
+        accumulation_session_id(),
+        accumulation_source(),
         vec![("stdin", payload.clone())],
     )
     .await;
@@ -1465,7 +1593,12 @@ async fn handle_bash_invocation(
         if !stderr.is_empty() {
             context_entries.push(("stderr", stderr));
         }
-        append_context_entries(context_session_id.as_deref(), context_entries).await;
+        append_context_entries(
+            accumulation_session_id(),
+            accumulation_source(),
+            context_entries,
+        )
+        .await;
 
         Ok(output.status.code().unwrap_or(1))
     } else {
@@ -1530,12 +1663,68 @@ fn run_pty_interactive_shell_code(
     // Add session ID to environment
     env_vars.push(("SEVORIX_SESSION_ID".to_string(), session_id.to_string()));
 
+    // If accumulation is active, set up a background thread to batch-POST chunks.
+    let context_tx = if let Some(acc_session) = accumulation_session_id() {
+        let acc_session = acc_session.to_string();
+        let acc_source = accumulation_source().to_string();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(&'static str, Vec<u8>)>(512);
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_default();
+            let mut batch: Vec<(&'static str, String)> = Vec::new();
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok((stream, bytes)) => {
+                        let text = String::from_utf8_lossy(&bytes).to_string();
+                        batch.push((stream, text));
+                        let has_newline = batch.iter().any(|(_, t)| t.contains('\n'));
+                        if has_newline || batch.len() >= 16 {
+                            post_context_batch_sync(
+                                &client,
+                                &acc_session,
+                                &acc_source,
+                                std::mem::take(&mut batch),
+                            );
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if !batch.is_empty() {
+                            post_context_batch_sync(
+                                &client,
+                                &acc_session,
+                                &acc_source,
+                                std::mem::take(&mut batch),
+                            );
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if !batch.is_empty() {
+                            post_context_batch_sync(
+                                &client,
+                                &acc_session,
+                                &acc_source,
+                                std::mem::take(&mut batch),
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     let config = PtyMultiplexerConfig {
         shell,
         env_vars,
         passthrough_commands: PtyMultiplexerConfig::default().passthrough_commands,
         watchtower_url: proxy_url().to_string(),
         validation_timeout_ms: 5000,
+        context_tx,
     };
 
     let mut multiplexer = PtyMultiplexer::new(config)?;
@@ -1552,35 +1741,32 @@ struct Verdict {
     kill: bool,
 }
 
-fn parse_current_context_session_id(body: &Value) -> Option<String> {
-    body.get("current_session")
-        .and_then(|value| value.as_str())
-        .filter(|session_id| !session_id.trim().is_empty())
-        .map(ToString::to_string)
-}
-
-async fn resolve_context_session_id() -> Option<String> {
-    if let Some(session_id) = resolved_context_session_id() {
-        return Some(session_id.to_string());
+/// Synchronous batch POST used by the PTY interactive tee thread.
+fn post_context_batch_sync(
+    client: &reqwest::blocking::Client,
+    session_id: &str,
+    source: &str,
+    entries: Vec<(&str, String)>,
+) {
+    let chunks: Vec<Value> = entries
+        .into_iter()
+        .filter(|(_, t)| !t.is_empty())
+        .map(|(stream, raw)| json!({"source": source, "stream": stream, "raw": raw}))
+        .collect();
+    if chunks.is_empty() {
+        return;
     }
-
-    let client = http_client();
-    let response = client
-        .get(format!("{}/api/sessions", proxy_url()))
-        .send()
-        .await
-        .ok()?;
-    let body = response.json::<Value>().await.ok()?;
-    let parsed = parse_current_context_session_id(&body);
-    // Cache the parsed response (including `None`) so we don't query
-    // `/api/sessions` on every sevsh invocation. OnceLock stores an
-    // `Option<String>`; setting it here remembers either the resolved
-    // session id or the absence of one for the lifetime of this process.
-    let _ = RESOLVED_CONTEXT_SESSION_ID.set(parsed.clone());
-    parsed
+    let _ = client
+        .post(format!("{}/api/context", proxy_url()))
+        .json(&json!({"session_id": session_id, "chunks": chunks}))
+        .send();
 }
 
-async fn append_context_entries(session_id: Option<&str>, entries: Vec<(&str, String)>) {
+async fn append_context_entries(
+    session_id: Option<&str>,
+    source: &str,
+    entries: Vec<(&str, String)>,
+) {
     let Some(session_id) = session_id else {
         return;
     };
@@ -1592,7 +1778,7 @@ async fn append_context_entries(session_id: Option<&str>, entries: Vec<(&str, St
                 None
             } else {
                 Some(json!({
-                    "source": "sevsh",
+                    "source": source,
                     "stream": stream,
                     "raw": raw,
                 }))
@@ -1942,6 +2128,7 @@ async fn spawn_with_seccomp_output(command: &mut Command) -> std::io::Result<std
 
 /// Spawn a child process and stream its stdout/stderr to the parent's
 /// stdout/stderr while capturing up to `cap` bytes of each stream.
+#[cfg(target_os = "linux")]
 fn run_child_with_tee(
     mut child: std::process::Child,
     cap: usize,
@@ -2124,6 +2311,7 @@ async fn validate_command(cmd: &str) -> Result<Verdict, Box<dyn std::error::Erro
 // -----------------------------------------------------------------------------
 
 /// Parse the ppid (4th field) from a `/proc/<pid>/stat` file content.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 ///
 /// The format is: `pid (comm) state ppid ...`
 /// where `comm` may contain spaces and parentheses, so we locate the
@@ -2191,6 +2379,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_parse_ppid_matches_getppid_for_self() {
         // Smoke-test against the real /proc/self/stat on Linux.
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
@@ -2378,27 +2567,6 @@ mod tests {
         // -c with nothing after it — command stays None
         let inv = parse_bash_invocation(&args(&["-c"]));
         assert!(inv.command.is_none());
-    }
-
-    #[test]
-    fn test_parse_current_context_session_id_extracts_non_empty_value() {
-        let body = json!({
-            "current_session": "550e8400-e29b-41d4-a716-446655440000"
-        });
-
-        assert_eq!(
-            parse_current_context_session_id(&body).as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
-    }
-
-    #[test]
-    fn test_parse_current_context_session_id_rejects_blank_value() {
-        let body = json!({
-            "current_session": "   "
-        });
-
-        assert!(parse_current_context_session_id(&body).is_none());
     }
 
     #[test]
@@ -2611,6 +2779,39 @@ mod tests {
             "curl",
             "-s",
             "http://example.com"
+        ])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_accumulate_alone() {
+        // `--accumulate` on its own must force the clap path
+        assert!(has_sevsh_flags(&args(&["--accumulate"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_accumulate_with_c() {
+        // `--accumulate -c echo` is a typical non-interactive accumulate invocation
+        assert!(has_sevsh_flags(&args(&["--accumulate", "-c", "echo"])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_source_eq_prefix() {
+        // `--source=claude-code` uses the `starts_with("--source=")` branch
+        assert!(has_sevsh_flags(&args(&[
+            "--source=claude-code",
+            "-c",
+            "echo"
+        ])));
+    }
+
+    #[test]
+    fn test_has_sevsh_flags_accumulate_with_no_sandbox() {
+        // `--no-sandbox` alone does NOT force clap, but `--accumulate` does
+        assert!(has_sevsh_flags(&args(&[
+            "--no-sandbox",
+            "--accumulate",
+            "-c",
+            "echo"
         ])));
     }
 

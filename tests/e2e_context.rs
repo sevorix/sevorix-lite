@@ -279,11 +279,14 @@ async fn test_sevsh_command_accumulates_context_for_active_daemon_session() {
     let sevsh_path = sevsh_bin();
     let home_dir = tmp.path().to_path_buf();
     let port = h.addr.port().to_string();
+    let session_id = h.state.session_id.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(sevsh_path)
             .args(["--no-sandbox", "-c", "echo hello"])
             .env("HOME", home_dir)
             .env("SEVORIX_PORT", port)
+            .env("SEVSH_ACCUMULATE", &session_id)
+            .env("SEVSH_ACCUMULATE_SOURCE", "sevsh")
             .output()
             .expect("failed to run sevsh")
     })

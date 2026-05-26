@@ -733,10 +733,15 @@ mod tests {
 
     #[test]
     fn test_policy_matches_executable_success() {
-        // Use /bin/true which should exist on all Unix systems
+        // Locate `true` portably: Linux puts it at /bin/true, macOS at /usr/bin/true.
+        let true_path = if std::path::Path::new("/bin/true").exists() {
+            "/bin/true"
+        } else {
+            "/usr/bin/true"
+        };
         let policy = Policy {
             id: "exec-4".to_string(),
-            match_type: PolicyType::Executable("/bin/true".to_string()),
+            match_type: PolicyType::Executable(true_path.to_string()),
             action: Action::Allow,
             context: PolicyContext::default(),
             kill: false,
@@ -744,9 +749,6 @@ mod tests {
         };
 
         let cache = HashMap::new();
-        // /bin/true always succeeds (exit code 0)
-        // But it won't receive input since we pipe stdin
-        // The matches() function returns true if exit code is 0
         assert!(policy.matches("", &cache));
     }
 

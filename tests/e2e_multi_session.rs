@@ -501,6 +501,7 @@ async fn test_ms17_heavy_session_a_does_not_affect_session_b() {
 ///
 /// This is a lite-only behavior — pro allows multiple concurrent sessions.
 #[test]
+#[cfg(all(not(feature = "pro"), target_os = "linux"))]
 fn test_ms18_lite_rejects_second_start_when_session_exists() {
     let bin = sevorix_bin();
 
@@ -558,6 +559,7 @@ fn test_ms18_lite_rejects_second_start_when_session_exists() {
 
 /// Verify that the lite enforcement message mentions the session name and port.
 #[test]
+#[cfg(all(not(feature = "pro"), target_os = "linux"))]
 fn test_ms19_lite_enforcement_message_includes_session_details() {
     let bin = sevorix_bin();
 
