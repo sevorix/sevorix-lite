@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Sevorix cgroup helper — runs as root to manage per-session cgroup isolation.
 # Called by sevsh via 'sudo -n sevorix-cgroup-helper <action> <session_id> [pid]'
 #
@@ -6,6 +6,9 @@
 #   create   <session_id>       — creates /sys/fs/cgroup/sevorix/<session_id>/
 #   add-pid  <session_id> <pid> — writes <pid> to the session cgroup.procs
 #   cleanup  <session_id>       — removes the session cgroup directory
+#   freeze   <session_id>       — suspends all processes in the cgroup (cgroup.freeze=1)
+#   unfreeze <session_id>       — resumes all processes in the cgroup (cgroup.freeze=0)
+#   kill     <session_id>       — freeze then atomically SIGKILL all processes; prints count
 
 set -e
 
@@ -15,8 +18,8 @@ PID="${3:-}"
 
 CGROUP_BASE="/sys/fs/cgroup/sevorix"
 
-# Validate session ID: must be sevsh-<uuid> to prevent path traversal
-if ! echo "$SESSION_ID" | grep -qE '^sevsh-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'; then
+# Validate session ID: must be sevsh-<uuid> or agent-<uuid> to prevent path traversal
+if ! echo "$SESSION_ID" | grep -qE '^(sevsh|agent)-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'; then
     echo "sevorix-cgroup-helper: invalid session ID '$SESSION_ID'" >&2
     exit 1
 fi
@@ -62,9 +65,65 @@ case "$ACTION" in
         rmdir "$CGROUP_PATH" 2>/dev/null || true
         ;;
 
+    freeze)
+        if [ ! -d "$CGROUP_PATH" ]; then
+            echo "sevorix-cgroup-helper: cgroup $CGROUP_PATH not found" >&2
+            exit 1
+        fi
+        echo 1 > "$CGROUP_PATH/cgroup.freeze"
+        # Poll cgroup.events for frozen=1 confirmation (up to 1s)
+        for i in $(seq 1 20); do
+            if grep -q "frozen 1" "$CGROUP_PATH/cgroup.events" 2>/dev/null; then
+                exit 0
+            fi
+            sleep 0.05
+        done
+        # Timed out waiting for confirmation — proceed anyway
+        ;;
+
+    unfreeze)
+        if [ ! -d "$CGROUP_PATH" ]; then
+            echo "sevorix-cgroup-helper: cgroup $CGROUP_PATH not found" >&2
+            exit 1
+        fi
+        echo 0 > "$CGROUP_PATH/cgroup.freeze"
+        ;;
+
+    kill)
+        if [ ! -d "$CGROUP_PATH" ]; then
+            echo "sevorix-cgroup-helper: cgroup $CGROUP_PATH not found" >&2
+            exit 1
+        fi
+        # Count processes before killing so we can report a meaningful number
+        PROC_COUNT=0
+        if [ -f "$CGROUP_PATH/cgroup.procs" ]; then
+            PROC_COUNT=$(grep -c '[0-9]' "$CGROUP_PATH/cgroup.procs" 2>/dev/null || echo 0)
+        fi
+        # Freeze first to prevent fork races during the kill window
+        echo 1 > "$CGROUP_PATH/cgroup.freeze" 2>/dev/null || true
+        for i in $(seq 1 20); do
+            if grep -q "frozen 1" "$CGROUP_PATH/cgroup.events" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+        done
+        # cgroup.kill (kernel >= 5.14): atomic SIGKILL of entire process tree
+        if [ -f "$CGROUP_PATH/cgroup.kill" ]; then
+            echo 1 > "$CGROUP_PATH/cgroup.kill"
+        else
+            # Fallback for kernels < 5.14: SIGKILL each PID individually
+            if [ -f "$CGROUP_PATH/cgroup.procs" ]; then
+                while IFS= read -r pid; do
+                    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+                done < "$CGROUP_PATH/cgroup.procs"
+            fi
+        fi
+        echo "$PROC_COUNT"
+        ;;
+
     *)
         echo "sevorix-cgroup-helper: unknown action '$ACTION'" >&2
-        echo "Usage: sevorix-cgroup-helper create|add-pid|cleanup <session_id> [pid]" >&2
+        echo "Usage: sevorix-cgroup-helper create|add-pid|freeze|unfreeze|kill|cleanup <session_id> [pid]" >&2
         exit 1
         ;;
 esac
