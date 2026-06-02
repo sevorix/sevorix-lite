@@ -97,13 +97,39 @@ impl AzureBlobStore {
         )
     }
 
-    /// Get an access token from the configured value or the Azure IMDS Managed Identity endpoint.
+    /// Get an access token via Managed Identity.
+    /// Prefers the Azure Container Apps identity endpoint (IDENTITY_ENDPOINT + IDENTITY_HEADER),
+    /// falls back to the standard VM/AKS IMDS endpoint.
     async fn get_access_token(&self) -> Result<String> {
         if let Some(ref token) = self.access_token {
             return Ok(token.clone());
         }
 
-        // Fetch token from Azure IMDS (Container Apps / VM / AKS with Managed Identity)
+        // Azure Container Apps exposes a local identity endpoint via env vars.
+        if let (Ok(endpoint), Ok(header)) = (
+            std::env::var("IDENTITY_ENDPOINT"),
+            std::env::var("IDENTITY_HEADER"),
+        ) {
+            let url = format!(
+                "{}?resource=https://storage.azure.com/&api-version=2019-08-01",
+                endpoint
+            );
+            let response = self
+                .client
+                .get(&url)
+                .header("X-IDENTITY-HEADER", header)
+                .send()
+                .await?;
+            let json: serde_json::Value = response.json().await?;
+            return json["access_token"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No access_token in Container Apps identity response")
+                });
+        }
+
+        // Fall back to VM/AKS IMDS endpoint.
         let metadata_url = "http://169.254.169.254/metadata/identity/oauth2/token\
              ?api-version=2018-02-01&resource=https://storage.azure.com/";
         let response = self
@@ -114,12 +140,10 @@ impl AzureBlobStore {
             .await?;
 
         let json: serde_json::Value = response.json().await?;
-        let token = json["access_token"]
+        json["access_token"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("No access_token in IMDS response"))?
-            .to_string();
-
-        Ok(token)
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("No access_token in IMDS response"))
     }
 }
 
