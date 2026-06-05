@@ -2224,7 +2224,8 @@ pub fn log_traffic_event(path: &std::path::Path, event: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{}", event);
+        let full = format!("{}\n", event);
+        let _ = file.write_all(full.as_bytes());
     }
 }
 
